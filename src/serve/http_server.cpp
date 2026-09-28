@@ -641,6 +641,12 @@ void HttpServer::register_routes() {
                         req.matches.size() > 1 ? req.matches[1].str() : std::string();
                     handle_model_details(id, res);
                 });
+    server_.Get(R"(/v1/models/(.+)/card)",
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    const std::string id =
+                        req.matches.size() > 1 ? req.matches[1].str() : std::string();
+                    handle_model_card(id, res);
+                });
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
     });
@@ -700,8 +706,40 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_openai_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
-                    "application/json");
+    nlohmann::json payload = nlohmann::json::parse(make_model_object(
+        public_model_id_, unix_time_now(), options_.max_context));
+    // Non-spec extension: attach the configured model card inline (vLLM precedent — clients
+    // ignore unknown members on the Model object).
+    if (service_ != nullptr) {
+        if (const nlohmann::json* card = service_->model_card();
+            card != nullptr && !card->is_null()) {
+            payload["model_card"] = *card;
+        }
+    }
+    res.set_content(payload.dump(), "application/json");
+}
+
+void HttpServer::handle_model_card(const std::string& model_id, httplib::Response& res) const {
+    if (model_id != public_model_id_) {
+        ApiError error;
+        error.status  = 404;
+        error.type    = "invalid_request_error";
+        error.code    = "model_not_found";
+        error.message = "model '" + model_id + "' not found";
+        write_openai_error(res, error);
+        return;
+    }
+    const nlohmann::json* card = service_ != nullptr ? service_->model_card() : nullptr;
+    if (card == nullptr || card->is_null()) {
+        ApiError error;
+        error.status  = 404;
+        error.type    = "invalid_request_error";
+        error.code    = "model_card_not_found";
+        error.message = "no model card configured for this server (start with --model-card FILE)";
+        write_openai_error(res, error);
+        return;
+    }
+    res.set_content(card->dump(), "application/json");
 }
 
 namespace {
