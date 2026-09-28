@@ -88,6 +88,7 @@ private:
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
+    void handle_model_details(const std::string& model_id, httplib::Response& res) const;
     void handle_metrics(httplib::Response& res) const;
     void handle_slots(httplib::Response& res) const;
     void handle_usage(httplib::Response& res) const;

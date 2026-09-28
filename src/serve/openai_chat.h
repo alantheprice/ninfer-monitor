@@ -27,6 +27,9 @@ struct OpenAIChatRequest {
     // timings_per_token controls only cumulative timing snapshots on streamed output chunks.
     bool timings_per_token = false;
     bool return_progress   = false;
+    // ninfer extension: attach per-response performance/cache statistics ("stats" object) to the
+    // terminal response (non-streaming body or final stream chunk).
+    bool return_stats = false;
 };
 
 OpenAIChatRequest parse_chat_completion_request(const RequestJson& body,
@@ -40,12 +43,14 @@ struct OpenAIChatResponseIdentity {
 
 OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model);
 std::string make_chat_completion_response(const OpenAIChatResponseIdentity& identity,
-                                          const GenerationOutcome& outcome);
+                                          const GenerationOutcome& outcome,
+                                          bool include_stats = false);
 
 class OpenAIChatStream {
 public:
     OpenAIChatStream(OpenAIChatResponseIdentity identity, bool include_usage,
-                     bool timings_per_token = false, bool return_progress = false);
+                     bool timings_per_token = false, bool return_progress = false,
+                     bool include_stats = false);
 
     std::string start();
     void note_start(const ninfer::GenerationStart& start);
@@ -70,6 +75,7 @@ private:
     bool include_usage_                     = false;
     bool timings_per_token_                 = false;
     bool return_progress_                   = false;
+    bool include_stats_                     = false;
     bool started_                           = false;
     bool admitted_                          = false;
     bool progress_started_                  = false;

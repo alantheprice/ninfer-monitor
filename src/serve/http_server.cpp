@@ -4,13 +4,20 @@
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
+#include "product/speculative_options.h"
 
 #include <nlohmann/json.hpp>
 
+#include <cuda_runtime.h>
 #include <dlfcn.h>
+#include <sys/utsname.h>
+#include <unistd.h>
 
-#include <chrono>
+#include <algorithm>
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <exception>
 #include <mutex>
@@ -628,6 +635,12 @@ void HttpServer::register_routes() {
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
+    server_.Get(R"(/v1/models/(.+)/details)",
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    const std::string id =
+                        req.matches.size() > 1 ? req.matches[1].str() : std::string();
+                    handle_model_details(id, res);
+                });
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
     });
@@ -689,6 +702,220 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
     }
     res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
                     "application/json");
+}
+
+namespace {
+
+using Json = nlohmann::json;
+
+const char* kv_cache_storage_name(ninfer::KvCacheStorage storage) noexcept {
+    switch (storage) {
+    case ninfer::KvCacheStorage::BFloat16:
+        return "bf16";
+    case ninfer::KvCacheStorage::Int8Group64:
+        return "int8";
+    case ninfer::KvCacheStorage::Fp8E4M3Row256:
+        return "fp8";
+    case ninfer::KvCacheStorage::Nvfp4Group16:
+        return "nvfp4";
+    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
+        return "k8v4";
+    }
+    return "unknown";
+}
+
+std::uint64_t meminfo_kib_field(const char* label) {
+    std::FILE* file = std::fopen("/proc/meminfo", "r");
+    if (file == nullptr) { return 0; }
+    std::uint64_t value = 0;
+    char line[256];
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        if (std::strncmp(line, label, std::strlen(label)) == 0) {
+            value = std::strtoull(line + std::strlen(label), nullptr, 10);
+            break;
+        }
+    }
+    std::fclose(file);
+    return value * 1024U; // kB -> bytes
+}
+
+// Lazily dlopen'd NVML introspection for /details. Every field degrades to null when the
+// library, the driver, or the requested device is unavailable — hardware reporting must never
+// take the server down.
+struct DeviceIntrospection {
+    using HandleFn = int (*)(unsigned int, void**);
+    using NameFn = int (*)(void*, char*, unsigned int);
+    using ComputeFn = int (*)(void*, int*, int*);
+    using MemoryFn = int (*)(void*, void*); // nvmlDeviceGetMemoryInfo(device, nvmlMemory_t*)
+    using DriverFn = int (*)(char*, unsigned int);
+    static constexpr unsigned int kNameBufferSize = 256;
+    static constexpr unsigned int kVersionBufferSize = 96;
+
+    void* nvml_handle    = nullptr;
+    HandleFn handle_fn   = nullptr;
+    NameFn name_fn       = nullptr;
+    ComputeFn compute_fn = nullptr;
+    MemoryFn memory_fn   = nullptr;
+    DriverFn driver_fn   = nullptr;
+
+    DeviceIntrospection() {
+        nvml_handle = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+        if (nvml_handle == nullptr) { return; }
+        auto init_fn = (int (*)())dlsym(nvml_handle, "nvmlInit_v2");
+        handle_fn    = (HandleFn)dlsym(nvml_handle, "nvmlDeviceGetHandleByIndex_v2");
+        name_fn      = (NameFn)dlsym(nvml_handle, "nvmlDeviceGetName");
+        compute_fn   = (ComputeFn)dlsym(nvml_handle, "nvmlDeviceGetCudaComputeCapability");
+        memory_fn    = (MemoryFn)dlsym(nvml_handle, "nvmlDeviceGetMemoryInfo");
+        driver_fn    = (DriverFn)dlsym(nvml_handle, "nvmlSystemGetDriverVersion");
+        if (init_fn == nullptr || handle_fn == nullptr) { return; }
+        if (init_fn() != 0) { return; }
+        initialized = true;
+    }
+    bool initialized = false;
+};
+
+Json gpu_report(int device_index) {
+    static const DeviceIntrospection introspection;
+    if (!introspection.initialized) { return Json(nullptr); }
+    void* device = nullptr;
+    if (introspection.handle_fn(static_cast<unsigned int>(device_index), &device) != 0) {
+        return Json(nullptr);
+    }
+    Json report = Json::object();
+    if (introspection.name_fn != nullptr) {
+        char name[DeviceIntrospection::kNameBufferSize] = {};
+        if (introspection.name_fn(device, name, sizeof(name)) == 0) {
+            report["name"] = std::string(name);
+        }
+    }
+    if (introspection.compute_fn != nullptr) {
+        int major = 0, minor = 0;
+        if (introspection.compute_fn(device, &major, &minor) == 0) {
+            report["compute_capability"] = std::to_string(major) + "." + std::to_string(minor);
+        }
+    }
+    if (introspection.memory_fn != nullptr) {
+        // nvmlMemory_t layout (v1): unsigned long long total, free, used — stable ABI.
+        struct NvmlMemory {
+            unsigned long long total;
+            unsigned long long free;
+            unsigned long long used;
+        } memory {};
+        if (introspection.memory_fn(device, &memory) == 0) {
+            report["vram_total_bytes"] = memory.total;
+            report["vram_free_bytes"]  = memory.free;
+            report["vram_used_bytes"]  = memory.used;
+        }
+    }
+    return report.empty() ? Json(nullptr) : Json(report);
+}
+
+std::string nvml_driver_version() {
+    static const DeviceIntrospection introspection;
+    if (!introspection.initialized || introspection.driver_fn == nullptr) { return {}; }
+    char version[DeviceIntrospection::kVersionBufferSize] = {};
+    if (introspection.driver_fn(version, sizeof(version)) == 0) { return std::string(version); }
+    return {};
+}
+
+Json hardware_report(int device_index) {
+    Json host = Json::object();
+    struct utsname system_info {};
+    if (uname(&system_info) == 0) {
+        host["kernel"]       = std::string(system_info.release);
+        host["architecture"] = std::string(system_info.machine);
+    }
+    host["cpu_cores"]           = static_cast<std::int64_t>(sysconf(_SC_NPROCESSORS_ONLN));
+    host["ram_total_bytes"]     = meminfo_kib_field("MemTotal:");
+    host["ram_available_bytes"] = meminfo_kib_field("MemAvailable:");
+
+    std::string driver = nvml_driver_version();
+    Json hardware = {{"gpu", gpu_report(device_index)}, {"host", std::move(host)}};
+    hardware["driver_version"] = driver.empty() ? Json(nullptr) : Json(driver);
+    return hardware;
+}
+
+} // namespace
+
+void HttpServer::handle_model_details(const std::string& model_id, httplib::Response& res) const {
+    if (service_ == nullptr) {
+        res.status = 503;
+        res.set_content(R"({"error":"service not attached"})", "application/json");
+        return;
+    }
+    if (model_id != public_model_id_) {
+        ApiError error;
+        error.status  = 404;
+        error.type    = "invalid_request_error";
+        error.code    = "model_not_found";
+        error.message = "model '" + model_id + "' not found";
+        write_openai_error(res, error);
+        return;
+    }
+
+    Json payload = {{"id", public_model_id_},
+                    {"object", "model"},
+                    {"created", unix_time_now()},
+                    {"owned_by", "ninfer"},
+                    {"status", service_->is_available() ? Json("ready") : Json("loading")}};
+    if (const nlohmann::json* card = service_->model_card();
+        card != nullptr && !card->is_null()) {
+        payload["model_card"] = *card;
+    }
+
+    Json server = {{"engine", "ninfer"},
+                   {"max_context_len", options_.max_context},
+                   {"kv_cache_dtype", kv_cache_storage_name(options_.kv_cache)},
+                   {"max_concurrency", options_.max_concurrency},
+                   {"max_pending_requests", options_.max_pending_requests},
+                   {"prefill_chunk", options_.prefill_chunk},
+                   {"enable_vision", options_.enable_vision},
+                   {"cuda_graphs", options_.use_cuda_graph},
+                   {"prefix_reuse", options_.allow_prefix_reuse},
+                   {"auto_long_anchors", options_.auto_long_anchors},
+                   {"electricity_rate_usd_per_kwh", options_.electricity_rate_usd_per_kwh}};
+    if (options_.enable_thinking.has_value()) {
+        server["enable_thinking"] = *options_.enable_thinking;
+    }
+    if (options_.preserve_thinking.has_value()) {
+        server["preserve_thinking"] = *options_.preserve_thinking;
+    }
+    if (options_.default_thinking_budget.has_value()) {
+        server["default_thinking_budget"] = *options_.default_thinking_budget;
+    }
+    if (options_.speculative.backend != SpeculativeBackend::None) {
+        server["speculative"] = {
+            {"backend", product::speculative_backend_name(options_.speculative.backend)},
+            {"draft_tokens", options_.speculative.draft_tokens}};
+    }
+    server["context_cache"] = {
+        {"device_state_slots", service_->engine_options().context_cache.device_state_slots},
+        {"host_state_slots", service_->engine_options().context_cache.host_state_slots},
+        {"host_kv_bytes", service_->engine_options().context_cache.host_kv_capacity_bytes},
+        {"max_private_continuations",
+         service_->engine_options().context_cache.max_private_continuations},
+        {"max_shared_prefixes", service_->engine_options().context_cache.max_shared_prefixes}};
+    int driver_version = 0, runtime_version = 0;
+    (void)cudaDriverGetVersion(&driver_version);
+    (void)cudaRuntimeGetVersion(&runtime_version);
+    server["cuda_driver_version"]  = driver_version;
+    server["cuda_runtime_version"] = runtime_version;
+    payload["server"] = std::move(server);
+
+    const ninfer::LoadSummary load = service_->load_summary();
+    Json load_json = {{"architecture", load.architecture},
+                      {"model_name", load.model_name},
+                      {"load_seconds", load.load_seconds},
+                      {"upload_seconds", load.upload_seconds},
+                      {"artifact_bytes_read", load.artifact_bytes_read},
+                      {"host_to_device_bytes", load.host_to_device_bytes},
+                      {"device_object_count", load.device_object_count},
+                      {"prefill_signature", load.prefill_signature}};
+    load_json["weight_formats"] = load.weight_formats;
+    payload["load"] = std::move(load_json);
+
+    payload["hardware"] = hardware_report(options_.device);
+    res.set_content(payload.dump(), "application/json");
 }
 
 void HttpServer::handle_metrics(httplib::Response& res) const {

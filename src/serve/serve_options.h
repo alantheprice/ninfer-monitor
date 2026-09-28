@@ -38,6 +38,9 @@ struct ServeOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     std::filesystem::path context_cost_presets;
+    // Optional JSON model card (capabilities, license, links, quantization notes). Loaded and
+    // parsed at startup; served verbatim under "model_card" on GET /v1/models/{id}/details.
+    std::filesystem::path model_card_path;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;

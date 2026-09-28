@@ -90,7 +90,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         }
         lifecycle->done(outcome);
         try {
-            set_owned_json_content(res, make_chat_completion_response(identity, outcome),
+            set_owned_json_content(res, make_chat_completion_response(
+                                            identity, outcome, request.return_stats),
                                    prepared.lifetime);
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
@@ -107,9 +108,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     try {
         const bool return_progress   = request.return_progress;
         const bool timings_per_token = request.timings_per_token;
+        const bool return_stats      = request.return_stats;
         auto stream                  = std::make_shared<HttpGenerationStream>(std::move(prepared));
         auto encoder = std::make_shared<OpenAIChatStream>(identity, request.include_usage,
-                                                          timings_per_token, return_progress);
+                                                          timings_per_token, return_progress,
+                                                          return_stats);
 
         prepare_sse_response(res);
         res.set_chunked_content_provider(

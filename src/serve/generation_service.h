@@ -7,6 +7,8 @@
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
+#include <nlohmann/json.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -118,6 +120,10 @@ public:
         return engine_->sampling_defaults();
     }
 
+    // Parsed --model-card JSON, or nullptr when no card was configured. Served verbatim by
+    // GET /v1/models/{id}/details under the "model_card" key.
+    [[nodiscard]] const nlohmann::json* model_card() const noexcept { return model_card_.get(); }
+
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           GenerationConsumerMode consumer_mode,
                                           ninfer::GenerationObservationOptions observation = {},
@@ -152,6 +158,7 @@ private:
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
 
     ServeOptions options_;
+    std::unique_ptr<nlohmann::json> model_card_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };

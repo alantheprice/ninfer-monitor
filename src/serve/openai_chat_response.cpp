@@ -1,5 +1,6 @@
 #include "serve/openai_chat.h"
 
+#include "product/speculative_options.h"
 #include "serve/generation_service.h"
 #include "serve/openai_common.h"
 
@@ -189,6 +190,71 @@ Json stream_choice(Json delta, Json finish_reason = nullptr) {
 
 std::string event(Json payload) { return "data: " + payload.dump() + "\n\n"; }
 
+const char* reuse_path_display_name(ninfer::PrefixReusePath path) noexcept {
+    switch (path) {
+    case ninfer::PrefixReusePath::Root:
+        return "root";
+    case ninfer::PrefixReusePath::PrivateEndpoint:
+        return "private_endpoint";
+    case ninfer::PrefixReusePath::PrivateTurnClosure:
+        return "private_turn_closure";
+    case ninfer::PrefixReusePath::PrivateResponseReplay:
+        return "private_response_replay";
+    default:
+        return "other";
+    }
+}
+
+// Per-response performance and cache statistics for the opt-in "return_stats" request field.
+// Extended timings: the same data the request log records, surfaced to the client.
+Json response_stats_json(const GenerationOutcome& outcome) {
+    const CompletionTimings timings = outcome_timings(outcome);
+    const double prompt_tokens = static_cast<double>(std::max(0, outcome.prompt_tokens));
+    Json stats = {{"ttft_ms", outcome.metrics.ttft_seconds * 1000.0},
+                  {"total_ms", outcome.metrics.total_seconds * 1000.0},
+                  {"prepare_ms", outcome.metrics.prepare_seconds * 1000.0},
+                  {"prefill_ms", outcome.metrics.prefill_seconds * 1000.0},
+                  {"decode_ms", outcome.metrics.decode_seconds * 1000.0},
+                  {"prompt_tokens", outcome.prompt_tokens},
+                  {"completion_tokens", outcome.completion_tokens},
+                  {"reasoning_tokens", outcome.reasoning_tokens},
+                  {"cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
+                  {"cache_hit_pct",
+                   prompt_tokens > 0.0
+                       ? 100.0 * static_cast<double>(outcome.metrics.prefix_cache_hit_tokens) /
+                             prompt_tokens
+                       : 0.0},
+                  {"prefix_reuse_path",
+                   reuse_path_display_name(outcome.metrics.prefix_reuse_path)},
+                  {"tokens_per_second", timings.predicted_per_second},
+                  {"queue_wait_ms", outcome.metrics.engine_timing.queue_wait_seconds * 1000.0},
+                  {"device_wait_ms",
+                   outcome.metrics.engine_timing.device_wait_exposed_seconds * 1000.0}};
+    if (outcome.metrics.speculative_backend != SpeculativeBackend::None) {
+        const double drafted = static_cast<double>(outcome.metrics.speculative_draft_tokens);
+        stats["speculative"] = {
+            {"backend", product::speculative_backend_name(outcome.metrics.speculative_backend)},
+            {"draft_window", outcome.metrics.speculative_draft_window},
+            {"draft_tokens", outcome.metrics.speculative_draft_tokens},
+            {"accepted_tokens", outcome.metrics.speculative_accepted_tokens},
+            {"acceptance_pct",
+             drafted > 0.0
+                 ? 100.0 * static_cast<double>(outcome.metrics.speculative_accepted_tokens) /
+                       drafted
+                 : 0.0},
+            {"rounds", outcome.metrics.speculative_rounds},
+            {"fallback_steps", outcome.metrics.speculative_fallback_steps}};
+    }
+    return stats;
+}
+
+Json stats_chunk(const OpenAIChatResponseIdentity& identity, Json stats) {
+    Json payload = base_payload(identity, "chat.completion.chunk");
+    payload["choices"] = Json::array();
+    payload["stats"]   = std::move(stats);
+    return event(std::move(payload));
+}
+
 std::string chunk(const OpenAIChatResponseIdentity& identity, Json delta, Json finish_reason,
                   bool include_usage, Json timings = nullptr) {
     Json payload       = base_payload(identity, "chat.completion.chunk");
@@ -225,7 +291,8 @@ OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model)
 }
 
 std::string make_chat_completion_response(const OpenAIChatResponseIdentity& identity,
-                                          const GenerationOutcome& outcome) {
+                                          const GenerationOutcome& outcome,
+                                          const bool include_stats) {
     Json message = {{"role", "assistant"}, {"content", outcome.text}, {"refusal", nullptr}};
     const bool has_tool_calls = !outcome.tool_calls.empty();
     // vLLM/SGLang-compatible reasoning_content preserves the Engine's Reasoning/Content split.
@@ -245,13 +312,16 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
                has_tool_calls ? Json("tool_calls") : Json(finish_reason(outcome.finish_reason))}}});
     payload["usage"]   = usage_json(usage_from(outcome));
     payload["timings"] = timings_json(outcome_timings(outcome));
+    if (include_stats) { payload["stats"] = response_stats_json(outcome); }
     return payload.dump();
 }
 
 OpenAIChatStream::OpenAIChatStream(OpenAIChatResponseIdentity identity, bool include_usage,
-                                   bool timings_per_token, bool return_progress)
+                                   bool timings_per_token, bool return_progress,
+                                   bool include_stats)
     : identity_(std::move(identity)), include_usage_(include_usage),
-      timings_per_token_(timings_per_token), return_progress_(return_progress) {}
+      timings_per_token_(timings_per_token), return_progress_(return_progress),
+      include_stats_(include_stats) {}
 
 std::string OpenAIChatStream::start() {
     if (started_ || finished_) { throw std::logic_error("OpenAI Chat stream already started"); }
@@ -380,6 +450,9 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     }
     if (include_usage_) {
         events.push_back(usage_chunk(identity_, usage_from(outcome), final_timings));
+    }
+    if (include_stats_) {
+        events.push_back(stats_chunk(identity_, response_stats_json(outcome)));
     }
     events.emplace_back("data: [DONE]\n\n");
     return events;

@@ -82,6 +82,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+           "[--model-card FILE] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -234,6 +235,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--max-shared-prefixes"), "max-shared-prefixes"));
             context_capacity_explicit = true;
+        } else if (arg == "--model-card") {
+            options.model_card_path = require_value("--model-card");
         } else if (arg == "--metrics-state") {
             options.metrics_state_path = require_value("--metrics-state");
         } else if (arg == "--electricity-rate") {
