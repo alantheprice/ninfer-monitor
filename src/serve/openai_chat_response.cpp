@@ -194,12 +194,8 @@ const char* reuse_path_display_name(ninfer::PrefixReusePath path) noexcept {
     switch (path) {
     case ninfer::PrefixReusePath::Root:
         return "root";
-    case ninfer::PrefixReusePath::PrivateEndpoint:
-        return "private_endpoint";
-    case ninfer::PrefixReusePath::PrivateTurnClosure:
-        return "private_turn_closure";
-    case ninfer::PrefixReusePath::PrivateResponseReplay:
-        return "private_response_replay";
+    case ninfer::PrefixReusePath::Checkpoint:
+        return "checkpoint";
     default:
         return "other";
     }

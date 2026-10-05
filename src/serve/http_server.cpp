@@ -631,7 +631,10 @@ void HttpServer::register_routes() {
                         "application/json");
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        handle_metrics(res);
+        const auto stats = service_->runtime_stats();
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(metrics_.render(stats, service_->is_available()),
+                        "text/plain; version=0.0.4; charset=utf-8");
     });
     server_.Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
         handle_slots(res);
@@ -940,12 +943,9 @@ void HttpServer::handle_model_details(const std::string& model_id, httplib::Resp
             {"draft_tokens", options_.speculative.draft_tokens}};
     }
     server["context_cache"] = {
-        {"device_state_slots", service_->engine_options().context_cache.device_state_slots},
-        {"host_state_slots", service_->engine_options().context_cache.host_state_slots},
-        {"host_kv_bytes", service_->engine_options().context_cache.host_kv_capacity_bytes},
-        {"max_private_continuations",
-         service_->engine_options().context_cache.max_private_continuations},
-        {"max_shared_prefixes", service_->engine_options().context_cache.max_shared_prefixes}};
+        {"device_state_slots",
+         service_->engine_options().context_cache.device_state_slots.value_or(0)},
+        {"host_context_bytes", service_->engine_options().context_cache.host_capacity_bytes}};
     int driver_version = 0, runtime_version = 0;
     (void)cudaDriverGetVersion(&driver_version);
     (void)cudaRuntimeGetVersion(&runtime_version);
@@ -1032,9 +1032,7 @@ void HttpServer::handle_usage(httplib::Response& res) const {
     double cache_efficiency = 0.0;
     {
         const double denom = static_cast<double>(stats.root_selections +
-            stats.private_endpoint_selections + stats.private_turn_closure_selections +
-            stats.private_response_replay_selections + stats.private_long_anchor_selections +
-            stats.shared_stable_prefix_selections);
+                                                  stats.checkpoint_selections);
         if (denom > 0) {
             cache_efficiency = 100.0 * (denom - stats.root_selections) / denom;
         }
@@ -1113,18 +1111,13 @@ void HttpServer::handle_usage(httplib::Response& res) const {
           {"prefill_tokens_last_window", window_prefill_tokens},
           {"decode_tokens_last_window", window_decode_tokens}}},
         {"requests",
-         {{"total", stats.root_selections + stats.private_endpoint_selections +
-                        stats.private_turn_closure_selections +
-                        stats.private_response_replay_selections +
-                        stats.private_long_anchor_selections +
-                        stats.shared_stable_prefix_selections},
+         {{"total", stats.root_selections + stats.checkpoint_selections},
           {"cache_miss_cold_starts", stats.root_selections},
-          {"cache_hit_endpoint", stats.private_endpoint_selections},
-          {"cache_hit_turn_closure", stats.private_turn_closure_selections},
-          {"cache_hit_response_replay", stats.private_response_replay_selections},
-          {"cache_hit_long_anchor", stats.private_long_anchor_selections},
-          {"cache_hit_shared_prefix", stats.shared_stable_prefix_selections},
-          {"cache_efficiency_pct", cache_efficiency}}},
+          {"cache_hit_checkpoint", stats.checkpoint_selections},
+          {"cache_efficiency_pct", cache_efficiency},
+          {"replay_restores", stats.replay_restores},
+          {"snapshot_restores", stats.snapshot_restores},
+          {"replayed_tokens", stats.replayed_tokens}}},
         {"lanes",
          {{"capacity", service_->engine_options().max_concurrency},
           {"processing", stats.running_requests},
@@ -1136,7 +1129,7 @@ void HttpServer::handle_usage(httplib::Response& res) const {
          {{"checkpoint_captures_completed", stats.active_captures_completed},
           {"checkpoint_captures_aborted", stats.active_captures_aborted},
           {"kv_pressure_spills", stats.pressure_spill_pages},
-          {"sessions_evicted", stats.pressure_private_owners_evicted},
+          {"preemptions", stats.preemptions},
           {"kv_pages_occupied", stats.device_main_kv_occupied_pages}}},
         {"energy",
          {{"rate_usd_per_kwh", options_.electricity_rate_usd_per_kwh},
@@ -1178,7 +1171,6 @@ void HttpServer::attach(GenerationService& service) {
     public_model_id_                    = resolve_public_model_id(options_, load.model_name);
     service_                            = &service;
     metrics_.configure(public_model_id_, service.engine_options(), memory, baseline);
-    request_jsonl_.write_server_start(options_, service.engine_options(),
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load,
                                       service.memory_summary());
