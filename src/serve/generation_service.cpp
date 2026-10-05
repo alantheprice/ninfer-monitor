@@ -205,28 +205,47 @@ public:
     explicit ServiceOutputSink(const StreamSink& sink) : sink_(&sink) {}
 
     void start(ninfer::GenerationStart start) override {
-        if (sink_->on_start) { sink_->on_start(start); }
+        deliver([&] {
+            if (sink_->on_start) { sink_->on_start(start); }
+        });
     }
 
     void progress(ninfer::PromptProgress progress) override {
-        if (sink_->on_progress) { sink_->on_progress(progress); }
+        deliver([&] {
+            if (sink_->on_progress) { sink_->on_progress(progress); }
+        });
     }
 
     void timing(ninfer::GenerationTimingObservation timing) override {
-        if (sink_->on_timing) { sink_->on_timing(timing); }
+        deliver([&] {
+            if (sink_->on_timing) { sink_->on_timing(timing); }
+        });
     }
 
     void publish(ninfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
-        if (delta.channel == ninfer::OutputChannel::Reasoning) {
-            if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
-        } else {
-            if (sink_->on_content) { sink_->on_content(delta.text); }
-        }
+        deliver([&] {
+            if (delta.channel == ninfer::OutputChannel::Reasoning) {
+                if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
+            } else {
+                if (sink_->on_content) { sink_->on_content(delta.text); }
+            }
+        });
     }
 
+    [[nodiscard]] bool disconnected() const noexcept { return disconnected_; }
+
 private:
+    template <class Callback>
+    void deliver(Callback&& callback) {
+        if (disconnected_) { return; }
+        try {
+            callback();
+        } catch (const ClientDisconnected&) { disconnected_ = true; }
+    }
+
     const StreamSink* sink_ = nullptr;
+    bool disconnected_      = false;
 };
 
 } // namespace
@@ -302,10 +321,11 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            ninfer::GenerationObservationOptions observation,
                                            std::function<bool()> is_cancelled,
                                            ContextCacheHints context_cache) const {
-    return prepare_impl(
-        request, consumer_mode, observation, std::move(is_cancelled), std::move(context_cache),
-        options_.allow_prefix_reuse ? CacheParticipation::ReadWrite : CacheParticipation::Disabled,
-        DeadlinePolicy::ClientPendingTimeout);
+    return prepare_impl(request, consumer_mode, std::move(observation), std::move(is_cancelled),
+                        std::move(context_cache),
+                        options_.allow_prefix_reuse ? CacheParticipation::ReadWrite
+                                                    : CacheParticipation::Disabled,
+                        DeadlinePolicy::ClientPendingTimeout);
 }
 
 PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request,
@@ -367,11 +387,19 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
+        if (observation.first_token) {
+            observation.first_token = [callback = std::move(observation.first_token),
+                                       seconds  = prepared.prepare_seconds](
+                                          ninfer::GenerationFirstTokenObservation first) {
+                first.prepare_seconds = seconds;
+                callback(first);
+            };
+        }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               consumer_mode == GenerationConsumerMode::Streaming
                                                   ? ninfer::OutputConsumerMode::Streaming
                                                   : ninfer::OutputConsumerMode::Aggregate,
-                                              observation, prepared.lifetime->deadline);
+                                              std::move(observation), prepared.lifetime->deadline);
         prepared.sampling   = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
@@ -420,11 +448,12 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     if (sink != nullptr) { output_sink = std::make_unique<ServiceOutputSink>(*sink); }
     ninfer::OutputSink* public_sink = output_sink.get();
     ninfer::CancellationView cancellation;
-    if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {
-        cancellation = ninfer::CancellationView([external = std::move(is_cancelled), sink]() {
-            return (external && external()) ||
-                   (sink != nullptr && sink->is_cancelled && sink->is_cancelled());
-        });
+    if (is_cancelled || sink != nullptr) {
+        cancellation = ninfer::CancellationView(
+            [external = std::move(is_cancelled), sink, observed = output_sink.get()]() {
+                return (observed && observed->disconnected()) || (external && external()) ||
+                       (sink != nullptr && sink->is_cancelled && sink->is_cancelled());
+            });
     }
 
     ninfer::GenerationResult result;
@@ -436,6 +465,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.reasoning           = std::move(result.reasoning);
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
+    outcome.generated_token_ids = std::move(result.generated_token_ids);
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
     outcome.finish_reason       = result.finish_reason;
@@ -454,9 +484,12 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.engine_timing               = result.engine_timing;
+    outcome.metrics.first_output_timing         = std::move(result.first_output_timing);
+    outcome.metrics.scheduling                  = result.scheduling;
+    outcome.metrics.engine_request_id           = result.engine_request_id;
+    outcome.metrics.computed_prefill_tokens     = result.computed_prefill_tokens;
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
-    outcome.metrics.materialization             = result.materialization;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
     outcome.metrics.speculative_rounds          = result.speculative.rounds;

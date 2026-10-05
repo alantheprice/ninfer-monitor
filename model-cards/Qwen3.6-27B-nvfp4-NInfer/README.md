@@ -82,11 +82,13 @@ A16 NVFP4 decode. Text, Vision, MTP, prefix reuse, CLI and serving use the commo
 | Field | Value |
 |---|---|
 | Filename | `qwen3_6_27b_nvfp4.ninfer` |
-| Size | 18,324,354,052 bytes (17.07 GiB) |
-| SHA-256 | `791936b206489c6cbd06e87fbc6f1fa9c85a259c77e8fc951812e77779e804a6` |
+| Size | 18,324,354,820 bytes (17.07 GiB) |
+| SHA-256 | `0448262d15df2ae4fda761540c110bc19e7c3b4f43c0938e4d50474429cda083` |
 | Container version | 3 |
 | Architecture | `Qwen3_5ForCausalLM` |
 | Public model name | `qwen3.6-27b` |
+| Chat template | [qwen3_6.jinja](https://github.com/Neroued/ninfer/blob/98dada0e03cb073fd07f905400b5904bc6e82759/tools/chat_templates/qwen3_6.jinja); override with `--chat-template FILE` |
+| Template defaults | thinking on; closed-turn reasoning omitted |
 | Stored objects | 1,545 (1,539 tensors and 6 resources) |
 | NVFP4 tensors | 247 |
 
@@ -98,14 +100,14 @@ Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  '791936b206489c6cbd06e87fbc6f1fa9c85a259c77e8fc951812e77779e804a6' \
+  '0448262d15df2ae4fda761540c110bc19e7c3b4f43c0938e4d50474429cda083' \
   'qwen3_6_27b_nvfp4.ninfer' | sha256sum --check
 ```
 
 ## Requirements
 
 - [NInfer](https://github.com/Neroued/ninfer) revision
-  [`04350ba`](https://github.com/Neroued/ninfer/commit/04350ba94c203833598ba1a41943031c468208f1)
+  [`98dada0`](https://github.com/Neroued/ninfer/commit/98dada0e03cb073fd07f905400b5904bc6e82759)
   or later, built from source;
 - 64-bit Linux;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
@@ -147,17 +149,16 @@ For images, videos, and structured chat history, see the
   --max-concurrency 2 \
   --kv-dtype fp8 \
   --device-state-slots 2 \
-  --host-state-slots 8 \
-  --host-kv-mib 8192 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft \
   --preserve-thinking
 ```
 
-Each request has a 240,000-token logical ceiling. The shared 240,000-token Device KV pool admits
-two active requests when their combined completion reservations fit; either request may use the
-full pool while running alone. Two extra Device checkpoint slots, eight pinned Host State slots,
-and 8 GiB of pinned Host KV retain reusable continuations under resource pressure.
+Each request has a 240,000-token logical ceiling. The shared 240,000-token Device KV pool grows
+with resident execution; resource pressure can pause a request for later Snapshot or Replay
+recovery. Either request may use the full pool while running alone. Two extra Device StateImages
+and the default shared pinned Host budget (8 GiB plus eight model StateImages) retain state, KV
+and pause snapshots.
 
 See the [HTTP serving guide](https://github.com/Neroued/ninfer/blob/master/docs/serving.md) for the
 API surface and the [resource scheduling reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/resource-scheduling-and-context-cache.md)
@@ -262,7 +263,7 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 - NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–8 active
   requests per Engine.
-- It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
+- It does not provide large-scale continuous batching, priority/QoS scheduling,
   multi-GPU execution, CPU/GPU offload, or distributed serving.
 - Context allocation is subject to GPU memory and the selected KV-cache type.
 - NInfer does not execute generated tool calls.
@@ -277,7 +278,7 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 | NVFP4 source revision | `9b5389d4a1e207daab2d47732efea57d7e946dcf` |
 | Conversion recipe | `qwen3_6_27b_nvfp4` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
-| Minimum runtime revision | `04350ba94c203833598ba1a41943031c468208f1` |
+| Minimum runtime revision | `98dada0e03cb073fd07f905400b5904bc6e82759` |
 | Ranking input SHA-256 | `c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5` |
 
 The artifact identity, summarized object inventory, and conversion provenance are published in

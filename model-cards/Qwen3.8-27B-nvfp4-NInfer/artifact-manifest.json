@@ -3,8 +3,8 @@
   "schema_version": 2,
   "artifact": {
     "filename": "qwen3_8_27b_nvfp4.ninfer",
-    "bytes": 23719715076,
-    "sha256": "f30f254f404a990a1ce395f3d3345ac4eaa3179e090e6bae4d1774461672e85f",
+    "bytes": 23719715844,
+    "sha256": "74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82",
     "container_version": 3,
     "architecture": "Qwen3_5ForCausalLM",
     "name": "qwen3.8-27b",
@@ -44,7 +44,7 @@
   },
   "runtime": {
     "repository": "https://github.com/Neroued/ninfer",
-    "minimum_revision": "04350ba94c203833598ba1a41943031c468208f1",
+    "minimum_revision": "98dada0e03cb073fd07f905400b5904bc6e82759",
     "cuda_architecture": "sm_120a",
     "dflash2_draft_tokens": {
       "recommended": 7,
@@ -80,10 +80,10 @@
     },
     "bytes": {
       "tensor": 23706400256,
-      "resource": 12837177,
-      "object": 23719237433,
-      "payload_span": 23719321860,
-      "alignment": 84427
+      "resource": 12837937,
+      "object": 23719238193,
+      "payload_span": 23719322628,
+      "alignment": 84435
     }
   }
 }

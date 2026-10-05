@@ -98,7 +98,7 @@ Json template_parameters(const ChatRenderOptions& options, const Json& special_t
     return context;
 }
 
-std::optional<std::size_t> containing_message(const PromptLayout& layout, ByteSpan region) {
+std::optional<std::size_t> containing_message(const PromptLayout& layout, text::ByteSpan region) {
     for (std::size_t i = 0; i < layout.messages.size(); ++i) {
         const auto& message = layout.messages[i];
         if (region.begin >= message.content_begin && region.end <= message.content_end) return i;
@@ -106,18 +106,30 @@ std::optional<std::size_t> containing_message(const PromptLayout& layout, ByteSp
     return std::nullopt;
 }
 
+// Equal text alone does not prove equal control-token interpretation.
+bool same_prefix(const text::TemplateOutput& lhs, const text::TemplateOutput& rhs,
+                 std::size_t size) {
+    if (lhs.text.size() < size || rhs.text.size() < size ||
+        std::string_view(lhs.text).substr(0, size) != std::string_view(rhs.text).substr(0, size))
+        return false;
+    for (std::size_t i = 0;; ++i) {
+        const bool left  = i < lhs.literal_spans.size() && lhs.literal_spans[i].begin < size;
+        const bool right = i < rhs.literal_spans.size() && rhs.literal_spans[i].begin < size;
+        if (!left || !right) return left == right;
+        const auto a = lhs.literal_spans[i];
+        const auto b = rhs.literal_spans[i];
+        if (a.begin != b.begin || std::min(a.end, size) != std::min(b.end, size)) return false;
+    }
+}
+
 bool real_user(const ChatMessage& message) {
     if (message.role != ChatRole::User) return false;
     if (message.has_media()) return true;
     std::string content;
     for (const auto& part : message.parts) content += part.text;
-    const auto chars  = text::unicode_internal::utf8_codepoints(content, "message content");
-    std::size_t begin = 0, end = chars.size();
-    while (begin < end && text::unicode_internal::is_whitespace(chars[begin].value)) ++begin;
-    while (end > begin && text::unicode_internal::is_whitespace(chars[end - 1].value)) --end;
-    const auto offset = begin < chars.size() ? chars[begin].offset : content.size();
-    const auto limit  = end < chars.size() ? chars[end].offset : content.size();
-    const auto body   = std::string_view(content).substr(offset, limit - offset);
+    const auto bytes = text::unicode_internal::trim_utf8(
+        content, true, true, text::unicode_internal::is_whitespace, "message content");
+    const auto body = std::string_view(content).substr(bytes.begin, bytes.end - bytes.begin);
     return !(body.starts_with("<tool_response>") && body.ends_with("</tool_response>"));
 }
 
@@ -227,9 +239,12 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             tool_tags.push_back(tag("/tools/" + std::to_string(i)));
         }
     }
+    std::vector<std::string> control_variables;
+    for (const auto& item : special_tokens_.items()) control_variables.push_back(item.key());
     text::TemplateRenderOptions execution{
-        .checkpoint = [&] { check_preparation_control(control, "chat template"); },
-        .regions    = regions};
+        .checkpoint        = [&] { check_preparation_control(control, "chat template"); },
+        .regions           = regions,
+        .control_variables = control_variables};
     auto output = compiled_.render(context, execution);
     auto layout = inspect_prompt_layout(output, media);
     if (continuation) {
@@ -246,6 +261,12 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         output.text.resize(content->end);
         std::erase_if(output.regions,
                       [&](const auto& region) { return region.begin > output.text.size(); });
+        for (auto& region : output.regions) region.end = std::min(region.end, output.text.size());
+        std::erase_if(output.literal_spans,
+                      [&](auto span) { return span.begin >= output.text.size(); });
+        if (!output.literal_spans.empty())
+            output.literal_spans.back().end =
+                std::min(output.literal_spans.back().end, output.text.size());
         layout = inspect_prompt_layout(output, media);
     }
     RenderedChat result;
@@ -267,7 +288,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         probe["add_generation_prompt"] = false;
         try {
             const auto rendered = compiled_.render(probe, execution);
-            if (output.text.starts_with(rendered.text)) boundary = rendered.text.size();
+            if (same_prefix(output, rendered, rendered.text.size()))
+                boundary = rendered.text.size();
         } catch (const RequestError&) {
             throw;
         } catch (const std::invalid_argument&) { /* This subset has no independent serialization. */
@@ -279,12 +301,12 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     // Associate actual input regions with complete ChatML blocks. Several tool results may
     // share one user block; their individual closing tags provide the intermediate boundaries.
     std::vector<std::optional<std::size_t>> message_blocks(messages.size());
-    std::vector<std::optional<ByteSpan>> content_regions(messages.size());
+    std::vector<std::optional<text::ByteSpan>> content_regions(messages.size());
     std::vector<std::size_t> block_users(layout.messages.size());
     for (std::size_t i = 0; i < sources.size(); ++i) {
         const auto& origin = sources[i];
-        std::optional<ByteSpan> extent;
-        const auto include = [&](ByteSpan bytes) {
+        std::optional<text::ByteSpan> extent;
+        const auto include = [&](text::ByteSpan bytes) {
             if (!extent)
                 extent = bytes;
             else {
@@ -315,11 +337,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             constexpr std::string_view close = "\n</tool_response>";
             const auto pos                   = output.text.find(close, content_regions[i]->end);
             if (pos != std::string::npos && pos + close.size() <= block.content_end) {
-                const auto end     = pos + close.size();
-                const bool sourced = std::any_of(
-                    output.regions.begin(), output.regions.end(), [&](const auto& region) {
-                        return region.begin < end && region.end > content_regions[i]->end;
-                    });
+                const auto end = pos + close.size();
+                const bool sourced =
+                    text::overlaps(output.literal_spans, content_regions[i]->end, end);
                 if (!sourced)
                     result.message_boundaries[i + 1] =
                         end == block.content_end && block.closed ? block.end : end;
@@ -369,8 +389,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         try {
             const auto next_turn     = compiled_.render(probe, probe_options);
             const auto history_bytes = generation_begin.value_or(output.text.size());
-            retain_open_turn =
-                next_turn.text.starts_with(std::string_view(output.text).substr(0, history_bytes));
+            retain_open_turn         = same_prefix(next_turn, output, history_bytes);
         } catch (const RequestError&) { throw; } catch (const std::invalid_argument&) {
             retain_open_turn = false;
         }
@@ -379,13 +398,54 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         result.rewrite_checkpoint = RewriteCheckpointByteSpec{
             .kind   = continuation || retain_open_turn ? RewriteCheckpointKind::ResponseReplay
                                                        : RewriteCheckpointKind::TurnClosure,
-            .offset = *generation_begin};
+            .offset = *generation_begin,
+            .recovery_offset = *generation_begin};
     }
     if (!continuation && !retain_open_turn && first_tail_assistant) {
         const auto begin = layout.messages[*first_tail_assistant].begin;
         if (begin > 0)
-            result.rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::TurnClosure, .offset = begin};
+            result.rewrite_checkpoint =
+                RewriteCheckpointByteSpec{.kind            = RewriteCheckpointKind::TurnClosure,
+                                          .offset          = begin,
+                                          .recovery_offset = begin};
+    }
+    const auto part_boundary = [&](std::size_t message,
+                                   std::size_t part) -> std::optional<std::size_t> {
+        const auto& origin = sources[message];
+        if (part < origin.part_ends.size())
+            return source_boundary(output, origin.tag, origin.part_ends[part]);
+        if (part < origin.part_tags.size()) {
+            if (origin.part_tags[part]) {
+                if (const auto region = unique_output_region(output, origin.part_tags[part]))
+                    return region->end;
+            } else if (origin.part_media[part]) {
+                return layout.media_placeholders[*origin.part_media[part]].bytes.end +
+                       std::string_view("<|vision_end|>").size();
+            }
+        }
+        return std::nullopt;
+    };
+    if (result.rewrite_checkpoint) {
+        auto& checkpoint = *result.rewrite_checkpoint;
+        for (std::size_t i = 0; i < messages.size(); ++i) {
+            const auto& message = messages[i];
+            if ((message.role != ChatRole::User && !instruction(message.role)) ||
+                message.parts.empty() || !message_blocks[i]) {
+                continue;
+            }
+            const auto block_index = *message_blocks[i];
+            const auto& block      = layout.messages[block_index];
+            if (!block.closed || block_users[block_index] != 1 || block.end != checkpoint.offset) {
+                continue;
+            }
+            const auto content_end = part_boundary(i, message.parts.size() - 1U);
+            if (content_end && *content_end > block.content_begin &&
+                *content_end == block.content_end &&
+                !text::overlaps(output.literal_spans, *content_end, block.end)) {
+                checkpoint.recovery_offset = *content_end;
+                break;
+            }
+        }
     }
     for (std::size_t i = 0; i < options.cache_markers.size(); ++i) {
         const auto& marker = options.cache_markers[i];
@@ -395,6 +455,20 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 auto& boundary = result.message_boundaries[marker.after_message_count];
                 if (!boundary) boundary = prefix(marker.after_message_count);
                 result.cache_boundaries[i] = boundary;
+                const bool automatic =
+                    has_shared_candidate_evidence(
+                        marker.evidence, SharedCandidateEvidence::DefaultAutomatic |
+                                             SharedCandidateEvidence::RequestedAutomatic) &&
+                    !has_shared_candidate_evidence(marker.evidence,
+                                                   SharedCandidateEvidence::ExplicitBoundary);
+                if (!boundary && automatic && marker.after_message_count) {
+                    // Some templates have no independently serializable message closing.
+                    // An automatic hint can still retain the proven content prefix.
+                    const auto message = marker.after_message_count - 1U;
+                    if (!messages[message].parts.empty())
+                        result.cache_boundaries[i] =
+                            part_boundary(message, messages[message].parts.size() - 1U);
+                }
             }
             break;
         case PromptCacheMarkerLocation::LeadingInstructionBoundary:
@@ -412,27 +486,14 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         case PromptCacheMarkerLocation::MessagePartBoundary:
             if (marker.after_message_count && marker.after_message_count <= sources.size() &&
                 marker.after_message_part_count) {
-                const auto& origin = sources[marker.after_message_count - 1];
-                const auto part    = marker.after_message_part_count - 1;
-                if (part < origin.part_ends.size())
-                    result.cache_boundaries[i] =
-                        source_boundary(output, origin.tag, origin.part_ends[part]);
-                else if (part < origin.part_tags.size()) {
-                    if (origin.part_tags[part]) {
-                        if (const auto region =
-                                unique_output_region(output, origin.part_tags[part]))
-                            result.cache_boundaries[i] = region->end;
-                    } else if (origin.part_media[part]) {
-                        result.cache_boundaries[i] =
-                            layout.media_placeholders[*origin.part_media[part]].bytes.end +
-                            std::string_view("<|vision_end|>").size();
-                    }
-                }
+                result.cache_boundaries[i] = part_boundary(marker.after_message_count - 1U,
+                                                           marker.after_message_part_count - 1U);
             }
             break;
         }
     }
-    result.text = std::move(output.text);
+    result.text          = std::move(output.text);
+    result.literal_spans = std::move(output.literal_spans);
     return result;
 }
 

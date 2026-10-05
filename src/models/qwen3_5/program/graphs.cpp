@@ -1,6 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
-#include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/execution_context.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
 #include "core/device.h"
@@ -133,7 +133,7 @@ void ProgramImpl::prepare_graphs() {
         allocations.reserve(max_concurrency);
         for (std::uint32_t row = 0; row < max_concurrency; ++row) {
             std::optional<KVAddressSpaceHandle> allocation =
-                addresses.create_active(1, static_cast<std::int32_t>(row));
+                addresses.create_active(1, static_cast<std::int32_t>(row), device.stream);
             if (!allocation) { throw std::bad_alloc(); }
             allocations.push_back(*allocation);
             addresses.ensure_mapped_to_tokens(*allocation, 1, device.stream);
@@ -170,7 +170,7 @@ void ProgramImpl::prepare_graphs() {
             controls.push_back(io.mtp->target_input_ids);
             controls.push_back(io.mtp->target_positions);
         }
-        if (io.dflash_prefill) { controls.push_back(io.dflash_prefill->produced_count); }
+        if (io.dflash_prefill) { controls.push_back(io.dflash_prefill->local_append_count); }
         for (const Tensor& tensor : controls) {
             CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
         }
@@ -371,9 +371,9 @@ void ProgramImpl::prepare_graphs() {
         }
     }
     if (is_masked_draft_backend(speculative_backend)) {
-        const auto batch_one_profiles =
-            dflash_graph_profiles(speculative_backend, capacity, draft_window, 1);
-        validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
+        const auto planned_profiles =
+            dflash_graph_profiles(speculative_backend, capacity, draft_window);
+        validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
         execution::DFlashBatchContext dflash_state{execution_core(),
                                                    decoder->text_kv,
                                                    *dflash,
@@ -381,24 +381,19 @@ void ProgramImpl::prepare_graphs() {
                                                    *dflash_host_ingress,
                                                    *dflash_host_egress,
                                                    state_images->continuation_hidden_store()};
-        const GraphExecutionProfile code_warm = batch_one_profiles.front();
+        const GraphExecutionProfile code_warm = planned_profiles.front();
         const ops::CausalAttentionExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                    capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
         prepare_representative(code_warm.min, 1);
         device.synchronize();
         execution::dflash_decode_batch(dflash_state, 1, draft_window,
-                                       dflash_envelopes(code_warm.min, code_warm.max, draft_window),
+                                       dflash_envelopes(code_warm.max, draft_window),
                                        code_warm_target, nullptr);
         device.synchronize();
 
-        dflash_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
+        dflash_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-            const auto planned_profiles = batch_size == 1
-                                              ? batch_one_profiles
-                                              : dflash_graph_profiles(speculative_backend, capacity,
-                                                                      draft_window, batch_size);
-            validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
             for (const GraphExecutionProfile planned : planned_profiles) {
                 dflash_graphs.profiles.emplace_back();
                 DecodeGraphProfile& profile    = dflash_graphs.profiles.back();
@@ -414,7 +409,7 @@ void ProgramImpl::prepare_graphs() {
 
                 execution::capture_dflash_decode_batch(
                     dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
+                    dflash_envelopes(planned.max, draft_window), target_envelope,
                     profile.definition);
             }
         }

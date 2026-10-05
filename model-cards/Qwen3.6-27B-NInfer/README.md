@@ -71,11 +71,13 @@ only for NInfer; it is not a Transformers checkpoint, Safetensors distribution, 
 | Field | Value |
 |---|---|
 | Filename | `qwen3_6_27b.ninfer` |
-| Size | 17,495,537,920 bytes (16.29 GiB) |
-| SHA-256 | `842f0ba90aab6ea3481b28e65872d85ae17007a0b93e25b3490ea2fa6153fdf7` |
+| Size | 17,495,538,688 bytes (16.29 GiB) |
+| SHA-256 | `9b610a7d051e7c4dbf89adb604bd269d248b643c8f6c7ef75bdb871af92c6f6b` |
 | Container version | 3 |
 | Architecture | `Qwen3_5ForCausalLM` |
 | Public model name | `qwen3.6-27b` |
+| Chat template | [qwen3_6.jinja](https://github.com/Neroued/ninfer/blob/98dada0e03cb073fd07f905400b5904bc6e82759/tools/chat_templates/qwen3_6.jinja); override with `--chat-template FILE` |
+| Template defaults | thinking on; closed-turn reasoning omitted |
 
 The file contains Text, Vision, MTP, the optimized proposal head, and frontend resources. Text
 projections use Q4/Q5, vocabulary weights use Q6, and MTP projections use Q8. Vision and speculative
@@ -85,14 +87,14 @@ Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  '842f0ba90aab6ea3481b28e65872d85ae17007a0b93e25b3490ea2fa6153fdf7' \
+  '9b610a7d051e7c4dbf89adb604bd269d248b643c8f6c7ef75bdb871af92c6f6b' \
   'qwen3_6_27b.ninfer' | sha256sum --check
 ```
 
 ## Requirements
 
 - [NInfer](https://github.com/Neroued/ninfer) revision
-  [`04350ba`](https://github.com/Neroued/ninfer/commit/04350ba94c203833598ba1a41943031c468208f1)
+  [`98dada0`](https://github.com/Neroued/ninfer/commit/98dada0e03cb073fd07f905400b5904bc6e82759)
   or later, built from source;
 - 64-bit Linux;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
@@ -134,17 +136,16 @@ For images, videos, and structured chat history, see the
   --max-concurrency 2 \
   --kv-dtype fp8 \
   --device-state-slots 2 \
-  --host-state-slots 8 \
-  --host-kv-mib 8192 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft \
   --preserve-thinking
 ```
 
-Each request has a 240,000-token logical ceiling. The shared 240,000-token Device KV pool admits
-two active requests when their combined completion reservations fit; either request may use the
-full pool while running alone. Two extra Device checkpoint slots, eight pinned Host State slots,
-and 8 GiB of pinned Host KV retain reusable continuations under resource pressure.
+Each request has a 240,000-token logical ceiling. The shared 240,000-token Device KV pool grows
+with resident execution; resource pressure can pause a request for later Snapshot or Replay
+recovery. Either request may use the full pool while running alone. Two extra Device StateImages
+and the default shared pinned Host budget (8 GiB plus eight model StateImages) retain state, KV
+and pause snapshots.
 
 See the [HTTP serving guide](https://github.com/Neroued/ninfer/blob/master/docs/serving.md) for the
 API surface and the [resource scheduling reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/resource-scheduling-and-context-cache.md)
@@ -240,7 +241,7 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 - NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–8 active
   requests per Engine.
-- It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
+- It does not provide large-scale continuous batching, priority/QoS scheduling,
   multi-GPU execution, CPU/GPU offload, or distributed serving.
 - Context allocation is subject to GPU memory and the selected KV-cache type.
 - NInfer does not execute generated tool calls.
@@ -253,7 +254,7 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 | Source revision | `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9` |
 | Conversion recipe | `qwen3_6_27b` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
-| Minimum runtime revision | `04350ba94c203833598ba1a41943031c468208f1` |
+| Minimum runtime revision | `98dada0e03cb073fd07f905400b5904bc6e82759` |
 
 The artifact identity, summarized object inventory, and conversion provenance are published in
 [`artifact-manifest.json`](https://huggingface.co/neroued/Qwen3.6-27B-NInfer/blob/main/artifact-manifest.json).

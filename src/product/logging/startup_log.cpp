@@ -62,10 +62,8 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
     case StartupPhase::ProgramInitialize:
         return {"initializing runtime", "runtime initialized", PhaseVisibility::Debug, false,
                 false};
-    case StartupPhase::HostStatePin:
-        return {"pinning host state", "host state pinned", PhaseVisibility::Info, true, false};
-    case StartupPhase::HostKvPin:
-        return {"pinning host KV", "host KV pinned", PhaseVisibility::Info, true, false};
+    case StartupPhase::HostContextPin:
+        return {"pinning host context", "host context pinned", PhaseVisibility::Info, true, false};
     case StartupPhase::CudaGraphPrepare:
         return {"preparing CUDA graphs", "CUDA graphs ready", PhaseVisibility::Info, false, false};
     case StartupPhase::EngineFinalize:
@@ -286,9 +284,9 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
     const double total_seconds = impl_->engine_elapsed_ns != 0
                                      ? static_cast<double>(impl_->engine_elapsed_ns) * 1.0e-9
                                      : load.load_seconds;
-    impl_->logger->info("engine ready | {} | total {} | weights {}",
+    impl_->logger->info("engine ready | {} | total {} | weights {} | CUDA sync {}",
                         format_pretty_text(load.model_name), format_pretty_duration(total_seconds),
-                        format_pretty_bytes(load.host_to_device_bytes));
+                        format_pretty_bytes(load.host_to_device_bytes), load.cuda_sync_mode);
     impl_->logger->debug(
         "load detail | architecture {} | artifact read {} | H2D {} | staging peak {} | device "
         "objects {} | host objects {}",

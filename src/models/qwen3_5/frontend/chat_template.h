@@ -36,13 +36,13 @@ enum class Modality : std::uint8_t {
 };
 
 struct MediaPlaceholderByteSpec {
-    ByteSpan bytes;
+    text::ByteSpan bytes;
     Modality modality      = Modality::Image;
     std::size_t item_index = 0;
 };
 
 struct MediaTokenRunByteSpec {
-    ByteSpan bytes;
+    text::ByteSpan bytes;
     Modality modality       = Modality::Image;
     std::size_t item_index  = 0;
     std::size_t frame_index = 0;
@@ -108,10 +108,14 @@ struct ChatRenderOptions {
 struct RewriteCheckpointByteSpec {
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::size_t offset         = 0;
+    // A proven earlier content boundary may share the input recovery state with Shared.
+    // offset remains the typed rewrite boundary in the serialized conversation.
+    std::size_t recovery_offset = 0;
 };
 
 struct RenderedChat {
     std::string text;
+    std::vector<text::ByteSpan> literal_spans;
     bool starts_in_reasoning = false;
     std::vector<MediaPlaceholderByteSpec> media_placeholders;
     std::vector<MediaTokenRunByteSpec> media_token_runs;

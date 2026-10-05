@@ -94,8 +94,10 @@ bool is_openai_path(std::string_view path) {
     return path.starts_with("/v1/") && !is_anthropic_path(path);
 }
 
-void ensure_openai_request_id(const httplib::Request& request, httplib::Response& response) {
-    if (is_openai_path(request.path) && !response.has_header("x-request-id")) {
+void ensure_http_request_id(const httplib::Request& request, httplib::Response& response) {
+    if (is_anthropic_path(request.path) && !response.has_header("request-id")) {
+        response.set_header("request-id", new_anthropic_request_id());
+    } else if (is_openai_path(request.path) && !response.has_header("x-request-id")) {
         response.set_header("x-request-id", new_openai_request_id());
     }
 }
@@ -119,24 +121,22 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
 bool report_has_activity(const ThroughputReport& report) {
     return report.computed_prefill_tokens != 0 || report.committed_decode_tokens != 0 ||
            report.decode_rounds != 0 || report.current.running_requests != 0 ||
-           report.current.waiting_requests != 0 || report.current.materializing_requests != 0 ||
+           report.current.waiting_requests != 0 || report.current.paused_requests != 0 ||
+           report.current.replaying_requests != 0 || report.current.materializing_requests != 0 ||
            report.current.capture_pending_requests != 0 ||
            report.current.terminal_pending_requests != 0 ||
            report.current.active_captures_completed != report.previous.active_captures_completed ||
            report.current.active_captures_aborted != report.previous.active_captures_aborted ||
+           report.current.preemptions != report.previous.preemptions ||
+           report.current.snapshot_restores != report.previous.snapshot_restores ||
+           report.current.replay_restores != report.previous.replay_restores ||
+           report.current.replayed_tokens != report.previous.replayed_tokens ||
            report.current.root_selections != report.previous.root_selections ||
-           report.current.private_endpoint_selections !=
-               report.previous.private_endpoint_selections ||
-           report.current.private_turn_closure_selections !=
-               report.previous.private_turn_closure_selections ||
-           report.current.private_response_replay_selections !=
-               report.previous.private_response_replay_selections ||
-           report.current.private_long_anchor_selections !=
-               report.previous.private_long_anchor_selections ||
-           report.current.shared_stable_prefix_selections !=
-               report.previous.shared_stable_prefix_selections ||
+           report.current.checkpoint_selections != report.previous.checkpoint_selections ||
            report.current.state_moves != report.previous.state_moves ||
            report.current.state_forks != report.previous.state_forks ||
+           report.current.materialization_state_forks !=
+               report.previous.materialization_state_forks ||
            report.current.state_restores != report.previous.state_restores ||
            report.current.state_d2h_count != report.previous.state_d2h_count ||
            report.current.state_h2d_count != report.previous.state_h2d_count ||
@@ -149,22 +149,6 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.backend_kv_d2d_pages != report.previous.backend_kv_d2d_pages ||
            report.current.pressure_spill_pages != report.previous.pressure_spill_pages ||
            report.current.partial_tail_cow_pages != report.previous.partial_tail_cow_pages ||
-           report.current.pressure_private_owners_degraded !=
-               report.previous.pressure_private_owners_degraded ||
-           report.current.pressure_private_owners_evicted !=
-               report.previous.pressure_private_owners_evicted ||
-           report.current.pressure_shared_owners_degraded !=
-               report.previous.pressure_shared_owners_degraded ||
-           report.current.pressure_shared_owners_evicted !=
-               report.previous.pressure_shared_owners_evicted ||
-           report.current.pressure_checkpoints_dropped !=
-               report.previous.pressure_checkpoints_dropped ||
-           report.current.pressure_searches != report.previous.pressure_searches ||
-           report.current.pressure_search_budget_exhaustions !=
-               report.previous.pressure_search_budget_exhaustions ||
-           report.current.pressure_maximal_fallback_selections !=
-               report.previous.pressure_maximal_fallback_selections ||
-           report.current.historical_fork_hits != report.previous.historical_fork_hits ||
            report.current.device_state_occupied_slots !=
                report.previous.device_state_occupied_slots ||
            report.current.host_state_occupied_slots != report.previous.host_state_occupied_slots ||
@@ -173,7 +157,10 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.device_backend_kv_occupied_pages !=
                report.previous.device_backend_kv_occupied_pages ||
            report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
-           report.current.shared_active_references != report.previous.shared_active_references ||
+           report.current.host_context_occupied_bytes !=
+               report.previous.host_context_occupied_bytes ||
+           report.current.host_context_reserved_bytes !=
+               report.previous.host_context_reserved_bytes ||
            report.current.host_work.engine_boundary_ns !=
                report.previous.host_work.engine_boundary_ns ||
            report.current.host_work.program_submit_ns !=
@@ -220,7 +207,7 @@ void write_anthropic_error(httplib::Response& response, const ApiError& api_erro
 httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions& options,
                                                               const httplib::Request& request,
                                                               httplib::Response& response) {
-    ensure_openai_request_id(request, response);
+    ensure_http_request_id(request, response);
     if (!response.body.empty()) { return httplib::Server::HandlerResponse::Unhandled; }
 
     ApiError error;
@@ -238,7 +225,7 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
         return httplib::Server::HandlerResponse::Unhandled;
     }
     if (request.path.rfind("/v1/messages", 0) == 0) {
-        write_anthropic_error(response, error, new_anthropic_request_id());
+        write_anthropic_error(response, error, response.get_header_value("request-id"));
     } else {
         write_openai_error(response, error);
     }
@@ -323,23 +310,42 @@ void HttpServer::record_request_start(const RequestLogContext& context) {
 }
 
 void HttpServer::record_request_rejected(const RequestRejectionLogContext& context) {
+    metrics_.rejected();
     request_jsonl_.write_request_rejected(context);
     operational_log_.request_rejected(context);
 }
 
+ninfer::GenerationFirstTokenObserver HttpServer::first_token_observer() {
+    return [this](const ninfer::GenerationFirstTokenObservation& observation) {
+        metrics_.first_token(observation);
+    };
+}
+
+ninfer::GenerationSchedulingObserver HttpServer::scheduling_observer(std::uint64_t request_id,
+                                                                     std::string http_request_id) {
+    if (!request_jsonl_.enabled()) { return {}; }
+    return [this, request_id, http_request_id = std::move(http_request_id)](
+               const ninfer::GenerationSchedulingObservation& observation) {
+        request_jsonl_.write_request_scheduling(request_id, http_request_id, observation);
+    };
+}
+
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
+    metrics_.done(outcome);
     request_jsonl_.write_request_done(context, outcome);
     operational_log_.request_done(context, outcome);
 }
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
+    metrics_.failed(failure.classification == RequestFailureClass::ClientDisconnected);
     request_jsonl_.write_request_error(context, failure.machine_message);
     operational_log_.request_failure(context, failure);
 }
 
 void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
+    metrics_.response_failed();
     operational_log_.response_failure(request_id, failure);
 }
 
@@ -506,11 +512,12 @@ void HttpServer::run_stats_reporter() {
 
     const ninfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
-    const ThroughputReport tail        = make_throughput_report(
+    ThroughputReport tail              = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
     // The exact partial interval remains useful to measurement consumers. Pretty throughput is a
     // fixed-cadence operational record and deliberately has no irregular shutdown tail.
-    if (report_has_activity(tail)) { request_jsonl_.write_throughput(tail); }
+    tail.final_interval = true;
+    request_jsonl_.write_throughput(tail);
 }
 
 void HttpServer::stop_stats_reporter() {
@@ -543,7 +550,7 @@ void HttpServer::register_routes() {
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-        ensure_openai_request_id(req, res);
+        ensure_http_request_id(req, res);
         if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
@@ -561,7 +568,7 @@ void HttpServer::register_routes() {
             error.message = "missing or invalid API key";
             // Render the 401 in the shape the target endpoint speaks.
             if (req.path.rfind("/v1/messages", 0) == 0) {
-                write_anthropic_error(res, error, new_anthropic_request_id());
+                write_anthropic_error(res, error, res.get_header_value("request-id"));
             } else {
                 write_openai_error(res, error);
             }
@@ -572,7 +579,7 @@ void HttpServer::register_routes() {
 
     server_.set_exception_handler(
         [this](const httplib::Request& req, httplib::Response& res, std::exception_ptr ep) {
-            ensure_openai_request_id(req, res);
+            ensure_http_request_id(req, res);
             try {
                 std::rethrow_exception(ep);
             } catch (const ApiException& e) {
@@ -583,7 +590,7 @@ void HttpServer::register_routes() {
                         response_request_id(res));
                 }
                 if (req.path.rfind("/v1/messages", 0) == 0) {
-                    write_anthropic_error(res, e.error(), new_anthropic_request_id());
+                    write_anthropic_error(res, e.error(), res.get_header_value("request-id"));
                 } else {
                     write_openai_error(res, e.error());
                 }
@@ -596,7 +603,7 @@ void HttpServer::register_routes() {
                     ApiError error;
                     error.status  = 500;
                     error.message = e.what();
-                    write_anthropic_error(res, error, new_anthropic_request_id());
+                    write_anthropic_error(res, error, res.get_header_value("request-id"));
                 } else {
                     write_exception(res, e);
                 }
@@ -610,7 +617,7 @@ void HttpServer::register_routes() {
                 error.type    = "internal_error";
                 error.message = "unknown error";
                 if (req.path.rfind("/v1/messages", 0) == 0) {
-                    write_anthropic_error(res, error, new_anthropic_request_id());
+                    write_anthropic_error(res, error, res.get_header_value("request-id"));
                 } else {
                     write_openai_error(res, error);
                 }
@@ -647,6 +654,12 @@ void HttpServer::register_routes() {
                         req.matches.size() > 1 ? req.matches[1].str() : std::string();
                     handle_model_card(id, res);
                 });
+    server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
+        const auto stats = service_->runtime_stats();
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(metrics_.render(stats, service_->is_available()),
+                        "text/plain; version=0.0.4; charset=utf-8");
+    });
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
     });
@@ -956,135 +969,6 @@ void HttpServer::handle_model_details(const std::string& model_id, httplib::Resp
     res.set_content(payload.dump(), "application/json");
 }
 
-void HttpServer::handle_metrics(httplib::Response& res) const {
-    using Clock  = std::chrono::steady_clock;
-    static const Clock::time_point process_start = Clock::now();
-    struct CounterDef {
-        const char* name;
-        const char* help;
-        std::uint64_t value;
-    };
-    std::string out;
-    auto emit_u64 = [&](const char* name, const char* help, std::uint64_t value,
-                        const char* labels = "") {
-        out += std::string("# HELP ") + name + ' ' + help + "\n# TYPE " + name + " counter\n" +
-               name + labels + ' ' + std::to_string(value) + "\n";
-    };
-    auto emit_gauge = [&](const char* name, const char* help, std::uint64_t value) {
-        out += std::string("# HELP ") + name + ' ' + help + "\n# TYPE " + name + " gauge\n" +
-               name + ' ' + std::to_string(value) + "\n";
-    };
-    auto emit_dbl = [&](const char* name, const char* help, double value) {
-        out += std::string("# HELP ") + name + ' ' + help + "\n# TYPE " + name + " gauge\n" +
-               name + ' ' + std::to_string(value) + "\n";
-    };
-
-    if (service_ == nullptr) {
-        res.status = 503;
-        res.set_content(out, "text/plain; version=0.0.4");
-        return;
-    }
-    const ninfer::RuntimeStats stats = service_->runtime_stats();
-    const ninfer::LoadSummary load   = service_->load_summary();
-    // Fresh 5s-window rates from the stats reporter (0 when idle — lifetime averages
-    // over full uptime are meaningless on a bursty server).
-    double window_prefill_tps = 0.0;
-    double window_decode_tps  = 0.0;
-    bool   window_fresh       = false;
-    {
-        std::lock_guard lock(last_throughput_mutex_);
-        const double age_s = std::chrono::duration<double>(
-                                 Clock::now() - last_throughput_at_).count();
-        window_fresh = age_s < 10.0 && last_throughput_.interval_seconds > 0.0;
-        if (window_fresh) {
-            window_prefill_tps = static_cast<double>(last_throughput_.computed_prefill_tokens) /
-                                 last_throughput_.interval_seconds;
-            window_decode_tps = static_cast<double>(last_throughput_.committed_decode_tokens) /
-                                last_throughput_.interval_seconds;
-        }
-    }
-
-    emit_u64("llamacpp:prompt_tokens_total",
-             "Total prompt tokens computed by prefill (cache hits excluded).",
-             stats.computed_prefill_tokens);
-    emit_u64("llamacpp:prompt_seconds_total", "Total wall seconds spent computing prefill.",
-             0);
-    emit_u64("llamacpp:tokens_predicted_total",
-             "Total output tokens committed by decode.", stats.committed_decode_tokens);
-    emit_u64("llamacpp:tokens_predicted_seconds_total",
-             "Total wall seconds spent decoding.", 0);
-    emit_gauge("llamacpp:requests_processing", "Requests currently running or prefilling.",
-               static_cast<std::uint64_t>(stats.running_requests));
-    emit_gauge("llamacpp:prompt_tokens_seconds", "Recent-window prefill throughput (tok/s).",
-               window_prefill_tps);
-    emit_gauge("llamacpp:predicted_tokens_seconds", "Recent-window decode throughput (tok/s).",
-               window_decode_tps);
-    emit_gauge("ninfer:throughput_window_fresh", "1 if the throughput window saw activity.",
-               window_fresh ? 1 : 0);
-    emit_gauge("llamacpp:requests_deferred", "Requests waiting in the admission queue.",
-               static_cast<std::uint64_t>(stats.waiting_requests));
-    emit_gauge("llamacpp:prompt_cache_tokens_total",
-               "Prompt tokens served from checkpoint reuse (all reuse paths).",
-               stats.reused_prompt_tokens);
-
-    emit_u64("ninfer:requests_total", "Total generation requests admitted.",
-             stats.root_selections + stats.private_endpoint_selections +
-                 stats.private_turn_closure_selections +
-                 stats.private_response_replay_selections +
-                 stats.private_long_anchor_selections +
-                 stats.shared_stable_prefix_selections);
-    emit_u64("ninfer:decode_rounds_total", "Decode batch executions.", stats.decode_rounds);
-    emit_u64("ninfer:decode_row_rounds_total",
-             "Sum of per-row decode executions across batches.", stats.decode_row_rounds);
-    emit_u64("ninfer:prefill_units_total", "Prefill compact-batch units executed.",
-             stats.host_work.prefill_units);
-    emit_u64("ninfer:prompt_cache_root_selections_total",
-             "Requests whose reuse candidate was the shared root (cold prefill).",
-             stats.root_selections);
-    emit_u64("ninfer:prompt_cache_private_endpoint_selections_total",
-             "Requests restored from their session endpoint (pure appends).",
-             stats.private_endpoint_selections);
-    emit_u64("ninfer:prompt_cache_turn_closure_selections_total",
-             "Requests restored from a turn-closure checkpoint.",
-             stats.private_turn_closure_selections);
-    emit_u64("ninfer:prompt_cache_response_replay_selections_total",
-             "Requests restored by response replay.", stats.private_response_replay_selections);
-    emit_u64("ninfer:prompt_cache_long_anchor_selections_total",
-             "Requests restored from a private long anchor (history rewrite).",
-             stats.private_long_anchor_selections);
-    emit_u64("ninfer:prompt_cache_shared_prefix_selections_total",
-             "Requests reading a published shared prefix.",
-             stats.shared_stable_prefix_selections);
-    emit_gauge("ninfer:prefilling_requests", "Requests currently computing prefill.",
-               stats.prefilling_requests);
-    emit_gauge("ninfer:decode_ready_requests", "Requests holding a decode lane.",
-               stats.decode_ready_requests);
-    emit_gauge("ninfer:materializing_requests", "Requests restoring checkpoints.",
-               stats.materializing_requests);
-    emit_gauge("ninfer:capture_pending_requests", "Requests waiting on checkpoint capture.",
-               stats.capture_pending_requests);
-    emit_gauge("ninfer:device_state_occupied_slots", "Occupied device state slots.",
-               stats.device_state_occupied_slots);
-    emit_gauge("ninfer:host_state_occupied_slots", "Occupied host state slots.",
-               stats.host_state_occupied_slots);
-    emit_gauge("ninfer:device_main_kv_occupied_pages", "Occupied main KV pages on device.",
-               stats.device_main_kv_occupied_pages);
-    emit_u64("ninfer:active_captures_completed_total",
-             "Checkpoint captures completed.", stats.active_captures_completed);
-    emit_u64("ninfer:active_captures_aborted_total",
-             "Checkpoint captures aborted.", stats.active_captures_aborted);
-    emit_u64("ninfer:pressure_spill_pages_total", "KV pages spilled under pressure.",
-             stats.pressure_spill_pages);
-    emit_u64("ninfer:pressure_private_owners_evicted_total",
-             "Private continuations evicted under pressure.",
-             stats.pressure_private_owners_evicted);
-    emit_dbl("ninfer:process_uptime_seconds", "Seconds since the stats endpoint was initialized.",
-             std::chrono::duration<double>(Clock::now() - process_start).count());
-
-    res.set_header("Cache-Control", "no-store");
-    res.set_content(out, "text/plain; version=0.0.4");
-}
-
 void HttpServer::handle_slots(httplib::Response& res) const {
     if (service_ == nullptr) {
         res.status = 503;
@@ -1288,8 +1172,13 @@ void HttpServer::attach(GenerationService& service) {
         throw std::logic_error("HTTP generation service is already attached");
     }
     const ninfer::LoadSummary load = service.load_summary();
-    public_model_id_               = resolve_public_model_id(options_, load.model_name);
-    service_                       = &service;
+    // memory_summary waits for the completed worker boundary, including warmup publication.
+    const ninfer::MemorySummary memory  = service.memory_summary();
+    const ninfer::RuntimeStats baseline = service.runtime_stats();
+    public_model_id_                    = resolve_public_model_id(options_, load.model_name);
+    service_                            = &service;
+    metrics_.configure(public_model_id_, service.engine_options(), memory, baseline);
+    request_jsonl_.write_server_start(options_, service.engine_options(),
     request_jsonl_.write_server_start(options_, service.engine_options(),
                                       service.sampling_defaults(), public_model_id_, load,
                                       service.memory_summary());
