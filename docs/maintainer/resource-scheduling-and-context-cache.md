@@ -741,10 +741,26 @@ union 中。
 若 isolated root 超过静态合同，结果为 permanently infeasible；若 isolated root 可行但 active guarantee、
 lane 或 open transaction 阻塞，结果为 temporarily blocked。
 
+root maximal 释放全部可牺牲 cache；若 optional search 因 budget 耗尽而停止，它会被直接 seal，把本可
+下沉到 Host 的 inactive owner（包括请求自己的 checkpoint）全部 evict。因此同样在 optional budget 之外，
+Planner 还为每个 candidate assessment spill seed：
+
+```text
+candidate
++ other owners demote Device replicas to Host (non-evicting maximal relief)
++ evict only owners without such relief
+```
+
+private continuation 与其发布来源的 shared prefix 可能引用同一批 pages，两侧同时下沉时 target 不可组合
+（StructuralInvalid）。因此 seed 先尝试全部下沉（All）；不可行时分别尝试只下沉 private（PrivateOnly）或
+只下沉 shared（SharedOnly）；两者都不可行时再尝试 private 下沉、shared evict（PrivateSpillSharedEvict）。
+可行 seed 只在完整 J 严格低于 root maximal 时取代它，root maximal 仍是最后的 correctness incumbent。
+
 ### 8.7 有界 heuristic search
 
 Materialization 与 shared capture 使用两个 typed entrypoint。Materialization 的 incumbent 是已验证
-identity 或 root maximal；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
+identity，或 root maximal 与 spill seeds（§8.6）中 J 最低者；shared capture 的 incumbent 是 Skip，只有
+exact `NetGain>0` 才替换。
 
 一次 planning problem 中：
 

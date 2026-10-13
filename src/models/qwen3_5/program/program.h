@@ -568,6 +568,12 @@ public:
     [[nodiscard]] PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] PressureTargetHandle maximal_target(runtime::PlanningCandidateId candidate);
+    // Other owners spill their Device replicas to Host instead of being evicted. A private
+    // continuation and the shared prefix it was published from can reference the same pages, so
+    // the shapes let planning keep one side unchanged (or evict it) when spilling both does not
+    // compose. An owner without non-evicting relief is evicted.
+    [[nodiscard]] PressureTargetHandle
+    spill_maximal_target(runtime::PlanningCandidateId candidate, runtime::SpillSeedShape shape);
     [[nodiscard]] PressureConstructionCursor begin_construction(PressureTargetHandle target,
                                                                 bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep

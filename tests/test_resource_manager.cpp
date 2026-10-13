@@ -24,6 +24,7 @@ using ninfer::runtime::CheckpointKind;
 using ninfer::runtime::CheckpointRecoveryAlternativeWork;
 using ninfer::runtime::CheckpointRef;
 using ninfer::runtime::CheckpointScope;
+using ninfer::runtime::SpillSeedShape;
 using ninfer::runtime::CommitDisposition;
 using ninfer::runtime::ConsumeStatus;
 using ninfer::runtime::ContextOperationCounts;
@@ -559,6 +560,8 @@ public:
     [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
     struct Cursor;
     [[nodiscard]] FakePressureTargetHandle maximal_target(PlanningCandidateId candidate);
+    [[nodiscard]] FakePressureTargetHandle spill_maximal_target(PlanningCandidateId candidate,
+                                                                SpillSeedShape shape);
     [[nodiscard]] Cursor begin_construction(FakePressureTargetHandle target, bool restore = false);
     [[nodiscard]] ninfer::runtime::PressureConstructionStep
     next_construction_option(Cursor& cursor);
@@ -1364,6 +1367,57 @@ FakePressurePlanningSession::maximal_target(PlanningCandidateId candidate) {
     const auto target                   = root_maximal_target(candidate);
     targets_[target.index].root_maximal = false;
     return target;
+}
+
+// Each spilled owner takes its first non-evicting decision (the fake's Host relief) or, without
+// one, its maximal decision; owners outside the shape stay unchanged or, for
+// PrivateSpillSharedEvict, are evicted.
+FakePressureTargetHandle
+FakePressurePlanningSession::spill_maximal_target(PlanningCandidateId candidate,
+                                                  SpillSeedShape shape) {
+    const std::uint32_t selected = candidate_index(candidate);
+    populate_options(selected);
+    Target spill{
+        .candidate_index = selected,
+        .choices         = std::vector<std::uint16_t>(owners_.size(), 0),
+    };
+    for (std::size_t index = 0; index < owners_.size(); ++index) {
+        const auto& alternatives = options_[selected][index];
+        if (alternatives.empty()) { continue; }
+        const bool shared = owners_[index].shared;
+        const bool spilled =
+            shape == SpillSeedShape::All || (shape == SpillSeedShape::PrivateOnly && !shared) ||
+            (shape == SpillSeedShape::SharedOnly && shared) ||
+            (shape == SpillSeedShape::PrivateSpillSharedEvict && !shared);
+        const auto maximal = static_cast<std::uint16_t>(alternatives.size());
+        if (!spilled) {
+            if (shape == SpillSeedShape::PrivateSpillSharedEvict) { spill.choices[index] = maximal; }
+            continue;
+        }
+        const auto relief =
+            std::find_if(alternatives.begin(), alternatives.end(),
+                         [](const FakeTargetDecision& decision) {
+                             return !decision.evicts_continuation;
+                         });
+        spill.choices[index] =
+            relief == alternatives.end()
+                ? maximal
+                : static_cast<std::uint16_t>(relief - alternatives.begin() + 1);
+    }
+    auto found = std::find_if(targets_.begin(), targets_.end(),
+                              [&](const Target& target) { return same_target(target, spill); });
+    if (found != targets_.end()) {
+        return FakePressureTargetHandle{
+            .generation = generation_,
+            .index      = static_cast<std::uint32_t>(found - targets_.begin()),
+        };
+    }
+    spill.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
+    targets_.push_back(std::move(spill));
+    return FakePressureTargetHandle{
+        .generation = generation_,
+        .index      = static_cast<std::uint32_t>(targets_.size() - 1U),
+    };
 }
 
 FakePressurePlanningSession::Cursor
@@ -2820,6 +2874,41 @@ void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
             "guided pressure search returned to eager breadth-first assessment");
 }
 
+void test_exhausted_search_spills_instead_of_maximal_eviction() {
+    constexpr std::size_t owner_count = 7;
+    FakeManager manager               = make_manager(1, owner_count + 1U);
+    FakeProgram program;
+    std::array<std::uint32_t, owner_count> owner_ids{};
+    for (std::size_t index = 0; index < owner_count; ++index) {
+        const std::uint32_t content = static_cast<std::uint32_t>(110U + index);
+        const ActiveRequest active =
+            start_active(manager, program, content, make_base(content), index + 1U);
+        owner_ids[index] = active.sequence.id;
+        (void)finish_active(manager, program, active);
+    }
+
+    // Every parked owner must yield, and each assessment outlasts the whole planning allowance,
+    // so no optional search runs: only the correctness seeds decide.
+    program.required_pressure_actions     = owner_count;
+    program.private_pressure_alternatives = 1;
+    program.pressure_action_immediate_ns  = 0;
+    program.pressure_assessment_delay_us  = 60'000;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{130}, make_base(130), 20);
+    require(inspection.choice.has_value(), "exhausted pressure search found no admission plan");
+
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{130}, {});
+    for (const std::uint32_t owner_id : owner_ids) {
+        require(std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
+                          1000U + owner_id) != program.started_action_ids.end(),
+                "exhausted pressure search did not keep a parked owner through Host relief");
+        require(std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
+                          2000U + owner_id) == program.started_action_ids.end(),
+                "exhausted pressure search evicted a parked owner that had Host relief");
+    }
+}
+
 void test_combined_target_reprices_cancelled_pressure_copy() {
     FakeManager manager = make_manager(1, 3);
     FakeProgram program;
@@ -3500,6 +3589,8 @@ int main() {
              test_materialization_result_is_adopted_by_owner_identity);
     run_test("guided deep retention",
              test_guided_pressure_reaches_deep_retention_before_maximal_fallback);
+    run_test("exhausted search spills instead of maximal eviction",
+             test_exhausted_search_spills_instead_of_maximal_eviction);
     run_test("combined target exact repricing",
              test_combined_target_reprices_cancelled_pressure_copy);
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);

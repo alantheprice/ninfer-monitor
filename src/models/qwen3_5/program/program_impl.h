@@ -1227,6 +1227,9 @@ struct PressurePlanningSessionImpl {
         std::uint32_t owner_index = 0;
         std::vector<PressureDecision> decisions;
         std::uint16_t eviction_choice = 0;
+        // Maximal non-evicting relief: every movable Device replica demoted to or dropped in
+        // favour of Host. Zero when the owner has no such relief.
+        std::uint16_t spill_choice = 0;
     };
 
     struct CandidateOptions {
@@ -1283,6 +1286,8 @@ struct PressurePlanningSessionImpl {
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] qwen3_5::PressureTargetHandle
     maximal_target(runtime::PlanningCandidateId candidate);
+    [[nodiscard]] qwen3_5::PressureTargetHandle
+    spill_maximal_target(runtime::PlanningCandidateId candidate, runtime::SpillSeedShape shape);
     [[nodiscard]] qwen3_5::PressureConstructionCursor
     begin_construction(qwen3_5::PressureTargetHandle target, bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep

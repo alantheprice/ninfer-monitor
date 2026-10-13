@@ -238,27 +238,57 @@ public:
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
         } else {
-            PressureTargetHandle root_maximal =
-                session.root_maximal_target(candidates[root_candidate_index].id);
-            AssessedPressureTarget assessed            = session.assess(root_maximal);
-            const PressureTargetAssessment& assessment = assessed.assessment();
-            if (assessment.candidate != candidates[root_candidate_index].id) {
-                throw std::logic_error("maximal pressure target changed admission candidate");
+            // Correctness seeds, assessed outside the optional budget: the root-maximal fallback
+            // and, for every candidate, targets that spill other owners to Host instead of
+            // evicting them. Without the spill seeds an exhausted search commits root maximal,
+            // evicting every inactive owner (the requester's own checkpoint included) while Host
+            // capacity is unused.
+            std::optional<Incumbent> seed;
+            const auto consider = [&](PressureTargetHandle target,
+                                      std::uint32_t candidate_index) -> bool {
+                AssessedPressureTarget assessed            = session.assess(target);
+                const PressureTargetAssessment& assessment = assessed.assessment();
+                if (assessment.candidate != candidates[candidate_index].id) {
+                    throw std::logic_error("maximal pressure target changed admission candidate");
+                }
+                ++targets_evaluated;
+                planning_saturating_add(projection_work, assessment.projection_work);
+                mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
+                if (assessment.physical_status != MaterializationPhysicalStatus::Feasible) {
+                    return false;
+                }
+                const std::optional<LogicalGoal> goal = logical_goal(
+                    assessment.candidate, assessment.source_mode, assessment.owner_outcomes);
+                if (!goal) { return false; }
+                const FoldedCost cost =
+                    fold_assessment(candidates[candidate_index], assessment, pressure.owner_policy,
+                                    pressure.checkpoint_policy, machine_cost);
+                if (!seed || cost.less(seed->cost)) {
+                    seed = make_incumbent(target, candidate_index, assessment, std::move(assessed),
+                                          cost, *goal);
+                }
+                return true;
+            };
+            // Root maximal first: a spill seed replaces it only when strictly cheaper.
+            consider(session.root_maximal_target(candidates[root_candidate_index].id),
+                     root_candidate_index);
+            // Narrower shapes only when a wider one does not compose: a private continuation and
+            // the shared prefix it was published from can claim the same pages.
+            for (std::size_t index = 0; index < candidates.size(); ++index) {
+                const auto candidate_index = static_cast<std::uint32_t>(index);
+                const auto spill           = [&](SpillSeedShape shape) {
+                    return consider(session.spill_maximal_target(candidates[index].id, shape),
+                                    candidate_index);
+                };
+                if (spill(SpillSeedShape::All)) { continue; }
+                const bool private_only = spill(SpillSeedShape::PrivateOnly);
+                const bool shared_only  = spill(SpillSeedShape::SharedOnly);
+                if (!private_only && !shared_only) {
+                    (void)spill(SpillSeedShape::PrivateSpillSharedEvict);
+                }
             }
-            ++targets_evaluated;
-            planning_saturating_add(projection_work, assessment.projection_work);
-            std::optional<LogicalGoal> goal;
-            if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
-                goal = logical_goal(assessment.candidate, assessment.source_mode,
-                                    assessment.owner_outcomes);
-            }
-            if (!goal) { return std::nullopt; }
-            const FoldedCost cost =
-                fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
-                                pressure.checkpoint_policy, machine_cost);
-            incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
-                                       std::move(assessed), cost, *goal);
-            mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
+            if (!seed) { return std::nullopt; }
+            incumbent = std::move(*seed);
         }
 
         if (!identity_best) { search_started = Clock::now(); }

@@ -135,6 +135,13 @@ PressurePlanningSession::maximal_target(runtime::PlanningCandidateId candidate) 
     return impl_->maximal_target(candidate);
 }
 
+PressureTargetHandle
+PressurePlanningSession::spill_maximal_target(runtime::PlanningCandidateId candidate,
+                                              runtime::SpillSeedShape shape) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->spill_maximal_target(candidate, shape);
+}
+
 PressureConstructionCursor PressurePlanningSession::begin_construction(PressureTargetHandle target,
                                                                        bool restore) {
     return impl_->begin_construction(target, restore);

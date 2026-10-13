@@ -412,6 +412,28 @@ void PressurePlanningSessionImpl::populate_options(std::uint32_t selected_candid
             throw std::overflow_error("pressure owner target count is not representable");
         }
         victim.eviction_choice = static_cast<std::uint16_t>(decisions.size());
+
+        // Maximal non-evicting relief: an unbounded Device deficit with no Host deficit makes the
+        // owner drop Device duplicates and demote every other movable replica to Host. Host
+        // capacity is not checked here; assessing a target rejects one that does not fit.
+        constexpr std::uint32_t kAll = std::numeric_limits<std::uint32_t>::max();
+        const detail::PhysicalResources spill_deficit{
+            .device = {.state_slots = kAll, .main_kv_pages = kAll, .backend_kv_pages = kAll},
+        };
+        std::optional<PressureDecision> spill =
+            owner.shared
+                ? program->inspect_shared_pressure_option(
+                      program->shared_prefix_states[PlanningContractAccess::index(
+                          *owner.shared_handle)],
+                      spill_deficit, &*protection)
+                : program->inspect_pressure_option(
+                      program->continuation_states[PlanningContractAccess::index(
+                          *owner.private_handle)],
+                      spill_deficit, &*protection);
+        if (spill && !spill->evicts_continuation && *spill != decisions.front()) {
+            decisions.push_back(std::move(*spill));
+            victim.spill_choice = static_cast<std::uint16_t>(decisions.size());
+        }
     }
     options.populated = true;
 }
@@ -467,6 +489,35 @@ PressurePlanningSessionImpl::root_maximal_target(runtime::PlanningCandidateId ro
     handle.generation_ = generation;
     handle.index_      = target_index;
     return handle;
+}
+
+qwen3_5::PressureTargetHandle
+PressurePlanningSessionImpl::spill_maximal_target(runtime::PlanningCandidateId id,
+                                                  runtime::SpillSeedShape shape) {
+    if (scratch_live) { throw std::logic_error("pressure expansion scratch is live"); }
+    const auto selected = candidate_index(id);
+    populate_options(selected);
+    choice_scratch.clear();
+    using Shape = runtime::SpillSeedShape;
+    for (const auto& victim : candidate_options[selected].victims) {
+        const bool shared = owners[victim.owner_index].shared;
+        const bool spill  = shape == Shape::All || (shape == Shape::PrivateOnly && !shared) ||
+                           (shape == Shape::SharedOnly && shared) ||
+                           (shape == Shape::PrivateSpillSharedEvict && !shared);
+        std::uint16_t choice = 0; // unchanged
+        if (spill) {
+            choice = victim.spill_choice != 0 ? victim.spill_choice : victim.eviction_choice;
+        } else if (shape == Shape::PrivateSpillSharedEvict) {
+            choice = victim.eviction_choice;
+        }
+        choice_scratch.push_back(choice);
+    }
+    const auto index = intern_target(selected, choice_scratch);
+    qwen3_5::PressureTargetHandle result;
+    result.session_    = this;
+    result.generation_ = generation;
+    result.index_      = index;
+    return result;
 }
 
 qwen3_5::PressureTargetHandle

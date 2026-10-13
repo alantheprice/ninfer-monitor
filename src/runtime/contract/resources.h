@@ -231,6 +231,16 @@ enum class MaterializationPhysicalStatus : std::uint8_t {
     StructuralInvalid,
 };
 
+// Shape of a non-evicting maximal pressure seed: which eligible owners spill their Device
+// replicas to Host. Owners outside the spilled side stay unchanged, or are evicted for
+// PrivateSpillSharedEvict.
+enum class SpillSeedShape : std::uint8_t {
+    All,
+    PrivateOnly,
+    SharedOnly,
+    PrivateSpillSharedEvict,
+};
+
 inline constexpr std::size_t kContextTransferDirectionCount = 3;
 using CoalescedTransferWork = std::array<TransferWork, kContextTransferDirectionCount>;
 
