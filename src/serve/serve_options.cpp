@@ -102,7 +102,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --disk-cache / --prompt-cache     Enable persistent multi-turn prompt caching to disk via DirectStorage DMA\n"
            "  --no-disk-cache                   Disable persistent disk prompt cache (default)\n"
            "  --disk-cache-dir <DIR>            Directory path for prompt cache (default: %LOCALAPPDATA%/ninfer/cache/<profile>)\n"
-           "  --disk-cache-gb <N>               Disk cache storage quota limit in GiB (default: 30)\n\n"
+           "  --disk-cache-gib <N>              Disk cache storage quota limit in GiB (default: 30)\n"
+           "                                    (aliases: --disk-cache-gb, --prompt-cache-gb)\n\n"
            "Quantization & Storage Layouts:\n"
            "  --kv-dtype <dtype>          KV cache storage data type and quantization layout:\n"
            "                                bf16       - 16-bit brain floating-point\n"
@@ -261,7 +262,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prompt-cache-dir" || arg == "--disk-cache-dir") {
             options.prompt_cache_dir    = require_value(arg.c_str());
             options.enable_prompt_cache = true;
-        } else if (arg == "--prompt-cache-gb" || arg == "--disk-cache-gb") {
+        } else if (arg == "--prompt-cache-gib" || arg == "--disk-cache-gib" || arg == "--prompt-cache-gb" || arg == "--disk-cache-gb") {
             const std::uint64_t gb = parse_u64(require_value(arg.c_str()), arg.c_str());
             options.prompt_cache_max_bytes = static_cast<std::size_t>(gb << 30);
             options.enable_prompt_cache    = true;
