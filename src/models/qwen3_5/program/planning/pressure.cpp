@@ -2634,7 +2634,7 @@ bool ProgramImpl::persistent_backfill_safe(
 
 qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     const detail::PhysicalResources usage = physical_occupancy();
-    return qwen3_5::PhysicalUsageSnapshot{
+    qwen3_5::PhysicalUsageSnapshot out{
         .resource_revision       = resource_revision_,
         .device_state_slots      = usage.device.state_slots,
         .host_state_slots        = usage.host.state_slots,
@@ -2642,6 +2642,8 @@ qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
         .device_backend_kv_pages = usage.device.backend_kv_pages,
         .host_kv_bytes           = usage.host.kv_bytes,
     };
+    populate_disk_usage(out);
+    return out;
 }
 
 

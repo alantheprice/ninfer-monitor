@@ -1329,6 +1329,15 @@ private:
                              typename ModelContract::PrefillProgress&& progress,
                              const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
+        if constexpr (requires { progress.waiting; }) {
+            if (progress.waiting) {
+                if (progress.complete || progress.processed_prompt_tokens != 0 ||
+                    progress.pending || progress.capture) {
+                    throw std::logic_error("waiting prefill step reported progress");
+                }
+                return;
+            }
+        }
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;

@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
+#include "core/disk_context_archive.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -21,6 +22,7 @@
 #include "models/qwen3_5/program/vision_prefill.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <array>
 #include <limits>
@@ -422,6 +424,11 @@ struct RequestControl {
         bool prepare_mtp                    = false;
         ReusePath reuse                     = ReusePath::Root;
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
+        // Frontier at which a BeforeSuffix MTP bridge runs: the planned base, or the archived
+        // frontier after a disk restore.
+        std::uint32_t bridge_frontier = 0;
+        std::shared_ptr<DiskContextArchive::Prefetch> disk_restore;
+        std::chrono::steady_clock::time_point disk_restore_deadline;
     };
 
     std::optional<Prefill> prefill;
@@ -592,6 +599,26 @@ public:
     std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
     std::unique_ptr<qwen3_5::HostStatePool> host_state_images;
+
+    // Persistent NVMe tier (storage/disk_tier.cpp). The archive is declared after its staging so
+    // its I/O threads stop before the staging is freed. Staging is pageable and untouched until an
+    // archive or restore uses it, so only the bytes actually in flight become resident.
+    struct DiskTier {
+        std::unique_ptr<std::byte[]> staging;
+        std::size_t staging_bytes = 0;
+        std::unique_ptr<DiskContextArchive> archive;
+        HostKVPageLayout text_layout;
+        std::optional<HostKVPageLayout> backend_layout;
+        std::uint32_t min_tokens       = 0;
+        std::uint64_t restores         = 0;
+        std::uint64_t restored_tokens  = 0;
+        std::uint64_t restore_failures = 0;
+        std::uint64_t save_failures    = 0;
+        std::uint64_t save_skips       = 0;
+        double restore_seconds         = 0.0;
+    };
+
+    std::unique_ptr<DiskTier> disk_tier_;
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
@@ -1069,6 +1096,21 @@ private:
         std::vector<runtime::CheckpointRecoveryAlternativeWork>& alternatives,
         PressureRecoveryScratch& scratch, std::uint64_t& projection_work) const;
     void publish_checkpoint_drop(SequenceState& sequence, runtime::CheckpointRef checkpoint);
+
+    enum class DiskRestoreStep : std::uint8_t { None, Waiting, Restored };
+    void initialize_disk_tier(const ContextCacheOptions& options);
+    [[nodiscard]] std::optional<std::uint32_t>
+    disk_backend_frontier(std::uint32_t frontier) const noexcept;
+    void archive_finished_sequence(const SequenceState& sequence) noexcept;
+    void begin_disk_restore(const SequenceState& sequence, RequestControl::Prefill& staged,
+                            ReusePath reuse) noexcept;
+    [[nodiscard]] DiskRestoreStep advance_disk_restore(SequenceState& sequence,
+                                                       RequestControl::Prefill& staged,
+                                                       std::uint32_t& restored_tokens);
+    [[nodiscard]] std::uint32_t restore_from_disk(SequenceState& sequence,
+                                                  RequestControl::Prefill& staged,
+                                                  const DiskContextArchive::Prefetch& prefetch);
+    void populate_disk_usage(qwen3_5::PhysicalUsageSnapshot& out) const noexcept;
     [[nodiscard]] PrefillProgress wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step);
     [[nodiscard]] PendingBatch wrap_pending(std::span<const std::uint32_t> lanes,
                                             const runtime::BatchedGeneratedRound& round);

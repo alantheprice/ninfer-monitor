@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/prefix_identity.h"
 #include <algorithm>
 #include <bit>
+#include <cstring>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
@@ -254,6 +255,77 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
                std::distance(rewrite_execution_frontiers_.begin(), resident_end) &&
            std::equal(prompt.identity.rewrite_execution_frontiers.begin(), incoming_end,
                       rewrite_execution_frontiers_.begin());
+}
+
+namespace {
+
+constexpr std::uint32_t kTextPrefixArchiveMagic = 0x5444494EU;
+
+template <typename T>
+void append_values(std::vector<std::byte>& out, const T* values, std::size_t count) {
+    const std::size_t offset = out.size();
+    out.resize(offset + count * sizeof(T));
+    if (count != 0) { std::memcpy(out.data() + offset, values, count * sizeof(T)); }
+}
+
+template <typename T>
+bool take_values(std::span<const std::byte>& bytes, T* values, std::size_t count) {
+    if (count > bytes.size() / sizeof(T)) { return false; }
+    if (count != 0) { std::memcpy(values, bytes.data(), count * sizeof(T)); }
+    bytes = bytes.subspan(count * sizeof(T));
+    return true;
+}
+
+} // namespace
+
+bool ResidentPrefixIdentity::serialize_text_prefix(std::span<const TokenId> tokens,
+                                                   std::size_t count,
+                                                   std::vector<std::byte>& out) const {
+    std::size_t items = 0;
+    if (count > size() || count > tokens.size() ||
+        count > std::numeric_limits<std::uint32_t>::max() ||
+        !prefix_item_count(vision_items_, count, &items) || items != 0) {
+        return false;
+    }
+    const auto rewrite_end = std::upper_bound(rewrite_execution_frontiers_.begin(),
+                                              rewrite_execution_frontiers_.end(), count);
+    const auto rewrites    = static_cast<std::uint32_t>(
+        std::distance(rewrite_execution_frontiers_.begin(), rewrite_end));
+    const std::array<std::uint32_t, 3> header{kTextPrefixArchiveMagic,
+                                              static_cast<std::uint32_t>(count), rewrites};
+    out.clear();
+    append_values(out, header.data(), header.size());
+    append_values(out, tokens.data(), count);
+    append_values(out, token_types_.data(), count);
+    for (const auto& axis : positions_) { append_values(out, axis.data(), count); }
+    append_values(out, rewrite_execution_frontiers_.data(), rewrites);
+    return true;
+}
+
+bool ResidentPrefixIdentity::deserialize_text_prefix(std::span<const std::byte> bytes,
+                                                     std::vector<TokenId>& tokens) {
+    std::array<std::uint32_t, 3> header{};
+    if (!take_values(bytes, header.data(), header.size()) || header[0] != kTextPrefixArchiveMagic) {
+        return false;
+    }
+    const std::size_t count = header[1];
+    ResidentPrefixIdentity identity;
+    tokens.resize(count);
+    identity.token_types_.resize(count);
+    for (auto& axis : identity.positions_) { axis.resize(count); }
+    identity.rewrite_execution_frontiers_.resize(header[2]);
+    bool ok = take_values(bytes, tokens.data(), count) &&
+              take_values(bytes, identity.token_types_.data(), count);
+    for (auto& axis : identity.positions_) { ok = ok && take_values(bytes, axis.data(), count); }
+    ok = ok && take_values(bytes, identity.rewrite_execution_frontiers_.data(), header[2]) &&
+         bytes.empty() &&
+         std::is_sorted(identity.rewrite_execution_frontiers_.begin(),
+                        identity.rewrite_execution_frontiers_.end()) &&
+         (identity.rewrite_execution_frontiers_.empty() ||
+          identity.rewrite_execution_frontiers_.back() <= count);
+    if (!ok) { return false; }
+    swap(identity);
+    return true;
 }
 
 bool ResidentPrefixIdentity::equals(const ResidentPrefixIdentity& other) const {

@@ -338,6 +338,7 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             .prepare_mtp        = request_plan.prepare_mtp,
             .reuse              = request_plan.reuse,
             .mtp_bridge         = request_plan.mtp_bridge,
+            .bridge_frontier    = request_plan.reuse_base,
         };
         request.prefill.emplace(std::move(prefill));
         if (request.prefill->vision_plan) {

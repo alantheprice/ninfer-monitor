@@ -227,6 +227,14 @@ public:
         --object.checkpoint_references;
     }
 
+    [[nodiscard]] qwen3_5::HostStateImageConstView host_view(StateImageHandle handle) const {
+        const Object& object = require(handle);
+        if (!object.host_slot || host_ == nullptr) {
+            throw std::logic_error("StateImage has no Host replica");
+        }
+        return host_->view(*object.host_slot);
+    }
+
     [[nodiscard]] std::int32_t physical_slot(StateImageHandle handle) const {
         const Object& object = require(handle);
         if (!object.device_slot) {

@@ -1,14 +1,18 @@
 #include "runtime/engine/model_instance.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
+#include "core/disk_context_archive.h"
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <set>
+#include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace ninfer::runtime {
@@ -105,7 +109,21 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.max_private_continuations         = concurrency;
         cache.max_shared_prefixes               = 0;
         cache.max_long_anchors_per_continuation = 0;
+        cache.disk_directory.clear();
         return options;
+    }
+    if (!cache.disk_directory.empty()) {
+        if (cache.disk_capacity_bytes == 0 || cache.disk_staging_bytes == 0) {
+            throw std::invalid_argument("disk context cache needs capacity and staging");
+        }
+        // The artifact's location, size and modification time stand in for its content: archived
+        // KV and state bytes are only meaningful for the exact weights that produced them.
+        const std::filesystem::path artifact = std::filesystem::canonical(options.artifact_path);
+        const auto modified = std::filesystem::last_write_time(artifact).time_since_epoch().count();
+        const std::string identity   = artifact.string() + '\n' +
+                                       std::to_string(std::filesystem::file_size(artifact)) + '\n' +
+                                       std::to_string(modified);
+        cache.disk_artifact_identity = archive_checksum(std::as_bytes(std::span(identity)));
     }
 
     cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);

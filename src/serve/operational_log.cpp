@@ -324,19 +324,38 @@ OperationalRecord render_response_failure(std::uint64_t request_id, const Reques
 }
 
 OperationalRecord render_throughput(const ThroughputReport& report) {
-    const double prefill_rate =
-        report.interval_seconds > 0.0
-            ? static_cast<double>(report.computed_prefill_tokens) / report.interval_seconds
-            : 0.0;
+    // Disk-restored prompt tokens reach the Engine as prefill progress but were not computed.
+    const std::uint64_t restored_tokens =
+        report.current.disk_restored_tokens - report.previous.disk_restored_tokens;
+    const std::uint64_t computed_tokens =
+        report.computed_prefill_tokens - std::min(report.computed_prefill_tokens, restored_tokens);
+    const double prefill_rate = report.interval_seconds > 0.0
+                                    ? static_cast<double>(computed_tokens) / report.interval_seconds
+                                    : 0.0;
     const double decode_rate =
         report.interval_seconds > 0.0
             ? static_cast<double>(report.committed_decode_tokens) / report.interval_seconds
             : 0.0;
     std::ostringstream out;
     out << "throughput | " << product::format_pretty_duration(report.interval_seconds);
-    if (report.computed_prefill_tokens != 0) {
+    if (computed_tokens != 0) {
         out << " | prefill " << product::format_pretty_rate(prefill_rate, "tok") << " ("
-            << product::format_pretty_count(report.computed_prefill_tokens) << " tok)";
+            << product::format_pretty_count(computed_tokens) << " tok)";
+    }
+    const std::uint64_t restores = report.current.disk_restores - report.previous.disk_restores;
+    const std::uint64_t saves    = report.current.disk_saves - report.previous.disk_saves;
+    if (restores != 0 || saves != 0) {
+        out << " | disk";
+        if (restores != 0) {
+            out << " restored " << product::format_pretty_count(restored_tokens) << " tok ("
+                << restores << ')';
+        }
+        if (saves != 0) {
+            out << (restores != 0 ? "," : "") << " archived " << saves << " ("
+                << product::format_pretty_bytes(report.current.disk_bytes_written -
+                                                report.previous.disk_bytes_written)
+                << ')';
+        }
     }
     if (report.committed_decode_tokens != 0) {
         out << " | decode " << product::format_pretty_rate(decode_rate, "tok") << " ("
@@ -460,6 +479,16 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
             product::format_pretty_bytes(cache.host_kv_capacity_bytes),
             *cache.max_private_continuations, *cache.max_shared_prefixes,
             *cache.max_long_anchors_per_continuation);
+        if (!cache.disk_directory.empty()) {
+            logger_->info("disk context cache | {} at {} | staging {} | writes {}/s | min {} tok",
+                          product::format_pretty_bytes(cache.disk_capacity_bytes),
+                          cache.disk_directory.string(),
+                          product::format_pretty_bytes(cache.disk_staging_bytes),
+                          cache.disk_write_bytes_per_second == 0
+                              ? std::string("unlimited")
+                              : product::format_pretty_bytes(cache.disk_write_bytes_per_second),
+                          cache.disk_min_tokens);
+        }
     } else {
         logger_->info("context cache | root only");
     }

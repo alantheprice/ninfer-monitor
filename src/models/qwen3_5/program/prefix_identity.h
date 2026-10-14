@@ -26,6 +26,14 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
 
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
+
+    // Archive form of a text-only prefix: the first count tokens with their types, positions and
+    // rewrite frontiers. Returns false when that prefix contains a Vision item.
+    [[nodiscard]] bool serialize_text_prefix(std::span<const TokenId> tokens, std::size_t count,
+                                             std::vector<std::byte>& out) const;
+    // Rebuilds an identity and its token ledger from serialize_text_prefix output.
+    [[nodiscard]] bool deserialize_text_prefix(std::span<const std::byte> bytes,
+                                               std::vector<TokenId>& tokens);
     [[nodiscard]] bool equals(const ResidentPrefixIdentity& other) const;
     [[nodiscard]] bool prefix_equals(const ResidentPrefixIdentity& other, std::size_t count) const;
 

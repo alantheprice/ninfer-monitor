@@ -26,6 +26,10 @@ inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
 inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
+inline constexpr std::uint64_t kDefaultDiskCapacityBytes       = 100ULL << 30;
+inline constexpr std::size_t kDefaultDiskStagingBytes          = 8ULL << 30;
+inline constexpr std::uint64_t kDefaultDiskWriteBytesPerSecond = 64ULL << 20;
+inline constexpr std::uint32_t kDefaultDiskMinTokens           = 8192;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -139,6 +143,18 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Persistent NVMe tier below the Host tier; an empty directory disables it. Finished turns of
+    // at least disk_min_tokens are archived within a sustained write budget, and a request whose
+    // archived prefix extends its cached reuse by at least disk_min_tokens restores from disk.
+    // Staging bounds the transient host memory of in-flight archive writes and restore reads; it
+    // is ordinary memory touched only as operations use it, so one checkpoint must fit in it.
+    std::filesystem::path disk_directory;
+    std::uint64_t disk_capacity_bytes         = kDefaultDiskCapacityBytes;
+    std::size_t disk_staging_bytes            = kDefaultDiskStagingBytes;
+    std::uint64_t disk_write_bytes_per_second = kDefaultDiskWriteBytesPerSecond;
+    std::uint32_t disk_min_tokens             = kDefaultDiskMinTokens;
+    // Resolved by the Engine from the artifact file; archived bytes are only valid for it.
+    std::uint64_t disk_artifact_identity = 0;
 };
 
 struct ContextCostOptions {
@@ -956,6 +972,18 @@ struct RuntimeStats {
     std::uint32_t device_main_kv_occupied_pages        = 0;
     std::uint32_t device_backend_kv_occupied_pages     = 0;
     std::size_t host_kv_occupied_bytes                 = 0;
+    std::uint64_t disk_restores                        = 0;
+    std::uint64_t disk_restored_tokens                 = 0;
+    std::uint64_t disk_restore_failures                = 0;
+    double disk_restore_seconds                        = 0.0;
+    double disk_read_seconds                           = 0.0;
+    std::uint64_t disk_saves                           = 0;
+    std::uint64_t disk_saves_skipped                   = 0;
+    std::uint64_t disk_save_failures                   = 0;
+    std::uint64_t disk_bytes_written                   = 0;
+    std::uint64_t disk_bytes_read                      = 0;
+    std::uint64_t disk_stored_bytes                    = 0;
+    std::uint64_t disk_manifests                       = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_evicted      = 0;
     std::uint64_t pressure_shared_owners_degraded      = 0;

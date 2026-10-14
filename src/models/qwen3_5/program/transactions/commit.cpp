@@ -48,6 +48,7 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
     out.summary                 = step.summary;
     out.processed_prompt_tokens = step.processed_prompt_tokens;
     out.complete                = step.complete;
+    out.waiting                 = step.waiting;
     out.timing                  = step.timing;
     if (step.complete) {
         const std::array<std::uint32_t, 1> lanes{lane};
@@ -645,6 +646,7 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
         populate_continuation_summary(state, out.summary);
         out.summary.active_references = 0;
     } catch (...) { return out; }
+    archive_finished_sequence(state);
     release_active_shared_references(state);
     release_sequence_growth_entitlement(state);
     unbind_sequence_kv(state);

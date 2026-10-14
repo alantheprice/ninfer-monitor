@@ -668,6 +668,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                                        device.stream));
         }
 
+        begin_disk_restore(sequence, staged, request_plan.reuse);
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle = Lifecycle::Prefilling;
     } catch (...) {
@@ -967,6 +968,21 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        std::uint32_t restored_tokens = 0;
+        switch (advance_disk_restore(sequence, staged, restored_tokens)) {
+        case DiskRestoreStep::Waiting:
+            staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+            return runtime::PrefillStepResult{
+                .summary = summary,
+                .waiting = true,
+                .timing  = timing.finish(),
+            };
+        case DiskRestoreStep::Restored:
+            processed_prompt_tokens += restored_tokens;
+            break;
+        case DiskRestoreStep::None:
+            break;
+        }
         if (staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == staged.cursor) {
             if (staged.cursor != staged.base ||
@@ -1008,7 +1024,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             dflash_host_ingress};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
-            if (staged.cursor != staged.base || staged.base == 0 ||
+            if (staged.cursor != staged.bridge_frontier || staged.bridge_frontier == 0 ||
                 staged.cursor >= staged.prompt_tokens) {
                 throw std::logic_error("staged MTP bridge is outside the reusable suffix");
             }
@@ -1016,21 +1032,21 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             const Tensor& previous_hidden = sequence.tail_hidden;
             const execution::MtpBridgeInput bridge{
                 .previous_hidden = &previous_hidden,
-                .position        = checked_i32(staged.base - 1, "MTP bridge position"),
-                .rope_position   = prompt_rope_position(staged.prompt, staged.base - 1),
+                .position        = checked_i32(staged.bridge_frontier - 1, "MTP bridge position"),
+                .rope_position   = prompt_rope_position(staged.prompt, staged.bridge_frontier - 1),
             };
             if (staged.vision) {
                 execution::mtp_bridge_multimodal(schedule_state, staged.prompt, *staged.vision,
                                                  bridge);
             } else {
                 Tensor bridge_token = io.mtp->target_input_ids.slice(0, 0, 1);
-                const TokenId token = staged.prompt.token_ids[staged.base];
+                const TokenId token = staged.prompt.token_ids[staged.bridge_frontier];
                 CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
                                            cudaMemcpyHostToDevice, device.stream));
                 execution::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
                                                   bridge.position, bridge.rope_position, false);
             }
-            sequence.mtp_kv_valid = staged.base;
+            sequence.mtp_kv_valid = staged.bridge_frontier;
             commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
             staged.mtp_bridge = MtpBridgeMode::None;
         }

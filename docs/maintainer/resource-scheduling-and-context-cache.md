@@ -420,6 +420,24 @@ State 与 KV 可以独立 placement，例如 State 在 Device、Main KV 部分�
 backend KV 采用另一种 coverage。Checkpoint 只有在全部 required components 至少保留一份有效 replica
 时才继续存在。
 
+### 5.3 NVMe 归档层
+
+`--disk-cache-dir` 在 Device 与 Host 之下增加持久化归档层。它不是第三个 placement：归档 checkpoint
+不是 live owner，不占用任何容量轴，也不参与 target search、retention 或 resource revision。
+
+- **写入。** text-only continuation 在 `finish` 发布时，Program 归档下一 turn 最可能恢复的 checkpoint：
+  有 rewrite checkpoint 时取它，否则取 endpoint。只复制归档中尚不存在的 KV 页与一个完整 StateImage；
+  页以其补全的 token prefix 的 shortlist digest 为键，因此同一会话的后续 turn 只写新页。持久化完成的后代
+  checkpoint 会退役同一 lineage 的祖先。写入受持续字节预算约束，超出预算时跳过而不是排队。
+- **读取。** 当某个归档前缀比 planned reuse 至少多出 `--disk-cache-min-tokens` 时，Program 在 staged
+  prefill 建立时开始后台读取。首个 prefill step 等待读取完成（等待的 step 不消耗 service work），校验
+  exact identity 与 checksum，然后把页与 StateImage 写入该请求自己 exclusive 的页与 state slot，从归档
+  frontier 继续普通 prefill。与 source prefix 共享的页从不被写入。
+- **规划。** materialization plan 不知道磁盘层：恢复只是在 plan 已授予的容量内替代 prefill 工作。
+  因此 planner 仍按完整 prefill 计价，这是保守而非错误的估计。
+- **持久性。** 文件以临时名写入、`fdatasync` 后 rename；页先于引用它们的 manifest 持久化。启动扫描删除
+  临时文件、孤立页以及缺页的 manifest。归档目录按 artifact 文件与 KV/StateImage layout 命名空间隔离。
+
 ---
 
 ## 6. Active completion guarantee
@@ -1046,6 +1064,8 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
 | State stores | `src/models/qwen3_5/program/storage/state_store.h` |
 | logical KV/address spaces | `src/models/qwen3_5/program/storage/kv_store.h` |
 | Host KV extents | `src/models/qwen3_5/program/storage/host_kv_store.h` |
+| NVMe 归档文件、索引与 I/O 线程 | `src/core/disk_context_archive.h` |
+| NVMe 归档与恢复的 Program 端 | `src/models/qwen3_5/program/storage/disk_tier.cpp` |
 | public capacity options | `include/ninfer/types.h` |
 
 路径用于定位当前实现，不改变本文定义的所有权边界。

@@ -781,6 +781,11 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
+| `--disk-cache-dir DIR` | enable the persistent NVMe context tier below the Host tier | off |
+| `--disk-cache-gib N` | NVMe context archive capacity in GiB | `100` |
+| `--disk-cache-staging-mib N` | transient host memory bound for in-flight archive writes and restore reads | `8192` |
+| `--disk-cache-write-mib-s N` | sustained archive write budget in MiB/s; `0` is unlimited | `64` |
+| `--disk-cache-min-tokens N` | smallest checkpoint archived, and smallest reuse gain worth a restore | `8192` |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
@@ -814,8 +819,22 @@ For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage 
 `C` slots guarantee active requests and `H` is a global checkpoint pool. Host State and Host KV are
 independent startup-fixed pinned-memory capacities; Host KV is shared by Main and the selected
 Backend pool and is consumed in physical page extents. `--no-prefix-reuse` selects root-only Engine
-mode and cannot be combined with any of the seven explicit context-cache capacity flags, including
-zero-valued flags.
+mode and cannot be combined with any of the explicit context-cache capacity flags, including
+zero-valued flags, or with `--disk-cache-dir`.
+
+`--disk-cache-dir` adds a persistent NVMe tier below Device and Host. When a text-only request of at
+least `--disk-cache-min-tokens` finishes, its resumable checkpoint (the turn-closure or response-replay
+checkpoint when present, otherwise the endpoint) is archived: KV pages not already on disk plus one
+StateImage. Pages are keyed by the token prefix they complete, so later turns of a conversation write
+only their new pages, and a durable later turn retires the archived earlier turns of the same
+conversation. Writes beyond the sustained `--disk-cache-write-mib-s` budget (with a two-minute burst)
+are skipped rather than queued, and the least recently used checkpoints are evicted beyond
+`--disk-cache-gib`. A request whose archived prefix extends its planned cache reuse by at least
+`--disk-cache-min-tokens` reads that checkpoint in the background, verifies its exact identity, and
+resumes prefill from the archived frontier; the archive survives restarts. Archives are namespaced by
+the artifact file and the KV/StateImage layout, so a different model, KV dtype or speculative backend
+never reads another configuration's bytes. Prompts containing media are not archived. One checkpoint
+must fit in `--disk-cache-staging-mib`, which is ordinary memory touched only by in-flight operations.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 

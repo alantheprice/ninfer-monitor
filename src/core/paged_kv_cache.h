@@ -106,6 +106,7 @@ class DeviceKVPagePool;
 class KVExecutionTablePool;
 class HostKVAllocationView;
 class HostKVAllocationConstView;
+struct HostKVPageLayout;
 
 /** Copyable, non-owning physical-page capability minted by one DeviceKVPagePool. */
 class DeviceKVPageHandle {
@@ -234,6 +235,12 @@ public:
     void copy_to_host(std::span<const DeviceKVPageHandle> source, HostKVAllocationView destination,
                       cudaStream_t stream = nullptr) const;
     void copy_from_host(HostKVAllocationConstView source,
+                        std::span<const DeviceKVPageHandle> destination,
+                        cudaStream_t stream = nullptr) const;
+    // Host staging outside the Host KV arena: consecutive pages page_stride apart in `layout`.
+    void copy_to_host(std::span<const DeviceKVPageHandle> source, std::byte* destination,
+                      const HostKVPageLayout& layout, cudaStream_t stream = nullptr) const;
+    void copy_from_host(const std::byte* source, const HostKVPageLayout& layout,
                         std::span<const DeviceKVPageHandle> destination,
                         cudaStream_t stream = nullptr) const;
 

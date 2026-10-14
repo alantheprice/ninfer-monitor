@@ -394,6 +394,54 @@ void test_prefix_identity() {
            "truncated multimodal continuation identity");
 }
 
+void test_text_prefix_archive() {
+    q36::PreparedPromptData text;
+    text.token_ids   = {101, 102, 103, 104, 105, 106};
+    text.token_types = std::vector<std::uint8_t>(text.token_ids.size(), 0);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        for (std::size_t token = 0; token < text.token_ids.size(); ++token) {
+            text.positions.push_back(static_cast<std::int32_t>(token));
+        }
+    }
+    text.identity.rewrite_execution_frontiers = {2, 5};
+    q36::detail::ResidentPrefixIdentity resident;
+    resident.assign(text);
+
+    std::vector<std::byte> archived;
+    expect(resident.serialize_text_prefix(text.token_ids, 4, archived),
+           "text-only prefix was not archivable");
+    q36::detail::ResidentPrefixIdentity restored;
+    std::vector<ninfer::TokenId> restored_tokens;
+    expect(restored.deserialize_text_prefix(archived, restored_tokens) &&
+               restored_tokens.size() == 4 &&
+               q36::detail::prefix_matches(text, restored_tokens, restored, 4),
+           "archived text prefix did not restore an exact identity");
+    expect(!q36::detail::prefix_matches(text, restored_tokens, restored, 5),
+           "archived identity matched beyond its own frontier");
+
+    q36::PreparedPromptData other_split              = text;
+    other_split.identity.rewrite_execution_frontiers = {3, 5};
+    expect(!q36::detail::prefix_matches(other_split, restored_tokens, restored, 4),
+           "archived identity ignored a different execution decomposition");
+    q36::PreparedPromptData other_token = text;
+    other_token.token_ids[3]            = 999;
+    expect(!q36::detail::prefix_matches(other_token, restored_tokens, restored, 4),
+           "archived identity ignored a different token");
+
+    std::vector<std::byte> truncated(archived.begin(), archived.end() - 1);
+    expect(!restored.deserialize_text_prefix(truncated, restored_tokens),
+           "truncated archive identity was accepted");
+
+    const q36::PreparedPromptData multimodal = identity_prompt();
+    q36::detail::ResidentPrefixIdentity multimodal_resident;
+    multimodal_resident.assign(multimodal);
+    expect(!multimodal_resident.serialize_text_prefix(multimodal.token_ids,
+                                                      multimodal.token_ids.size(), archived),
+           "a prefix containing a Vision item was archived");
+    expect(multimodal_resident.serialize_text_prefix(multimodal.token_ids, 1, archived),
+           "a text prefix before any Vision item was not archivable");
+}
+
 void test_rebuild_work_prompt_frontier_boundary() {
     constexpr std::uint32_t prompt_tokens = 100;
     constexpr std::uint32_t prefill_chunk = 2048;
@@ -421,6 +469,7 @@ int main() {
     test_mtp_alignment();
     test_vision_control();
     test_prefix_identity();
+    test_text_prefix_archive();
     test_rebuild_work_prompt_frontier_boundary();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";

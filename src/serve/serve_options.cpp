@@ -74,8 +74,11 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
+           "[--disk-cache-dir DIR] [--disk-cache-gib N] [--disk-cache-staging-mib N] "
+           "[--disk-cache-write-mib-s N] [--disk-cache-min-tokens N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
-           "[--max-long-anchors-per-continuation N] [--auto-long-anchors N] [--electricity-rate R] [--metrics-state FILE] "
+           "[--max-long-anchors-per-continuation N] [--auto-long-anchors N] [--electricity-rate R] "
+           "[--metrics-state FILE] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
@@ -109,6 +112,12 @@ std::string serve_usage_text(const char* argv0) {
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
            "--host-kv-mib uses MiB\n"
+           "       --disk-cache-dir archives finished turns to NVMe below the Host tier and "
+           "restores "
+           "them across evictions and restarts; defaults: 100 GiB, 8192 MiB host staging (touched "
+           "on "
+           "use; one checkpoint must fit), "
+           "64 MiB/s sustained writes (0 = unlimited), 8192 minimum tokens\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -225,6 +234,40 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
             context_capacity_explicit                    = true;
+        } else if (arg == "--disk-cache-dir") {
+            options.context_cache.disk_directory = require_value("--disk-cache-dir");
+            if (options.context_cache.disk_directory.empty()) {
+                throw std::invalid_argument("--disk-cache-dir must not be empty");
+            }
+            context_capacity_explicit = true;
+        } else if (arg == "--disk-cache-gib") {
+            const std::uint64_t gib =
+                parse_u64(require_value("--disk-cache-gib"), "disk-cache-gib");
+            if (gib == 0 || gib > (std::numeric_limits<std::uint64_t>::max() >> 30)) {
+                throw std::invalid_argument("--disk-cache-gib is out of range");
+            }
+            options.context_cache.disk_capacity_bytes = gib << 30;
+        } else if (arg == "--disk-cache-staging-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--disk-cache-staging-mib"), "disk-cache-staging-mib");
+            if (mib == 0 || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--disk-cache-staging-mib is out of range");
+            }
+            options.context_cache.disk_staging_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--disk-cache-write-mib-s") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--disk-cache-write-mib-s"), "disk-cache-write-mib-s");
+            if (mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
+                throw std::invalid_argument("--disk-cache-write-mib-s is out of range");
+            }
+            options.context_cache.disk_write_bytes_per_second = mib << 20;
+        } else if (arg == "--disk-cache-min-tokens") {
+            options.context_cache.disk_min_tokens =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--disk-cache-min-tokens"), "disk-cache-min-tokens"));
+            if (options.context_cache.disk_min_tokens == 0) {
+                throw std::invalid_argument("--disk-cache-min-tokens must be positive");
+            }
         } else if (arg == "--max-private-continuations") {
             options.context_cache.max_private_continuations =
                 static_cast<std::uint32_t>(parse_nonnegative_int(

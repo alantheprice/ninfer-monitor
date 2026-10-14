@@ -173,6 +173,8 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.device_backend_kv_occupied_pages !=
                report.previous.device_backend_kv_occupied_pages ||
            report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
+           report.current.disk_restores != report.previous.disk_restores ||
+           report.current.disk_saves != report.previous.disk_saves ||
            report.current.shared_active_references != report.previous.shared_active_references ||
            report.current.host_work.engine_boundary_ns !=
                report.previous.host_work.engine_boundary_ns ||
@@ -1078,6 +1080,32 @@ void HttpServer::handle_metrics(httplib::Response& res) const {
     emit_u64("ninfer:pressure_private_owners_evicted_total",
              "Private continuations evicted under pressure.",
              stats.pressure_private_owners_evicted);
+    emit_u64("ninfer:disk_restores_total", "Prefills resumed from the NVMe context archive.",
+             stats.disk_restores);
+    emit_u64("ninfer:disk_restored_tokens_total",
+             "Prompt tokens restored from the NVMe context archive instead of computed.",
+             stats.disk_restored_tokens);
+    emit_u64("ninfer:disk_restore_failures_total",
+             "NVMe archive candidates that could not be read or verified.",
+             stats.disk_restore_failures);
+    emit_dbl("ninfer:disk_read_seconds_total",
+             "Wall seconds spent reading and verifying archived checkpoints.",
+             stats.disk_read_seconds);
+    emit_dbl("ninfer:disk_restore_copy_seconds_total",
+             "Worker seconds spent copying restored checkpoints to the device.",
+             stats.disk_restore_seconds);
+    emit_u64("ninfer:disk_saves_total", "Checkpoints archived to NVMe.", stats.disk_saves);
+    emit_u64("ninfer:disk_saves_skipped_total",
+             "Checkpoint archives skipped by the write budget or staging capacity.",
+             stats.disk_saves_skipped);
+    emit_u64("ninfer:disk_bytes_written_total", "Bytes written to the NVMe context archive.",
+             stats.disk_bytes_written);
+    emit_u64("ninfer:disk_bytes_read_total", "Bytes read from the NVMe context archive.",
+             stats.disk_bytes_read);
+    emit_gauge("ninfer:disk_stored_bytes", "Bytes held by the NVMe context archive.",
+               stats.disk_stored_bytes);
+    emit_gauge("ninfer:disk_checkpoints", "Checkpoints held by the NVMe context archive.",
+               stats.disk_manifests);
     emit_dbl("ninfer:process_uptime_seconds", "Seconds since the stats endpoint was initialized.",
              std::chrono::duration<double>(Clock::now() - process_start).count());
 

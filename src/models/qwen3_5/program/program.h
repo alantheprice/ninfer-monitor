@@ -38,6 +38,19 @@ struct PhysicalUsageSnapshot {
     std::uint32_t device_main_kv_pages    = 0;
     std::uint32_t device_backend_kv_pages = 0;
     std::size_t host_kv_bytes             = 0;
+    // Persistent NVMe tier counters; all zero when the tier is disabled.
+    std::uint64_t disk_restores         = 0;
+    std::uint64_t disk_restored_tokens  = 0;
+    std::uint64_t disk_restore_failures = 0;
+    double disk_restore_seconds         = 0.0;
+    double disk_read_seconds            = 0.0;
+    std::uint64_t disk_saves            = 0;
+    std::uint64_t disk_saves_skipped    = 0;
+    std::uint64_t disk_save_failures    = 0;
+    std::uint64_t disk_bytes_written    = 0;
+    std::uint64_t disk_bytes_read       = 0;
+    std::uint64_t disk_stored_bytes     = 0;
+    std::uint64_t disk_manifests        = 0;
 
     [[nodiscard]] friend constexpr bool operator==(const PhysicalUsageSnapshot&,
                                                    const PhysicalUsageSnapshot&) noexcept = default;
@@ -712,6 +725,9 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // No prefill work was done: the staged prompt is still being read from the disk tier. The
+    // Engine neither charges service work nor publishes progress for such a step.
+    bool waiting = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<CaptureOffer> capture;

@@ -65,6 +65,8 @@ struct PrefillStepResult {
     GeneratedRound round;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    // The step did no prefill work because its prompt is still being read from the disk tier.
+    bool waiting = false;
     ExecutionTiming timing;
 };
 

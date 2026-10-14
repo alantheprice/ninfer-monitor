@@ -1104,6 +1104,20 @@ public:
         out.device_main_kv_occupied_pages    = usage.device_main_kv_pages;
         out.device_backend_kv_occupied_pages = usage.device_backend_kv_pages;
         out.host_kv_occupied_bytes           = usage.host_kv_bytes;
+        if constexpr (requires { usage.disk_restores; }) {
+            out.disk_restores         = usage.disk_restores;
+            out.disk_restored_tokens  = usage.disk_restored_tokens;
+            out.disk_restore_failures = usage.disk_restore_failures;
+            out.disk_restore_seconds  = usage.disk_restore_seconds;
+            out.disk_read_seconds     = usage.disk_read_seconds;
+            out.disk_saves            = usage.disk_saves;
+            out.disk_saves_skipped    = usage.disk_saves_skipped;
+            out.disk_save_failures    = usage.disk_save_failures;
+            out.disk_bytes_written    = usage.disk_bytes_written;
+            out.disk_bytes_read       = usage.disk_bytes_read;
+            out.disk_stored_bytes     = usage.disk_stored_bytes;
+            out.disk_manifests        = usage.disk_manifests;
+        }
         std::uint64_t shared_references      = 0;
         for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
             if (active_[lane].occupied) {
