@@ -110,6 +110,10 @@ public:
         std::array<std::vector<ArchiveKey>, kArchivePageKinds> page_keys;
         std::size_t identity_bytes = 0;
         std::size_t state_bytes    = 0;
+        // Restore points (turn closures, long anchors) are spared by the supersede pass when a
+        // newer checkpoint of the same lineage commits: their whole-state images are valid only
+        // at their own frontier, so the newer checkpoint's prefix cannot replace them.
+        bool retain = false;
     };
 
     // Staging for one checkpoint. Only pages absent from the archive need data; missing(kind)
@@ -235,6 +239,8 @@ private:
         std::uint64_t last_used    = 0;
         std::uint32_t pins         = 0;
         bool superseded            = false;
+        // Retained restore point: exempt from supersede, still LRU-evictable.
+        bool retained              = false;
     };
 
     struct PageRecord {

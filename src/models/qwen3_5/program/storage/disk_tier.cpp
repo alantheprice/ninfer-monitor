@@ -104,35 +104,49 @@ ProgramImpl::disk_backend_frontier(std::uint32_t frontier) const noexcept {
 
 void ProgramImpl::archive_finished_sequence(const SequenceState& sequence) noexcept {
     if (!disk_tier_ || !sequence.kv) { return; }
-    std::uint32_t frontier = 0;
-    StateImageHandle image;
+    // Archive every finished-checkpoint restore point whose whole-state image is still valid:
+    // the rewrite checkpoint (turn closure / response replay), the endpoint, and the long
+    // anchors. Pages are content-addressed, so a restore point at a frontier below an
+    // already-archived one only adds its manifest, identity, and state image.
+    std::vector<std::pair<std::uint32_t, StateImageHandle>> points;
     if (sequence.rewrite_checkpoint.valid && sequence.rewrite_state) {
-        frontier = sequence.rewrite_checkpoint.frontier;
-        image    = *sequence.rewrite_state;
-    } else if (sequence.endpoint_valid) {
-        frontier = sequence.execution_frontier;
-        image    = sequence.state.read;
-    } else {
-        return;
+        points.emplace_back(sequence.rewrite_checkpoint.frontier, *sequence.rewrite_state);
     }
-    if (frontier < disk_tier_->min_tokens) { return; }
+    if (sequence.endpoint_valid) {
+        points.emplace_back(sequence.execution_frontier, sequence.state.read);
+    }
+    for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
+        points.emplace_back(anchor.frontier, anchor.state);
+    }
+    bool archived_any = false;
+    for (const auto& [frontier, image] : points) {
+        archived_any = archive_restore_point(sequence, frontier, image,
+                                             /*retain=*/true) || archived_any;
+    }
+    (void) archived_any;
+}
+
+bool ProgramImpl::archive_restore_point(const SequenceState& sequence, std::uint32_t frontier,
+                                        StateImageHandle image, bool retain) noexcept {
+    if (!disk_tier_) { return false; }
+    if (frontier < disk_tier_->min_tokens) { return false; }
     if (frontier > sequence.ledger.size() || frontier > sequence.prefix_digests.size() ||
         frontier > sequence.text_kv_valid) {
         ++disk_tier_->save_skips;
-        return;
+        return false;
     }
     std::optional<DiskContextArchive::SaveJob> job;
     try {
         if (!state_store->valid(image) ||
             state_store->residency(image) == StateReplicaResidency::None) {
             ++disk_tier_->save_skips;
-            return;
+            return false;
         }
         const std::optional<std::uint32_t> backend = disk_backend_frontier(frontier);
         const bool archive_backend = backend.has_value() && sequence.kv->backend.has_value();
         if (archive_backend && backend_kv_valid(sequence) < *backend) {
             ++disk_tier_->save_skips;
-            return;
+            return false;
         }
         // MTP KV at position p is computed from token p+1, so a backend page is keyed by the
         // prefix one token past its own end.
@@ -141,7 +155,7 @@ void ProgramImpl::archive_finished_sequence(const SequenceState& sequence) noexc
 
         std::vector<std::byte> identity;
         if (!sequence.prefix_identity.serialize_text_prefix(sequence.ledger, frontier, identity)) {
-            return;
+            return false;
         }
 
         // A checkpoint may already be partly demoted: each page is archived from its Device
@@ -157,6 +171,7 @@ void ProgramImpl::archive_finished_sequence(const SequenceState& sequence) noexc
         request.frontier               = frontier;
         request.backend_frontier       = archive_backend ? *backend : 0U;
         request.prefix_key             = sequence.prefix_digests.at(frontier);
+        request.retain                 = retain;
         const std::uint32_t text_pages = pages_for(frontier);
         for (std::uint32_t page = 0; page < text_pages; ++page) {
             const std::uint32_t end     = std::min(frontier, (page + 1U) * kPageTokens);
@@ -164,7 +179,7 @@ void ProgramImpl::archive_finished_sequence(const SequenceState& sequence) noexc
             if (!readable(*text_kv_pages, text_kv_addresses->logical_page(sequence.kv->text, page),
                           columns)) {
                 ++disk_tier_->save_skips;
-                return;
+                return false;
             }
             request.page_keys[kTextPages].push_back(
                 page_key(kTextPages, sequence.prefix_digests.at(end), columns));
@@ -178,7 +193,7 @@ void ProgramImpl::archive_finished_sequence(const SequenceState& sequence) noexc
                               backend_kv_addresses->logical_page(*sequence.kv->backend, page),
                               columns)) {
                     ++disk_tier_->save_skips;
-                    return;
+                    return false;
                 }
                 request.page_keys[kBackendPages].push_back(page_key(
                     kBackendPages, sequence.prefix_digests.at(end + backend_lookahead), columns));
@@ -189,7 +204,7 @@ void ProgramImpl::archive_finished_sequence(const SequenceState& sequence) noexc
 
         job = disk_tier_->archive->begin_save(
             std::move(request), [&](std::uint32_t at) { return sequence.prefix_digests.at(at); });
-        if (!job) { return; }
+        if (!job) { return false; }
 
         const auto stage_pages = [&](std::size_t kind, KVAddressSpaceStore& addresses,
                                      LogicalKVPageStore& pages, KVAddressSpaceHandle address,
@@ -236,6 +251,7 @@ void ProgramImpl::archive_finished_sequence(const SequenceState& sequence) noexc
         std::memcpy(job->identity().data(), identity.data(), identity.size());
         device.synchronize();
         disk_tier_->archive->commit(std::move(*job));
+        return true;
     } catch (...) {
         // An archive is an optimization: a failure leaves the request's own state untouched. Any
         // staged copy must finish before the job releases its staging.
@@ -243,6 +259,7 @@ void ProgramImpl::archive_finished_sequence(const SequenceState& sequence) noexc
             device.synchronize();
         } catch (...) {}
         ++disk_tier_->save_failures;
+        return false;
     }
 }
 
