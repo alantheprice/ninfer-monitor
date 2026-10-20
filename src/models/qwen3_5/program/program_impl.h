@@ -1124,6 +1124,11 @@ private:
     [[nodiscard]] std::optional<std::uint32_t>
     disk_backend_frontier(std::uint32_t frontier) const noexcept;
     void archive_finished_sequence(const SequenceState& sequence) noexcept;
+    // Archives one whole-state restore point (rewrite checkpoint, endpoint, or long anchor).
+    // Retained points are spared by the archive's supersede pass. Best-effort: returns false
+    // when the point is below min_tokens, already archived, or its pages are not readable.
+    bool archive_restore_point(const SequenceState& sequence, std::uint32_t frontier,
+                               StateImageHandle image, bool retain) noexcept;
     void begin_disk_restore(const SequenceState& sequence, RequestControl::Prefill& staged,
                             ReusePath reuse) noexcept;
     [[nodiscard]] DiskRestoreStep advance_disk_restore(SequenceState& sequence,

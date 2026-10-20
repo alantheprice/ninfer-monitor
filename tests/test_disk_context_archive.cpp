@@ -169,6 +169,69 @@ int main() {
             verify_prefetch(archive, a, 700);
         }
         {
+            // Retained restore points (turn closures, long anchors) survive a newer same-lineage
+            // checkpoint and stay discoverable at their own frontier, on disk and after restart.
+            DiskContextArchive archive(options(root / "retained", 1ULL << 30), staging);
+            auto anchor = request_for(a, 300);
+            anchor.retain = true;
+            auto job = archive.begin_save(anchor, [&](std::uint32_t f) { return a.key_at(f); });
+            require(job.has_value(), "retained anchor save was declined");
+            for (std::size_t kind = 0; kind < kArchivePageKinds; ++kind) {
+                const auto missing = job->missing(kind);
+                for (std::size_t i = 0; i < missing.size(); ++i) {
+                    const std::uint64_t key = anchor.page_keys[kind][missing[i]][0];
+                    auto bytes = job->page(kind, i);
+                    for (std::size_t b = 0; b < bytes.size(); ++b) {
+                        bytes[b] = static_cast<std::byte>(pattern(key, b));
+                    }
+                }
+            }
+            for (std::size_t b = 0; b < job->identity().size(); ++b) {
+                job->identity()[b] = static_cast<std::byte>(pattern(300, b));
+            }
+            for (std::size_t b = 0; b < job->state().size(); ++b) {
+                job->state()[b] = static_cast<std::byte>(pattern(301, b));
+            }
+            archive.commit(std::move(*job));
+            archive.flush();
+
+            auto later = request_for(a, 700);
+            auto later_job = archive.begin_save(later, [&](std::uint32_t f) { return a.key_at(f); });
+            require(later_job.has_value(), "descendant save was declined");
+            for (std::size_t kind = 0; kind < kArchivePageKinds; ++kind) {
+                const auto missing = later_job->missing(kind);
+                for (std::size_t i = 0; i < missing.size(); ++i) {
+                    const std::uint64_t key = later.page_keys[kind][missing[i]][0];
+                    auto bytes = later_job->page(kind, i);
+                    for (std::size_t b = 0; b < bytes.size(); ++b) {
+                        bytes[b] = static_cast<std::byte>(pattern(key, b));
+                    }
+                }
+            }
+            for (std::size_t b = 0; b < later_job->identity().size(); ++b) {
+                later_job->identity()[b] = static_cast<std::byte>(pattern(700, b));
+            }
+            for (std::size_t b = 0; b < later_job->state().size(); ++b) {
+                later_job->state()[b] = static_cast<std::byte>(pattern(701, b));
+            }
+            archive.commit(std::move(*later_job));
+            archive.flush();
+
+            require(archive.stats().manifests == 2,
+                    "retained anchor was superseded by the newer checkpoint");
+            require(archive.find(1, 699, [&](std::uint32_t f) { return a.key_at(f); }).has_value(),
+                    "retained anchor became undiscoverable");
+            require(archive.find(1, 4000, [&](std::uint32_t f) { return a.key_at(f); }).has_value(),
+                    "newer checkpoint missing");
+        }
+        {
+            DiskContextArchive archive(options(root / "retained", 1ULL << 30), staging);
+            require(archive.stats().manifests == 2,
+                    "retained flag did not survive a restart");
+            require(archive.find(1, 699, [&](std::uint32_t f) { return a.key_at(f); }).has_value(),
+                    "retained anchor missing after restart");
+        }
+        {
             // Startup removes temporary files and orphan pages, and drops manifests whose pages
             // are gone.
             const auto directory = root / "basic";

@@ -60,6 +60,8 @@ struct ManifestHeader {
     std::uint64_t id               = 0;
     std::uint32_t frontier         = 0;
     std::uint32_t backend_frontier = 0;
+    std::uint32_t retained         = 0;
+    std::array<std::byte, 4> reserved{};
     std::uint64_t prefix_key[2]{};
     std::uint64_t page_counts[kArchivePageKinds]{};
     std::uint64_t identity_bytes   = 0;
@@ -460,6 +462,7 @@ void DiskContextArchive::scan() {
             record.prefix_key       = {header.prefix_key[0], header.prefix_key[1]};
             record.identity_bytes   = header.identity_bytes;
             record.state_bytes      = header.state_bytes;
+            record.retained         = header.retained != 0;
             record.file_bytes       = static_cast<std::uint64_t>(info.st_size);
             record.last_used = static_cast<std::uint64_t>(info.st_mtim.tv_sec) * 1'000'000'000ULL +
                                static_cast<std::uint64_t>(info.st_mtim.tv_nsec);
@@ -634,8 +637,11 @@ std::optional<DiskContextArchive::SaveJob> DiskContextArchive::begin_save(SaveRe
         for (const ArchiveKey& key : request.page_keys[kind]) { ++pages_[kind][key].references; }
     }
     // Archived ancestors of the same lineage are retired once this checkpoint is durable: their
-    // prefixes remain reachable through it, so they only cost space.
+    // prefixes remain reachable through it, so they only cost space. Retained restore points
+    // (turn closures, long anchors) are spared — each carries a whole-state image valid only at
+    // its own frontier.
     for (const auto& [id, record] : manifests_) {
+        if (record.retained) { continue; }
         if (record.frontier < request.frontier && key_at(record.frontier) == record.prefix_key) {
             job.supersedes_.push_back(id);
         }
@@ -730,6 +736,7 @@ void DiskContextArchive::write_job(SaveJob& job) {
     header.id               = id;
     header.frontier         = save.frontier;
     header.backend_frontier = save.backend_frontier;
+    header.retained         = save.retain ? 1U : 0U;
     header.prefix_key[0]    = save.prefix_key[0];
     header.prefix_key[1]    = save.prefix_key[1];
     for (std::size_t kind = 0; kind < kArchivePageKinds; ++kind) {
@@ -756,6 +763,7 @@ void DiskContextArchive::write_job(SaveJob& job) {
     record.page_keys        = save.page_keys;
     record.identity_bytes   = save.identity_bytes;
     record.state_bytes      = save.state_bytes;
+    record.retained         = save.retain;
     record.file_bytes = sizeof(header) + key_bytes.size() + save.identity_bytes + save.state_bytes;
     record.last_used  = now_ns();
     for (std::size_t kind = 0; kind < kArchivePageKinds; ++kind) {
