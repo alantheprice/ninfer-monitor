@@ -175,6 +175,8 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
            report.current.disk_restores != report.previous.disk_restores ||
            report.current.disk_saves != report.previous.disk_saves ||
+           report.current.disk_restore_attempts != report.previous.disk_restore_attempts ||
+           report.current.disk_saves_evicted != report.previous.disk_saves_evicted ||
            report.current.shared_active_references != report.previous.shared_active_references ||
            report.current.host_work.engine_boundary_ns !=
                report.previous.host_work.engine_boundary_ns ||
@@ -1100,6 +1102,22 @@ void HttpServer::handle_metrics(httplib::Response& res) const {
     emit_u64("ninfer:disk_saves_skipped_total",
              "Checkpoint archives skipped by the write budget or staging capacity.",
              stats.disk_saves_skipped);
+    emit_u64("ninfer:disk_saves_evicted_total",
+             "Archived checkpoints evicted (LRU) to stay within the capacity limit.",
+             stats.disk_saves_evicted);
+    emit_u64("ninfer:disk_saves_skipped_budget_total",
+             "Checkpoint archives skipped by the sustained write budget.",
+             stats.disk_saves_skipped_budget);
+    emit_u64("ninfer:disk_saves_skipped_staging_total",
+             "Checkpoint archives skipped because archive staging was full.",
+             stats.disk_saves_skipped_staging);
+    emit_u64("ninfer:disk_restore_attempts_total",
+             "Restore lookups run for eligible prefills (text-only, past min_tokens).",
+             stats.disk_restore_attempts);
+    emit_u64("ninfer:disk_restore_deadline_misses_total",
+             "Prefills that fell back to compute because the staged read missed the restore "
+             "deadline.",
+             stats.disk_restore_deadline_misses);
     emit_u64("ninfer:disk_bytes_written_total", "Bytes written to the NVMe context archive.",
              stats.disk_bytes_written);
     emit_u64("ninfer:disk_bytes_read_total", "Bytes read from the NVMe context archive.",
@@ -1175,6 +1193,8 @@ void HttpServer::handle_usage(httplib::Response& res) const {
     }
 
     const double hit_rate = pt_total ? 100.0 * pt_cache / pt_total : 0.0;
+    const double disk_hit_rate =
+        stats.disk_restore_attempts ? 100.0 * stats.disk_restores / stats.disk_restore_attempts : 0.0;
     double cache_efficiency = 0.0;
     {
         const double denom = static_cast<double>(stats.root_selections +
@@ -1278,6 +1298,22 @@ void HttpServer::handle_usage(httplib::Response& res) const {
           {"decoding", stats.decode_ready_requests},
           {"prefilling", stats.prefilling_requests},
           {"restoring_checkpoints", stats.materializing_requests}}},
+        {"disk_cache",
+         {{"enabled", stats.disk_manifests != 0 || stats.disk_saves != 0 ||
+                          stats.disk_restore_attempts != 0},
+          {"checkpoints", stats.disk_manifests},
+          {"stored_bytes", stats.disk_stored_bytes},
+          {"restores", stats.disk_restores},
+          {"restored_tokens", stats.disk_restored_tokens},
+          {"restore_attempts", stats.disk_restore_attempts},
+          {"restore_hit_rate_pct", disk_hit_rate},
+          {"restore_failures", stats.disk_restore_failures},
+          {"restore_deadline_misses", stats.disk_restore_deadline_misses},
+          {"saves", stats.disk_saves},
+          {"saves_evicted", stats.disk_saves_evicted},
+          {"saves_skipped", stats.disk_saves_skipped},
+          {"saves_skipped_budget", stats.disk_saves_skipped_budget},
+          {"saves_skipped_staging", stats.disk_saves_skipped_staging}}},
         {"health",
          {{"checkpoint_captures_completed", stats.active_captures_completed},
           {"checkpoint_captures_aborted", stats.active_captures_aborted},

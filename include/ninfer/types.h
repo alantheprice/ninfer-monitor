@@ -988,6 +988,12 @@ struct RuntimeStats {
     std::uint64_t disk_bytes_read                      = 0;
     std::uint64_t disk_stored_bytes                    = 0;
     std::uint64_t disk_manifests                       = 0;
+    // Observability for restore admission and eviction pressure (all zero when disabled).
+    std::uint64_t disk_restore_attempts                = 0;
+    std::uint64_t disk_restore_deadline_misses         = 0;
+    std::uint64_t disk_saves_evicted                   = 0;
+    std::uint64_t disk_saves_skipped_budget            = 0;
+    std::uint64_t disk_saves_skipped_staging           = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_evicted      = 0;
     std::uint64_t pressure_shared_owners_degraded      = 0;

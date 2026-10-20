@@ -346,7 +346,13 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
     }
     const std::uint64_t restores = report.current.disk_restores - report.previous.disk_restores;
     const std::uint64_t saves    = report.current.disk_saves - report.previous.disk_saves;
-    if (restores != 0 || saves != 0) {
+    const std::uint64_t evicted =
+        report.current.disk_saves_evicted - report.previous.disk_saves_evicted;
+    const std::uint64_t attempts =
+        report.current.disk_restore_attempts - report.previous.disk_restore_attempts;
+    const std::uint64_t missed =
+        report.current.disk_restore_deadline_misses - report.previous.disk_restore_deadline_misses;
+    if (restores != 0 || saves != 0 || evicted != 0 || attempts != 0) {
         out << " | disk";
         if (restores != 0) {
             out << " restored " << product::format_pretty_count(restored_tokens) << " tok ("
@@ -357,6 +363,15 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
                 << product::format_pretty_bytes(report.current.disk_bytes_written -
                                                 report.previous.disk_bytes_written)
                 << ')';
+        }
+        if (evicted != 0) {
+            out << (restores != 0 || saves != 0 ? "," : "") << " evicted " << evicted;
+        }
+        if (missed != 0) {
+            out << (restores != 0 || saves != 0 || evicted != 0 ? "," : "")
+                << " restore-missed " << missed << '/' << attempts;
+        } else if (attempts != 0 && restores == 0) {
+            out << (restores != 0 || saves != 0 || evicted != 0 ? "," : "") << " no-hit " << attempts;
         }
     }
     if (report.committed_decode_tokens != 0) {
