@@ -51,6 +51,12 @@ struct PhysicalUsageSnapshot {
     std::uint64_t disk_bytes_read       = 0;
     std::uint64_t disk_stored_bytes     = 0;
     std::uint64_t disk_manifests        = 0;
+    // Observability for restore admission and eviction pressure.
+    std::uint64_t disk_restore_attempts       = 0;
+    std::uint64_t disk_restore_deadline_misses = 0;
+    std::uint64_t disk_saves_evicted          = 0;
+    std::uint64_t disk_saves_skipped_budget   = 0;
+    std::uint64_t disk_saves_skipped_staging  = 0;
 
     [[nodiscard]] friend constexpr bool operator==(const PhysicalUsageSnapshot&,
                                                    const PhysicalUsageSnapshot&) noexcept = default;

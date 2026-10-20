@@ -260,6 +260,7 @@ void ProgramImpl::begin_disk_restore(const SequenceState& sequence, RequestContr
     const std::uint32_t maximum = staged.prompt_tokens - 1U;
     if (minimum > maximum) { return; }
     try {
+        ++disk_tier_->restore_attempts;
         const std::optional<DiskContextArchive::Candidate> candidate = disk_tier_->archive->find(
             static_cast<std::uint32_t>(minimum), maximum,
             [&](std::uint32_t at) { return sequence.prefix_digests.at(at); });
@@ -289,6 +290,10 @@ ProgramImpl::DiskRestoreStep ProgramImpl::advance_disk_restore(SequenceState& se
     staged.disk_restore.reset();
     if (status != DiskContextArchive::Prefetch::Status::Ready) {
         ++disk_tier_->restore_failures;
+        if (status == DiskContextArchive::Prefetch::Status::Pending) {
+            // Still reading when the deadline expired; the request falls back to prefill.
+            ++disk_tier_->restore_deadline_misses;
+        }
         return DiskRestoreStep::None;
     }
     const auto started = std::chrono::steady_clock::now();
@@ -418,6 +423,11 @@ void ProgramImpl::populate_disk_usage(qwen3_5::PhysicalUsageSnapshot& out) const
     out.disk_bytes_read    = archive.bytes_read;
     out.disk_stored_bytes  = archive.stored_bytes;
     out.disk_manifests     = archive.manifests;
+    out.disk_restore_attempts        = disk_tier_->restore_attempts;
+    out.disk_restore_deadline_misses = disk_tier_->restore_deadline_misses;
+    out.disk_saves_evicted           = archive.manifests_evicted;
+    out.disk_saves_skipped_budget    = archive.saves_skipped_budget;
+    out.disk_saves_skipped_staging   = archive.saves_skipped_staging;
 }
 
 } // namespace ninfer::models::qwen3_5::detail

@@ -609,13 +609,18 @@ public:
         std::unique_ptr<DiskContextArchive> archive;
         HostKVPageLayout text_layout;
         std::optional<HostKVPageLayout> backend_layout;
-        std::uint32_t min_tokens       = 0;
-        std::uint64_t restores         = 0;
-        std::uint64_t restored_tokens  = 0;
-        std::uint64_t restore_failures = 0;
-        std::uint64_t save_failures    = 0;
-        std::uint64_t save_skips       = 0;
-        double restore_seconds         = 0.0;
+        std::uint32_t min_tokens        = 0;
+        std::uint64_t restores          = 0;
+        std::uint64_t restored_tokens   = 0;
+        std::uint64_t restore_failures  = 0;
+        std::uint64_t save_failures     = 0;
+        std::uint64_t save_skips        = 0;
+        double restore_seconds          = 0.0;
+        // Observability: how often the disk tier was consulted and what happened. attempts counts
+        // every eligible restore lookup; deadline misses are the subset of failures where the
+        // staged read did not finish inside kRestoreDeadline and the request fell back to prefill.
+        std::uint64_t restore_attempts  = 0;
+        std::uint64_t restore_deadline_misses = 0;
     };
 
     std::unique_ptr<DiskTier> disk_tier_;

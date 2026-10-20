@@ -1118,6 +1118,13 @@ public:
             out.disk_stored_bytes     = usage.disk_stored_bytes;
             out.disk_manifests        = usage.disk_manifests;
         }
+        if constexpr (requires { usage.disk_restore_attempts; }) {
+            out.disk_restore_attempts        = usage.disk_restore_attempts;
+            out.disk_restore_deadline_misses = usage.disk_restore_deadline_misses;
+            out.disk_saves_evicted           = usage.disk_saves_evicted;
+            out.disk_saves_skipped_budget    = usage.disk_saves_skipped_budget;
+            out.disk_saves_skipped_staging   = usage.disk_saves_skipped_staging;
+        }
         std::uint64_t shared_references      = 0;
         for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
             if (active_[lane].occupied) {
