@@ -818,16 +818,10 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
 #endif
 
-    if (options.kv_cache == KvCacheStorage::RK4V4E8) {
-        // E8-lattice KV is in progress on the sm_89 port: the host-side plumbing (storage
-        // enum, paged KV page layout, --kv-dtype rk4v4-e8, log labels) is wired and the E8
-        // codec is sm_89-compile-verified, but the E8 attention + KV-append kernels are not
-        // ported yet. Refuse to serve it rather than silently fall through to the wrong
-        // kernel in the attention/append dispatch.
-        throw std::invalid_argument(
-            "kv-dtype rk4v4-e8 (E8-lattice KV) is not supported on this build yet; "
-            "use k8v4, int8, or nvfp4");
-    }
+    // RK4V4E8 (rk4v4-e8) is now served on the sm_89 port: the i4 KV-cache append (E8-lattice K,
+    // i4 V) and the i4 causal-attention (prompt + small_t decode) kernels are ported and wired, so
+    // no refusal. K and Q share the D256 rotation (QK preserved); V is stored raw (PV output
+    // needs no de-rotation), matching the mainline i8 convention.
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,

@@ -7,6 +7,7 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
+#include "ops/softmax_attention/dense/causal_cache/small_t_i4.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/softmax_attention.h"
 
@@ -211,6 +212,89 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+void launch_tc_partial_i4(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                          PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
+                          std::int32_t logical_capacity, std::int32_t implementation_window,
+                          std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
+                          Tensor& partial_l, cudaStream_t stream) {
+    Tensor& cache_k       = cache.k_pages;
+    Tensor& cache_v       = cache.v_pages;
+    Tensor& cache_k_scale = cache.k_scale_pages;
+    Tensor& cache_v_scale = cache.v_scale_pages;
+    auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
+        const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+        constexpr std::size_t kDynamicBytes =
+            DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kCausalHeadDim) : 0u;
+        if constexpr (DynamicArena) {
+            static const cudaError_t attr = cudaFuncSetAttribute(
+                causal_attention_small_t_i4_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
+                                                         MinBlocksPerSm, KeyBlock, DynamicArena,
+                                                         MultiBatch, Masked, CacheInput>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+            CUDA_CHECK(attr);
+        }
+        causal_attention_small_t_i4_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
+                                                 KeyBlock, DynamicArena, MultiBatch, Masked,
+                                                 CacheInput>
+            <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data), input,
+                static_cast<const std::int32_t*>(pos.data),
+                static_cast<std::uint8_t*>(cache_k.data), static_cast<std::uint8_t*>(cache_v.data),
+                static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
+                static_cast<const std::int32_t*>(cache.block_tables.data),
+                invocation.valid_columns == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                invocation.table_rows == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
+                logical_capacity, scale, static_cast<float*>(partial_acc.data),
+                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+    };
+    if constexpr (TokenTile >= 6) {
+        if (implementation_window > 128 && implementation_window <= 160) {
+            launch.template operator()<24, 1, 32, false>();
+        } else if (implementation_window <= 2054) {
+            launch.template operator()<12, 1, 32, false>();
+        } else if (implementation_window <= 8198) {
+            launch.template operator()<12, 1, 64, true>();
+        } else {
+            launch.template operator()<6, 2, 32, false>();
+        }
+    } else if constexpr (TokenTile == 5) {
+        if constexpr (Geometry::GroupSize == 6) {
+            if (implementation_window > 128 && implementation_window <= 512) {
+                launch.template operator()<32, 1, 32, false>();
+            } else if (implementation_window <= 1029) {
+                launch.template operator()<16, 1, 32, false>();
+            } else {
+                launch.template operator()<8, 2, 32, false>();
+            }
+        } else {
+            if (implementation_window > 128 && implementation_window <= 512) {
+                launch.template operator()<24, 1, 32, false>();
+            } else if (implementation_window <= 1029) {
+                launch.template operator()<24, 1, 32, false>();
+            } else if (implementation_window <= 4096) {
+                launch.template operator()<12, 1, 32, false>();
+            } else {
+                launch.template operator()<6, 2, 32, false>();
+            }
+        }
+    } else if constexpr (TokenTile == 4) {
+        if (implementation_window <= 1029) {
+            launch.template operator()<16, 1, 32, false>();
+        } else {
+            launch.template operator()<8, 2, 32, false>();
+        }
+    } else {
+        launch.template operator()<8, 2, 32, false>();
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
@@ -271,6 +355,10 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
             if (cache.storage == KvCacheStorage::Int8Group64) {                                    \
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
+                    q, input, pos, scale, cache, invocation, logical_capacity,                     \
+                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
+            } else if (cache.storage == KvCacheStorage::RK4V4E8) {                                 \
+                launch_tc_partial_i4<Geometry, (TOKENS), MultiBatch, Masked>(                      \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
             } else {                                                                               \
@@ -361,7 +449,8 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
         else
             launch_profile.template operator()<Int8, true, false>();
     };
-    if (cache.storage == KvCacheStorage::Int8Group64)
+    if (cache.storage == KvCacheStorage::Int8Group64 ||
+        cache.storage == KvCacheStorage::RK4V4E8)
         launch_for_storage.template operator()<true>();
     else
         launch_for_storage.template operator()<false>();
