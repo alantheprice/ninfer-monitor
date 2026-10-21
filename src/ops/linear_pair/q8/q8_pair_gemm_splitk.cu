@@ -75,8 +75,15 @@ void launch_active_cols(const Tensor& x, const Weight& first_weight, const Weigh
     const Q8ContiguousOutput ignored{static_cast<__nv_bfloat16*>(first_out.data), kRows};
     const Q8PairExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(first_out.data),
                                         static_cast<__nv_bfloat16*>(second_out.data)};
+    static const cudaError_t smem_attr = cudaFuncSetAttribute(
+        q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Q8ContiguousOutput,
+                             Q8PairExactTEpilogue, Q8PairExactTRows>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Q8KSplitSharedStorage<Schedule>));
+    CUDA_CHECK(smem_attr);
     q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Q8ContiguousOutput, Q8PairExactTEpilogue,
-                         Q8PairExactTRows><<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+                         Q8PairExactTRows><<<kRows / kRowsPerCta, Schedule::kThreads,
+                                              sizeof(Q8KSplitSharedStorage<Schedule>),
+                                              stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, ignored, epilogue,
         Q8PairExactTRows{});
 }
@@ -102,8 +109,15 @@ void launch_medium(const Tensor& x, const Weight& first_weight, const Weight& se
     }
     const PairOutput output{static_cast<__nv_bfloat16*>(first_out.data),
                             static_cast<__nv_bfloat16*>(second_out.data)};
+    constexpr std::size_t kGroupedSmemBytes =
+        16 * (KSplits * 64) + (KSplits * NGroups) * (TileCols / NGroups) * 64 * 2;
+    static const cudaError_t smem_attr = cudaFuncSetAttribute(
+        q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks, PairOutput>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(kGroupedSmemBytes));
+    CUDA_CHECK(smem_attr);
     q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<(2 * kRows) / 16, KSplits * NGroups * 32, 0, stream>>>(
+        <<<(2 * kRows) / 16, KSplits * NGroups * 32, kGroupedSmemBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, output, x.ne[1]);
 }
 

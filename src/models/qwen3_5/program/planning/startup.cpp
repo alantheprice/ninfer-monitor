@@ -801,9 +801,22 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     }
+#if defined(NINFER_SM86) || defined(NINFER_SM89)
+    // sm_86/89 port (feat/rtx-4090-sm89-on-mainline): the Qwen3.8-27B groupwise artifact is
+    // served on Ada. The family's device kernels are portable — the sm_89 op test suite
+    // (GDN, q4/q5/q6/q8 groupwise GEMMs, attention, KV append) passes on sm_89 — and the
+    // 4090 fork runs this same model family on sm_89 (measured 187-197 tok/s). The mainline
+    // CC==120 check is a Blackwell-only support policy, not a hardware requirement; the
+    // nvfp4/fp8 KV + GEMM paths stay CC-12-only via their own arch guards.
+    if (device.compute_capability() < 89) {
+        throw std::invalid_argument(
+            "Qwen3.5 family runtime requires compute capability >= 8.9 on this build");
+    }
+#else
     if (device.compute_capability() != 120) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
     }
+#endif
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,

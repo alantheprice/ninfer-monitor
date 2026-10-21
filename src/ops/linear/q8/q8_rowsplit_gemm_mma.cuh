@@ -55,7 +55,22 @@ struct Q8RowSplitMmaGemmSchedule {
     static_assert(STAGES == 2, "Q8G32 MMA uses a two-stage cp.async pipeline");
     static_assert(ACTIVATION_STAGES == 1 || ACTIVATION_STAGES == STAGES,
                   "Q8G32 MMA activation staging is single-buffered or follows the pipeline");
-    static_assert(SMEM_BYTES <= 99 * 1024, "sm_120a per-CTA shared memory limit");
+    static_assert(SMEM_BYTES <= 99 * 1024,
+                  "per-CTA shared memory limit (sm_89 dynamic-smem opt-in: 99 KB)");
+};
+
+// The contraction owns the shared layout; tiled launchers use the same type for dynamic-smem
+// sizing (sizeof matches the kernel's per-instantiation byte count exactly).
+template <class Cfg, Q8Epilogue Epilogue = Q8Epilogue::Store>
+union alignas(16) Q8RowSplitMmaSharedStorage {
+    struct {
+        alignas(16) __nv_bfloat16 weights[Cfg::BM * Cfg::BK];
+        alignas(16) __nv_bfloat16 activations[Cfg::ACTIVATION_STAGES][Cfg::BN * Cfg::BK];
+        alignas(16) std::uint8_t codes[Cfg::BM * Cfg::BK];
+        alignas(16) std::uint8_t scales[Cfg::BM * Cfg::SCALE_CACHE_BYTES];
+    } operands;
+
+    float projected[Epilogue == Q8Epilogue::Residual ? Cfg::BM * Cfg::BN : 1];
 };
 
 __device__ __forceinline__ int q8_g32_swz64(int row, int col) {
@@ -82,20 +97,11 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q8_rowsplit_gem
     static_assert(!kSwiGlu || Cfg::WARPS_M == 1 || Cfg::WARPS_M == 2,
                   "SwiGLU supports warp-local or shared-memory row pairing");
 
-    struct OperandStorage {
-        alignas(16) __nv_bfloat16 weights[BM * BK];
-        alignas(16) __nv_bfloat16 activations[Cfg::ACTIVATION_STAGES][BN * BK];
-        alignas(16) std::uint8_t codes[BM * BK];
-        alignas(16) std::uint8_t scales[BM * Cfg::SCALE_CACHE_BYTES];
-    };
-
-    union SharedStorage {
-        OperandStorage operands;
-        float projected[Epilogue == Q8Epilogue::Residual ? BM * BN : 1];
-    };
+    using SharedStorage = Q8RowSplitMmaSharedStorage<Cfg, Epilogue>;
 
     static_assert(sizeof(SharedStorage) <= 99 * 1024);
-    __shared__ __align__(16) SharedStorage shared;
+    extern __shared__ __align__(16) unsigned char dynamic_shared[];
+    auto& shared = *reinterpret_cast<SharedStorage*>(dynamic_shared);
     auto& As = shared.operands.weights;
     auto& Bs = shared.operands.activations;
     auto& Cr = shared.operands.codes;

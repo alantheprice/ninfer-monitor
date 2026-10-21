@@ -1,15 +1,30 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_120a. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
-# host-toolchain default or accepts an unsupported target.
+# Architecture gate. Blackwell (sm_120a) is the reference/default target; the
+# RTX-4090 (sm_89) and Ampere (sm_86) targets are supported by re-applying the
+# Ada/Ampere kernel layer (see the sm_89 port). Validate the architecture before
+# CUDA compiler detection so CMake never injects a generic host-toolchain default
+# or accepts an unsupported target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(120a|86|89)$")
   message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
+    "NInfer supports CMAKE_CUDA_ARCHITECTURES=120a, 86 or 89; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
+endif()
+# NVFP4 (Blackwell FP4 tensor cores + TMA/setmaxnreg warp-specialized kernels) is
+# only available on sm_120a. On sm_86/89 the groupwise-int path (q4/q5/q6/q8
+# row-split) is used and the NVFP4 kernel archives are excluded from the build.
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(120a)$")
+  set(NINFER_ENABLE_NVFP4 ON)
+  add_compile_definitions(NINFER_SM120A=1)
+elseif(CMAKE_CUDA_ARCHITECTURES MATCHES "^86$")
+  set(NINFER_ENABLE_NVFP4 OFF)
+  add_compile_definitions(NINFER_SM86=1)
+else()
+  set(NINFER_ENABLE_NVFP4 OFF)
+  add_compile_definitions(NINFER_SM89=1)
 endif()
 
 project(ninfer LANGUAGES C CXX CUDA)

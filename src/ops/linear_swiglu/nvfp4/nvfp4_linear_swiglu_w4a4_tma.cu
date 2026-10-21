@@ -1,5 +1,8 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
 
+#if defined(NINFER_SM120A)
+
+
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma.cuh"
@@ -77,3 +80,21 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
 }
 
 } // namespace ninfer::ops::detail
+
+#else
+
+#include <stdexcept>
+
+namespace ninfer::ops::detail {
+void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
+                                         const std::uint8_t* activation_scales,
+                                         const std::uint8_t* weight_codes,
+                                         const std::uint8_t* weight_scales, __nv_bfloat16* output,
+                                         std::int32_t tokens, float alpha, cudaStream_t stream)
+{
+  throw std::runtime_error("nvfp4 W4A4 TMA linear-swiglu kernel requires sm_120a; use a groupwise artifact on sm_86/89");
+}
+
+} // namespace ninfer::ops::detail
+
+#endif  // NINFER_SM120A

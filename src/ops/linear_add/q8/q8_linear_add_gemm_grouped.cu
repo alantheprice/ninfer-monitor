@@ -14,8 +14,16 @@ void launch(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t str
     constexpr int kTokenGroups = 4;
     const dim3 grid(5120 / 16, div_up(x.ne[1], kColumns));
     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(residual.data), 5120};
+    constexpr std::size_t kGroupedSmemBytes =
+        16 * (kSplits * 64) + (kSplits * kTokenGroups) * (kColumns / kTokenGroups) * 64 * 2;
+    static const cudaError_t smem_attr = cudaFuncSetAttribute(
+        q8_ksplit_grouped_mma_kernel<K, kColumns, kSplits, kTokenGroups, 1, Q8ContiguousOutput,
+                                    true, true>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kGroupedSmemBytes));
+    CUDA_CHECK(smem_attr);
     q8_ksplit_grouped_mma_kernel<K, kColumns, kSplits, kTokenGroups, 1, Q8ContiguousOutput, true,
-                                 true><<<grid, kSplits * kTokenGroups * 32, 0, stream>>>(
+                                 true><<<grid, kSplits * kTokenGroups * 32, kGroupedSmemBytes,
+                                          stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), output, x.ne[1]);
     CUDA_CHECK(cudaGetLastError());

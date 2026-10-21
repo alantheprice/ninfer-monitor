@@ -1,6 +1,9 @@
 // Non-RDC ownership for the warp-specialized NVFP4 causal prompt kernel.
 #include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_non_rdc_launch.h"
 
+#if defined(NINFER_SM120A)
+
+
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4.cuh"
@@ -75,3 +78,27 @@ void causal_attention_prompt_nvfp4_batch_kernel_launch(const Tensor& q, const Te
 }
 
 } // namespace ninfer::ops::detail
+
+#else
+
+#include <stdexcept>
+
+namespace ninfer::ops::detail {
+
+void causal_attention_prompt_nvfp4_kernel_launch(const Tensor& q, const Tensor& positions,
+                                                 float scale, const PagedKVLayerView& cache,
+                                                 Tensor& out, cudaStream_t stream) {
+  throw std::runtime_error("nvfp4 prompt attention TMA kernel requires sm_120a; use a groupwise artifact on sm_86/89");
+}
+
+void causal_attention_prompt_nvfp4_batch_kernel_launch(const Tensor& q, const Tensor& positions,
+                                                       const Tensor& valid_columns,
+                                                       const Tensor& table_rows, float scale,
+                                                       const PagedKVBatchLayerView& cache,
+                                                       Tensor& out, cudaStream_t stream) {
+  throw std::runtime_error("nvfp4 batch prompt attention TMA kernel requires sm_120a; use a groupwise artifact on sm_86/89");
+}
+
+} // namespace ninfer::ops::detail
+
+#endif  // NINFER_SM120A

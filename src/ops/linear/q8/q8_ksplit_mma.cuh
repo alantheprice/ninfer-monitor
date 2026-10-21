@@ -104,7 +104,15 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
 
     using SharedStorage = Q8KSplitSharedStorage<Schedule>;
 
-    constexpr bool kDynamicShared = TiledColumns && ActiveCols > 64;
+    // sm_89 has a hard 48 KB limit for *static* shared memory and no build-time opt-in; the
+    // opt-in is the runtime cudaFuncSetAttribute(MaxDynamicSharedMemorySize), which lifts the
+    // per-block limit to 99 KB for dynamic (extern) smem. The launch side therefore passes
+    // sizeof(SharedStorage) as the dynamic size for every instantiation (the pre-conversion
+    // kDynamicShared = TiledColumns && ActiveCols > 64 gate left TiledColumns=false callers on
+    // static smem, which exceeds the 48 KB limit at the 48/56/64-column schedules, e.g. the
+    // 0x18400 (97 KB) Q8KSplitSchedule<16,40,...> instance). The launch side sets the
+    // cudaFuncSetAttribute opt-in once per kernel.
+    constexpr bool kDynamicShared = true;
     __shared__ __align__(
         16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
     extern __shared__ __align__(16) unsigned char dynamic_shared[];

@@ -12,9 +12,21 @@
 namespace ninfer::ops::detail {
 
 __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
+#if defined(NINFER_SM120A)
     __nv_fp4x2_e2m1 value;
     value.__x = storage;
     return static_cast<float2>(value);
+#else
+    // E2M1 (4-bit) has 16 codes: {0, .5, 1, 1.5, 2, 3, 4, 6} with sign on 1..6.
+    // The CUDA FP4 library only exists on sm_120a; elsewhere decode via a table.
+    constexpr float kE2M1[16] = {
+        0.0F,  0.5F,  1.0F,  1.5F,  2.0F,  3.0F,  4.0F,  6.0F,
+        -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F,
+    };
+    const int hi = (storage >> 4) & 0xF;
+    const int lo = storage & 0xF;
+    return make_float2(kE2M1[lo], kE2M1[hi]);
+#endif
 }
 
 __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
@@ -33,6 +45,7 @@ static_assert(alignof(Nvfp4QuantizedK16) == 8);
 
 __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
+#if defined(NINFER_SM120A)
     asm volatile("{\n"
                  ".reg .b8 b0;\n"
                  ".reg .b8 b1;\n"
@@ -58,6 +71,15 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
                    "f"(values[2].x), "f"(values[2].y), "f"(values[3].x), "f"(values[3].y),
                    "f"(values[4].x), "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
                    "f"(values[6].x), "f"(values[6].y), "f"(values[7].x), "f"(values[7].y));
+#else
+    // FP4 (e2m1) quantization is a sm_120a hardware feature (FP4 tensor cores); it has
+    // no sm_86/89 encoding. NVFP4 paths are unreachable on a groupwise artifact, so
+    // fail loudly rather than silently produce wrong numerics.
+    (void)values;
+    codes_lo = 0;
+    codes_hi = 0;
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,

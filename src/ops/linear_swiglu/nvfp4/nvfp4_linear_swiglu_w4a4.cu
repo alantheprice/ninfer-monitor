@@ -72,8 +72,16 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
     const Nvfp4SwiGluRows row_policy{};
     const Nvfp4SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data)};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+    static const cudaError_t smem_attr = cudaFuncSetAttribute(
+        nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput,
+                             Nvfp4SwiGluRows, true>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        sizeof(Nvfp4W4a4SharedStorage<Schedule>));
+    CUDA_CHECK(smem_attr);
     nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput,
-                          Nvfp4SwiGluRows, true><<<grid, Schedule::kThreads, 0, stream>>>(
+                          Nvfp4SwiGluRows, true><<<grid, Schedule::kThreads,
+                                                     sizeof(Nvfp4W4a4SharedStorage<Schedule>),
+                                                     stream>>>(
         activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
         output, row_policy);

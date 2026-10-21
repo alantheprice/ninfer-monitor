@@ -37,8 +37,13 @@ void launch_output(const Tensor& x, const Weight& weight, Output output, cudaStr
                                                 : 48;
     using Geometry         = Q8LinearGeometry<Rows, kHidden>;
     using Schedule         = Q8KSplitDefaultSchedule<TileCols, ActiveCols>;
+    static const cudaError_t smem_attr = cudaFuncSetAttribute(
+        q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Output>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Q8KSplitSharedStorage<Schedule>));
+    CUDA_CHECK(smem_attr);
     q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule>
-        <<<Rows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+        <<<Rows / kRowsPerCta, Schedule::kThreads, sizeof(Q8KSplitSharedStorage<Schedule>),
+           stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output);
@@ -88,8 +93,14 @@ void launch_target_medium_cols(const Tensor& x, const Weight& weight, Tensor& q,
     const TargetOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+    constexpr std::size_t kGroupedSmemBytes =
+        16 * (KSplits * 64) + (KSplits * NGroups) * (TileCols / NGroups) * 64 * 2;
+    static const cudaError_t smem_attr = cudaFuncSetAttribute(
+        q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks, TargetOutput>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kGroupedSmemBytes));
+    CUDA_CHECK(smem_attr);
     q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<kTargetRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
+        <<<kTargetRows / kRowsPerCta, KSplits * NGroups * 32, kGroupedSmemBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
@@ -102,8 +113,15 @@ void launch_companion_medium_cols(const Tensor& x, const Weight& weight, Tensor&
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
+    constexpr std::size_t kGroupedSmemBytes =
+        16 * (KSplits * 64) + (KSplits * NGroups) * (TileCols / NGroups) * 64 * 2;
+    static const cudaError_t smem_attr = cudaFuncSetAttribute(
+        q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks,
+                                     CompanionOutput>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kGroupedSmemBytes));
+    CUDA_CHECK(smem_attr);
     q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<kCompanionRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
+        <<<kCompanionRows / kRowsPerCta, KSplits * NGroups * 32, kGroupedSmemBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);

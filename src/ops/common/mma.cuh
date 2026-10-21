@@ -56,13 +56,32 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// FP8 e4m3 GEMM via the Hopper-style kind::f8f6f4 mma instruction is sm_90+/sm_120a
+// only; sm_86/89 (Ada) exposes FP8 GEMM through a different (non-`kind`) encoding
+// that the groupwise-int kernels use. FP8 KV dtypes (fp8 / k8v4) are therefore
+// unavailable on sm_86/89 — use int8 KV or the E8-lattice (4-bit) KV instead. The
+// fp8 kernels still compile so the dispatch links, but invoking one traps.
 __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                              unsigned b0, unsigned b1) {
+#if defined(NINFER_SM120A)
     asm volatile("mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    (void)c0;
+    (void)c1;
+    (void)c2;
+    (void)c3;
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)b0;
+    (void)b1;
+    __trap();  // fp8 kind::f8f6f4 GEMM requires sm_90+/sm_120a; never reachable on sm_86/89
+#endif
 }
 
 __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
@@ -80,10 +99,16 @@ __device__ __forceinline__ void mma_tf32(float& c0, float& c1, float& c2, float&
                   __float_as_uint(a3), __float_as_uint(b0), __float_as_uint(b1));
 }
 
+// FP4 block-scale MMA is a sm_120a instruction (kind::mxf4nvf4). On sm_86/89 the
+// nvfp4 weight format is unavailable (no FP4 tensor cores); the nvfp4 kernels
+// still compile so the host dispatch links, but invoking one traps the device
+// instead of producing wrong numerics. The groupwise-int artifact never reaches
+// this path.
 __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, float& c3,
                                                unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                                unsigned b0, unsigned b1, unsigned sfa,
                                                unsigned sfb) {
+#if defined(NINFER_SM120A)
     constexpr unsigned short kScaleBlockId  = 0;
     constexpr unsigned short kScaleThreadId = 0;
     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."
@@ -100,6 +125,21 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, 
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa),
                    "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleBlockId),
                    "h"(kScaleThreadId));
+#else
+    (void)c0;
+    (void)c1;
+    (void)c2;
+    (void)c3;
+    (void)a0;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)b0;
+    (void)b1;
+    (void)sfa;
+    (void)sfb;
+    __trap();  // nvfp4 W4A4 MMA requires sm_120a; never reachable on the groupwise path
+#endif
 }
 
 } // namespace ninfer::ops

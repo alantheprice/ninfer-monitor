@@ -41,12 +41,15 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
     using Geometry            = Q8LinearGeometry<kRows, InputRows>;
     using Schedule            = Q8KSplitSchedule<Warps, TileColumns, Warps == 8 ? 2 : 3,
                                                  Q8KSplitScaleAccess::Shared, Activation>;
-    constexpr int SharedBytes = TileColumns > 64 ? sizeof(Q8KSplitSharedStorage<Schedule>) : 0;
-    if constexpr (SharedBytes > 0) {
+    // The ksplit kernel uses dynamic smem unconditionally (sm_89 has a 48 KB *static* limit),
+    // so the dynamic size is the full storage for every instantiation — the pre-conversion
+    // `TileColumns > 64` gate left the smaller schedules on 0 bytes of dynamic smem.
+    constexpr std::size_t SharedBytes = sizeof(Q8KSplitSharedStorage<Schedule>);
+    {
         static const cudaError_t attribute = cudaFuncSetAttribute(
             q8_ksplit_mma_kernel<Geometry, TileColumns, Schedule, Q8ContiguousOutput,
                                  Q8KSplitStoreEpilogue, Q8KSplitIdentityRows, false, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, SharedBytes);
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(SharedBytes));
         CUDA_CHECK(attribute);
     }
     const int columns = x.ne[1];

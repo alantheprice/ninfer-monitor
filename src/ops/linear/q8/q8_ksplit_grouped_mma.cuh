@@ -31,8 +31,19 @@ __global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_gr
     static_assert(TileCols % NGroups == 0 && kWarpCols % 8 == 0);
     static_assert(Hidden % kGroupK == 0 && kKernelWarps <= 32);
 
-    __shared__ __align__(16) std::uint8_t code_shared[kMmaRows][kGroupK];
-    __shared__ __align__(16) __nv_bfloat16 b_shared[kKernelWarps][kWarpCols * kTileK];
+    // sm_89: the two former static arrays are merged into one dynamic shared-memory buffer
+    // (static smem has a hard 48 KB limit with no build-time opt-in; the launch side opts in to
+    // 99 KB via cudaFuncSetAttribute(MaxDynamicSharedMemorySize) and passes the total of both
+    // regions as the dynamic size). First region = code, second = b; the b region stays
+    // 16-byte aligned because kMmaRows * kGroupK is a multiple of 2048.
+    constexpr std::size_t kCodeSharedBytes = static_cast<std::size_t>(kMmaRows) * kGroupK;
+    constexpr std::size_t kBSharedBytes =
+        static_cast<std::size_t>(kKernelWarps) * kWarpCols * kTileK * 2;
+    extern __shared__ __align__(16) unsigned char dynamic_shared[];
+    auto* code_shared =
+        reinterpret_cast<std::uint8_t(*)[kGroupK]>(dynamic_shared);
+    auto* b_shared = reinterpret_cast<__nv_bfloat16(*)[kWarpCols * kTileK]>(
+        dynamic_shared + kCodeSharedBytes);
 
     const int tid        = static_cast<int>(threadIdx.x);
     const int warp       = tid >> 5;
@@ -237,6 +248,23 @@ __global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_gr
             }
         }
     }
+}
+
+// Host-side byte count for the q8_ksplit_grouped_mma_kernel dynamic shared-memory buffer. It is
+// the sum of the two former static regions (code first, b second); the b region stays 16-byte
+// aligned because 16 * KSplits * 64 (kMmaRows * kGroupK) is a multiple of 1024.
+template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks, class Output,
+          bool AddResidual = false, bool TiledColumns = false>
+constexpr std::size_t q8_ksplit_grouped_mma_shared_bytes() {
+    constexpr int kTileK       = 64;
+    constexpr int kMmaRows     = 16;
+    constexpr int kKernelWarps = KSplits * NGroups;
+    constexpr int kGroupK      = KSplits * kTileK;
+    constexpr int kWarpCols    = TileCols / NGroups;
+    constexpr std::size_t kCodeSharedBytes = static_cast<std::size_t>(kMmaRows) * kGroupK;
+    constexpr std::size_t kBSharedBytes =
+        static_cast<std::size_t>(kKernelWarps) * kWarpCols * kTileK * 2;
+    return kCodeSharedBytes + kBSharedBytes;
 }
 
 } // namespace ninfer::ops::detail

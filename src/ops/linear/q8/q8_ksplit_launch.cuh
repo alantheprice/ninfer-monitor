@@ -18,9 +18,16 @@ void launch_q8_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
         throw std::invalid_argument("q8 K-split: padded K differs from the registered geometry");
     }
     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
+    constexpr std::size_t kSharedBytes = sizeof(Q8KSplitSharedStorage<Schedule>);
+    static const cudaError_t smem_attr = cudaFuncSetAttribute(
+        q8_ksplit_mma_kernel<Geometry, ColumnCapacity, Schedule, Q8ContiguousOutput, Epilogue,
+                             Q8KSplitIdentityRows, false, true>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSharedBytes));
+    CUDA_CHECK(smem_attr);
     q8_ksplit_mma_kernel<Geometry, ColumnCapacity, Schedule, Q8ContiguousOutput, Epilogue,
                          Q8KSplitIdentityRows, false, true>
-        <<<Geometry::kOutputRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+        <<<Geometry::kOutputRows / Schedule::kRowsPerCta, Schedule::kThreads, kSharedBytes,
+           stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output, Epilogue{},

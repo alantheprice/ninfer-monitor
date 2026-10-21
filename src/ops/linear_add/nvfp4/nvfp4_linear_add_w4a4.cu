@@ -27,7 +27,15 @@ void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace work
     const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
     auto* output      = static_cast<__nv_bfloat16*>(residual.data);
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
+    static const cudaError_t smem_attr = cudaFuncSetAttribute(
+        nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4AddResidualEpilogue,
+                              Nvfp4ContiguousOutput>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        sizeof(Nvfp4W4a4SharedStorage<Schedule>));
+    CUDA_CHECK(smem_attr);
+    nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads,
+                                                 sizeof(Nvfp4W4a4SharedStorage<Schedule>),
+                                                 stream>>>(
         activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
         Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},

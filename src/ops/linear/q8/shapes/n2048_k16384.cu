@@ -24,8 +24,15 @@ void launch_grouped(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
             "q8 grouped K-split: padded K differs from registered geometry");
     }
     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
+    constexpr std::size_t kGroupedSmemBytes =
+        16 * (KWarps * 64) + (KWarps * TokenGroups) * (Capacity / TokenGroups) * 64 * 2;
+    static const cudaError_t smem_attr = cudaFuncSetAttribute(
+        q8_ksplit_grouped_mma_kernel<Geometry::kInputRows, Capacity, KWarps, TokenGroups, 1,
+                                     Q8ContiguousOutput>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kGroupedSmemBytes));
+    CUDA_CHECK(smem_attr);
     q8_ksplit_grouped_mma_kernel<Geometry::kInputRows, Capacity, KWarps, TokenGroups, 1>
-        <<<Geometry::kOutputRows / 16, KWarps * TokenGroups * 32, 0, stream>>>(
+        <<<Geometry::kOutputRows / 16, KWarps * TokenGroups * 32, kGroupedSmemBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);

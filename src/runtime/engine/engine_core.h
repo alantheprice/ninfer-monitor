@@ -18,6 +18,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <deque>
 #include <exception>
@@ -2030,7 +2031,26 @@ private:
                 }
                 set_host_work_class(HostWorkClass::Control);
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            } catch (const std::exception& e) {
+                // A worker-loop escape permanently latches the engine (failed_ is never
+                // cleared). Log the reason before latching — the 2026-10-02 503 incident
+                // was a silent latch with no record of the trigger.
+                fprintf(stderr, "ninfer-serve: FATAL engine worker loop escaped exception: %s "
+                                "(engine latched unavailable until restart)\n",
+                        e.what());
+                std::fflush(stderr);
+                const std::exception_ptr error = std::current_exception();
+                HostPhaseMeasurement cleanup   = begin_host_phase();
+                fail_all_locked(error);
+                finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                try {
+                    publish_runtime_stats();
+                } catch (...) {}
+                return;
             } catch (...) {
+                fprintf(stderr, "ninfer-serve: FATAL engine worker loop escaped "
+                                "non-standard exception (engine latched unavailable until restart)\n");
+                std::fflush(stderr);
                 const std::exception_ptr error = std::current_exception();
                 HostPhaseMeasurement cleanup   = begin_host_phase();
                 fail_all_locked(error);

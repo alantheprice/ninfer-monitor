@@ -13,8 +13,15 @@ void launch_variant(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t 
     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]};
     const dim3 grid(out.ne[0] / (Schedule::BM / 2),
                     static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
+    static const cudaError_t smem_attr = cudaFuncSetAttribute(
+        q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::SwiGluSplitHalf>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        sizeof(Q8RowSplitMmaSharedStorage<Schedule, Q8Epilogue::SwiGluSplitHalf>));
+    CUDA_CHECK(smem_attr);
     q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::SwiGluSplitHalf>
-        <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+        <<<grid, Schedule::THREADS,
+            sizeof(Q8RowSplitMmaSharedStorage<Schedule, Q8Epilogue::SwiGluSplitHalf>),
+            stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                                  static_cast<const std::uint8_t*>(w.qdata),
                                                  static_cast<const std::uint8_t*>(w.scales), output,
                                                  w.n, w.k, x.ne[1], w.padded_shape[1]);
