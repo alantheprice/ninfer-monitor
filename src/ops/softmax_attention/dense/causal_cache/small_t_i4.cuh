@@ -174,6 +174,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     }
 
     if constexpr (CacheInput::writes_cache) {
+        // The fused append below reads physical_pages_s; the preload above must be visible
+        // first (the i8 kernel gets this barrier for free from its two-stage H64 exchange).
+        __syncthreads();
         // Fused i4 append: one warp per new (token) for this kv_head encodes the full 256-dim row
         // (D256-rotated + E8-refined K, raw i4 V) via the verified row encoder, writing i4 codes +
         // group scales into the cache. __syncthreads below orders the readback.

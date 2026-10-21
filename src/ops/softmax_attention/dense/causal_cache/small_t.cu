@@ -52,19 +52,23 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
             return Geometry::SmallTMaximumSplits;
         }
     }
+    // RK4V4E8 shares Int8Group64's 64-key page geometry and kernel structure, so it must
+    // follow the same split policy (otherwise a large window yields too few splits and the
+    // 64-entry physical_pages_s staging overflows).
+    const bool i8_like = storage == KvCacheStorage::Int8Group64 || storage == KvCacheStorage::RK4V4E8;
     // A 64-key default split just above a 32-key boundary makes the partial kernel execute a
     // nearly empty second tile. T=5 uses one 32-key tile per split; the short T>=6 profile keeps
     // all newly appended rows in one tail split while retaining a useful B=8 grid.
-    if (storage == KvCacheStorage::Int8Group64 && tokens == 5 && window > 128 && window <= 512) {
+    if (i8_like && tokens == 5 && window > 128 && window <= 512) {
         return div_up(window, 32 / Geometry::SmallTSplitScale);
     }
-    if (storage == KvCacheStorage::Int8Group64 && tokens >= 6 && window > 128 && window <= 160) {
+    if (i8_like && tokens >= 6 && window > 128 && window <= 160) {
         constexpr std::int32_t kKeysPerSplit = Geometry::SmallTSplitScale == 2 ? 17 : 24;
         return div_up(window, kKeysPerSplit);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
     // one 170-SM wave after accounting for the geometry's KV-head count.
-    if (storage == KvCacheStorage::Int8Group64 && tokens >= 6 && window > 5000 && window <= 8198) {
+    if (i8_like && tokens >= 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::SmallTSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::SmallTSplitScale;
         constexpr std::int32_t kMax = 42 * Geometry::SmallTSplitScale;
@@ -317,7 +321,8 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
             if (cache_storage == KvCacheStorage::BFloat16)
                 target_ctas =
                     narrow || batch_size >= 5 || envelope.max_visible_keys > 4096 ? 320 : 160;
-            else if (cache_storage == KvCacheStorage::Int8Group64)
+            else if (cache_storage == KvCacheStorage::Int8Group64 ||
+                     cache_storage == KvCacheStorage::RK4V4E8)
                 target_ctas = narrow || envelope.max_visible_keys > 4096 ? 320 : 160;
             else if (cache_storage == KvCacheStorage::Nvfp4Group16)
                 target_ctas = narrow ? 320 : 160;
