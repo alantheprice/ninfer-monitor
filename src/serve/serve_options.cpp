@@ -52,7 +52,7 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
-    if (value == "rk4v4-e8" || value == "e8") { return KvCacheStorage::E8KeyNvfp4Value; }
+    if (value == "rk4v4-e8" || value == "e8") { return KvCacheStorage::RK4V4E8; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 

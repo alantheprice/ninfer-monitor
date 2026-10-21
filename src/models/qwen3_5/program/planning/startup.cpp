@@ -818,7 +818,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
 #endif
 
-    if (options.kv_cache == KvCacheStorage::E8KeyNvfp4Value) {
+    if (options.kv_cache == KvCacheStorage::RK4V4E8) {
         // E8-lattice KV is in progress on the sm_89 port: the host-side plumbing (storage
         // enum, paged KV page layout, --kv-dtype rk4v4-e8, log labels) is wired and the E8
         // codec is sm_89-compile-verified, but the E8 attention + KV-append kernels are not

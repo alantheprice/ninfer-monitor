@@ -760,7 +760,7 @@ const char* kv_cache_storage_name(ninfer::KvCacheStorage storage) noexcept {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
-    case ninfer::KvCacheStorage::E8KeyNvfp4Value:
+    case ninfer::KvCacheStorage::RK4V4E8:
         return "rk4v4-e8";
     }
     return "unknown";

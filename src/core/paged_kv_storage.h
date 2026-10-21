@@ -87,15 +87,16 @@ struct PagedKVStorageLayout {
                     {DType::U8, 128, DType::U8, 16}};
         }
         break;
-    case KvCacheStorage::E8KeyNvfp4Value:
-        // E8-lattice key: 256 dims = 32 x 8-dim subvectors, 2 bytes each (root idx +
-        // rad/axis), radius baked into the code so no key scale plane. Value reuses the
-        // NVFP4 value plane (128 B codes + 16 B group scales).
+    case KvCacheStorage::RK4V4E8:
+        // 4-bit (i4) key + 4-bit value, group-64 fp16 scales (the 4090 fork's live
+        // rk4v4-e8 storage). i4 = 2 codes/byte: 256 dims -> 128 B; group 64 -> 4 scales
+        // (2 B each). The key's E8-lattice quantization + Hadamard rotation are
+        // encode-side only; the decode is i4 unpack -> int8 -> s8 MMA (sm_89-safe).
         if (head_dim == kD256KVCacheHeadDim) {
             return {storage,
                     head_dim,
-                    {DType::U8, 64, DType::U8, 0},
-                    {DType::U8, 128, DType::U8, 16}};
+                    {DType::U8, 128, DType::FP16, 4},
+                    {DType::U8, 128, DType::FP16, 4}};
         }
         break;
     }

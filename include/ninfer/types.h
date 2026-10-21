@@ -37,7 +37,10 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8E4M3Row256,
     Nvfp4Group16,
     Fp8KeyNvfp4Value,
-    E8KeyNvfp4Value,
+    // 4-bit (i4) keys, E8-lattice-quantized (Hadamard-rotated) + 4-bit values, group-64.
+    // Matches the 4090 fork's live rk4v4-e8 storage; sm_89-portable (i4 unpack -> int8
+    // -> s8 MMA; the E8 lattice + rotation are encode-side only).
+    RK4V4E8,
 };
 
 enum class EnginePurpose : std::uint8_t {
