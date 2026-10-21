@@ -87,6 +87,17 @@ struct PagedKVStorageLayout {
                     {DType::U8, 128, DType::U8, 16}};
         }
         break;
+    case KvCacheStorage::E8KeyNvfp4Value:
+        // E8-lattice key: 256 dims = 32 x 8-dim subvectors, 2 bytes each (root idx +
+        // rad/axis), radius baked into the code so no key scale plane. Value reuses the
+        // NVFP4 value plane (128 B codes + 16 B group scales).
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::U8, 64, DType::U8, 0},
+                    {DType::U8, 128, DType::U8, 16}};
+        }
+        break;
     }
     throw std::invalid_argument("unsupported paged KV-cache storage geometry");
 }
