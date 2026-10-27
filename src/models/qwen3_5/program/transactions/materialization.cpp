@@ -19,6 +19,11 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+// Budget for every device drain performed while unwinding a transaction (abort, staging
+// release, failure cleanup). Exceeding it means the transfer stream is stalled, and the only
+// safe move is a loud abort — an unbounded wait here is what wedged the engine worker once.
+constexpr auto kAbortDrainBudget = std::chrono::seconds(60);
+
 runtime::ContextTransactionReserveStatus
 ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptData&& prompt,
                                      runtime::CancellationFlagView cancellation) {
@@ -373,6 +378,8 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
 
 void ProgramImpl::release_materialization_staging(
     MaterializationTransaction& transaction) noexcept {
+    // A stalled transfer stream must not hold the engine worker forever: bound every cleanup
+    // wait and abort loudly (supervisor restarts) if the device cannot drain in time.
     const std::uint32_t lane = transaction.destination.value;
     if (lane < max_concurrency && requests[lane].lifecycle == Lifecycle::Empty) {
         requests[lane].prefill.reset();
@@ -381,9 +388,10 @@ void ProgramImpl::release_materialization_staging(
          position < transaction.shared_pressure.size(); ++position) {
         MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
         if (work.submitted) {
-            try {
-                context_completion_.synchronize();
-            } catch (...) { std::terminate(); }
+            if (!context_completion_.wait_for(kAbortDrainBudget) ||
+                !cuda_stream_sync_for(device.transfer_stream, kAbortDrainBudget)) {
+                fatal_device_wait_timeout("materialization staging release", kAbortDrainBudget.count());
+            }
         }
         abort_pressure_work(work);
     }
@@ -392,9 +400,10 @@ void ProgramImpl::release_materialization_staging(
          ++position) {
         MaterializationTransaction::PressureWork& work = transaction.pressure[position];
         if (work.submitted) {
-            try {
-                context_completion_.synchronize();
-            } catch (...) { std::terminate(); }
+            if (!context_completion_.wait_for(kAbortDrainBudget) ||
+                !cuda_stream_sync_for(device.transfer_stream, kAbortDrainBudget)) {
+                fatal_device_wait_timeout("materialization staging release", kAbortDrainBudget.count());
+            }
         }
         abort_pressure_work(work);
     }
@@ -1251,7 +1260,11 @@ void ProgramImpl::abort_materialization_transfers(
     MaterializationTransaction& transaction) noexcept {
     try {
         if (transaction.transfer_submitted) {
-            context_completion_.synchronize();
+            if (!context_completion_.wait_for(kAbortDrainBudget) ||
+                !cuda_stream_sync_for(device.transfer_stream, kAbortDrainBudget)) {
+                fatal_device_wait_timeout("materialization transfer abort",
+                                          kAbortDrainBudget.count());
+            }
             record_materialization_transfer_observations(transaction);
         }
         if (transaction.state_restore) {
@@ -2037,6 +2050,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
 
     if (pressure_transition.phase == PressureTransitionPhase::CopiesInFlight) {
         if (!context_completion_.ready()) {
+            if (cancellation.requested()) { transaction.cancel_pending = true; }
+            if (transaction.cancel_pending) { abort_transaction(); return out; }
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }
@@ -2117,6 +2132,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
 
     if (transaction.transfer_submitted) {
         if (!context_completion_.ready()) {
+            if (cancellation.requested()) { transaction.cancel_pending = true; }
+            if (transaction.cancel_pending) { abort_transaction(); return out; }
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }

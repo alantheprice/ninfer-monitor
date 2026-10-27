@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 
 namespace ninfer {
 
@@ -79,10 +80,20 @@ public:
     void wait(cudaStream_t stream) const;
     [[nodiscard]] bool ready() const;
     void synchronize() const;
+    // Bounded synchronize: true when the event completed within the budget, false on timeout.
+    [[nodiscard]] bool wait_for(std::chrono::milliseconds timeout) const;
 
 private:
     int device_        = 0;
     cudaEvent_t event_ = nullptr;
 };
+
+// Bounded cudaStreamSynchronize for cleanup paths: returns true when the stream drained within
+// the budget, false on timeout. The engine treats a timeout as an unrecoverable device stall.
+[[nodiscard]] bool cuda_stream_sync_for(cudaStream_t stream, std::chrono::milliseconds timeout);
+
+// Loud terminal failure for a stalled device wait on a path that must not block the engine
+// worker forever: logs one FATAL line with the stall context, then aborts (systemd restarts).
+[[noreturn]] void fatal_device_wait_timeout(const char* site, long long timeout_ms);
 
 } // namespace ninfer

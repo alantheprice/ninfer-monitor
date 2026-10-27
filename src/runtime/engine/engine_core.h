@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <future>
@@ -675,6 +676,11 @@ private:
         std::uint64_t protection_epoch = 0;
         Clock::time_point started;
     };
+
+    // A context transaction (lane materialization restore) normally completes in seconds. One
+    // that runs longer is stuck; the engine forces its graceful abort instead of waiting forever
+    // (2026-10-27 wedge: a materializing restore never finished and held all admission for ~1h).
+    static constexpr auto kTransactionStallBudget = std::chrono::seconds(90);
 
     [[nodiscard]] std::optional<GenerationTimingObservation>
     record_committed_output(const std::shared_ptr<Request>& request,
@@ -1489,6 +1495,18 @@ private:
                 request->sequence || request->budget || lane >= max_concurrency_ ||
                 slots_[lane] != nullptr) {
                 throw std::logic_error("materializing request has invalid Engine ownership");
+            }
+            // A context transaction that outlives its budget is stalled (normal restores and
+            // transfers finish in seconds). Force the graceful abort so the lane frees and
+            // queued requests drain; the unwind itself is bounded (kAbortDrainBudget).
+            if (Clock::now() - control.started > kTransactionStallBudget &&
+                !request->cancelled.load(std::memory_order_acquire)) {
+                std::fprintf(stderr,
+                             "WARN materialization stalled | request #%llu | %.1fs | forcing abort\n",
+                             static_cast<unsigned long long>(request->id),
+                             std::chrono::duration<double>(Clock::now() - control.started).count());
+                std::fflush(stderr);
+                request->cancelled.store(true, std::memory_order_release);
             }
             cancellation = CancellationFlagView{&request->cancelled};
             break;

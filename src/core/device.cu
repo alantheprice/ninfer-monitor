@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace ninfer {
@@ -245,6 +246,37 @@ bool CudaCompletionEvent::ready() const {
 void CudaCompletionEvent::synchronize() const {
     if (event_ == nullptr) { throw std::logic_error("CUDA completion event is empty"); }
     CUDA_CHECK(cudaEventSynchronize(event_));
+}
+
+bool CudaCompletionEvent::wait_for(std::chrono::milliseconds timeout) const {
+    if (event_ == nullptr) { throw std::logic_error("CUDA completion event is empty"); }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        if (ready()) { return true; }
+        if (std::chrono::steady_clock::now() >= deadline) { return false; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+bool cuda_stream_sync_for(cudaStream_t stream, std::chrono::milliseconds timeout) {
+    if (stream == nullptr) { return true; }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        const cudaError_t status = cudaStreamQuery(stream);
+        if (status == cudaSuccess) { return true; }
+        if (status != cudaErrorNotReady) { CUDA_CHECK(status); }
+        if (std::chrono::steady_clock::now() >= deadline) { return false; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+void fatal_device_wait_timeout(const char* site, long long timeout_ms) {
+    std::fprintf(stderr,
+                 "FATAL device wait stalled | site=%s budget_ms=%lld | engine cannot make "
+                 "progress; aborting so the service supervisor can restart it\n",
+                 site, timeout_ms);
+    std::fflush(stderr);
+    std::abort();
 }
 
 } // namespace ninfer
