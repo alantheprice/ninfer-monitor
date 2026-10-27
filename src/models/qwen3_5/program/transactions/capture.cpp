@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -15,6 +16,9 @@
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
+
+// Shared unwind budget for device drains on transaction cleanup paths (see materialization.cpp).
+constexpr auto kAbortDrainBudget = std::chrono::seconds(60);
 
 bool ProgramImpl::shared_capture_matches(const CaptureOffer& offer,
                                          const SharedPrefixHandle& shared) const {
@@ -1181,7 +1185,10 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
                 });
             }
         } catch (...) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
+            if (!cuda_stream_sync_for(device.transfer_stream, kAbortDrainBudget)) {
+                fatal_device_wait_timeout("active capture pressure cleanup",
+                                          kAbortDrainBudget.count());
+            }
             for_each_pending_pressure([&](auto& work) { abort_pressure_work(work); });
             throw;
         }
@@ -1266,8 +1273,9 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
         try {
             enqueue_active_capture_transfers(transaction);
         } catch (...) {
-            if (device.transfer_stream != nullptr) {
-                (void)cudaStreamSynchronize(device.transfer_stream);
+            if (!cuda_stream_sync_for(device.transfer_stream, kAbortDrainBudget)) {
+                fatal_device_wait_timeout("active capture transfer enqueue cleanup",
+                                          kAbortDrainBudget.count());
             }
             abort_active_capture(transaction);
             transaction.published = true;
@@ -1276,6 +1284,15 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
         return ActiveCaptureResult{.status = runtime::ContextTransactionStatus::InProgress};
     }
     if (transaction.transfer_submitted && !context_completion_.ready()) {
+        if (cancellation.requested()) {
+            // A queued request asked the capture to yield. Drain the in-flight copies before
+            // releasing their destinations, bounded like every other unwind; a stream that
+            // cannot drain is a fatal stall, not a wedge.
+            if (!cuda_stream_sync_for(device.transfer_stream, kAbortDrainBudget)) {
+                fatal_device_wait_timeout("active capture yield drain", kAbortDrainBudget.count());
+            }
+            return abort();
+        }
         return ActiveCaptureResult{.status = runtime::ContextTransactionStatus::InProgress};
     }
     if (transaction.transfer_submitted) {

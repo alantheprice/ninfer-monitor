@@ -18,6 +18,9 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+// Shared unwind budget for device drains on transaction cleanup paths (see materialization.cpp).
+constexpr auto kAbortDrainBudget = std::chrono::seconds(60);
+
 PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
                                        const runtime::BatchedGeneratedRound& round) {
     if (pending_transaction_ || lanes.empty() || lanes.size() > max_concurrency) {
@@ -772,14 +775,17 @@ ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) no
 void ProgramImpl::fail_all_cleanup() noexcept {
     pending_transaction_.reset();
     if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
-        if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
+        if (transaction->transfer_submitted &&
+            !cuda_stream_sync_for(device.transfer_stream, kAbortDrainBudget)) {
+            fatal_device_wait_timeout("fail-all capture drain", kAbortDrainBudget.count());
         }
         abort_active_capture(*transaction);
     }
     if (auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_)) {
-        if (transaction->transfer_submitted && device.transfer_stream != nullptr) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
+        if (transaction->transfer_submitted &&
+            !cuda_stream_sync_for(device.transfer_stream, kAbortDrainBudget)) {
+            fatal_device_wait_timeout("fail-all materialization drain",
+                                      kAbortDrainBudget.count());
         }
         release_materialization_staging(*transaction);
     }
