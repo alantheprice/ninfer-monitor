@@ -56,6 +56,9 @@ struct DFlashFeatureSink {
     PrefillConsumer consume_prefill;
     std::uint32_t captured_mask = 0;
     std::int32_t active_tokens  = 0;
+    // Capture-only sinks (offline layer-residual dumps) leave the features in the buffer and skip
+    // the prefill consumer callback.
+    bool capture_only = false;
 
     void begin(const Tensor& value);
     void capture_layer(int layer, const Tensor& value, cudaStream_t stream);

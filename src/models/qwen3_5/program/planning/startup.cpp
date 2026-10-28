@@ -248,6 +248,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             add_tensor(builder, DType::BF16,
                        {dimension(config.hidden_size), static_cast<std::int32_t>(kCausalScoreTile)},
                        "causal score hidden staging");
+        out.kva_features =
+            add_tensor(builder, DType::BF16,
+                       {dimension(config.hidden_size * kKvaMaxDumpLayers),
+                        static_cast<std::int32_t>(effective_prefill_chunk)},
+                       "kva layer residual capture");
+        out.kva_positions =
+            add_tensor(builder, DType::I32, {static_cast<std::int32_t>(effective_prefill_chunk)},
+                       "kva layer capture positions");
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {

@@ -222,6 +222,9 @@ void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t str
 }
 
 void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint) {
+    // Capture-only sinks (offline layer-residual dumps) keep the features in the buffer and have
+    // no consumer to hand them to.
+    if (capture_only) { return; }
     if (!consume_prefill || tokens != active_tokens) {
         throw std::logic_error("DFlash prefill feature consumer is unavailable");
     }

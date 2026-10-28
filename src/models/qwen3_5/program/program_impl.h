@@ -471,6 +471,12 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
                                                   std::uint32_t first_target);
+
+    // Offline layer-residual capture for the KVA projector pipeline. Runs a reset prefill with a
+    // feature sink attached and copies the requested layers' residuals out as BF16.
+    void dump_layer_residuals(PreparedPromptData&& prompt,
+                              std::span<const std::uint32_t> layers, std::vector<std::byte>& out,
+                              std::uint32_t& tokens_out, std::uint32_t& width_out);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
@@ -626,6 +632,8 @@ public:
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
+    std::optional<Tensor> kva_features;
+    std::optional<Tensor> kva_positions;
     Tensor sampling_config;
     Tensor token_counts;
 

@@ -98,3 +98,12 @@ ninfer_add_test(ninfer_qwen3_5_visual_scatter_test
 set_tests_properties(
   ninfer_qwen3_5_visual_scatter_test
   PROPERTIES SKIP_RETURN_CODE 77)
+
+# KVA projector pipeline: dump arbitrary layer residuals from a real artifact.
+ninfer_add_test(ninfer_qwen3_5_kva_extract_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_kva_extract.cpp"
+  LIBRARIES ninfer_engine)
+
+set_tests_properties(
+  ninfer_qwen3_5_kva_extract_test
+  PROPERTIES SKIP_RETURN_CODE 77)

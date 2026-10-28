@@ -3,7 +3,9 @@
 #include "ninfer/types.h"
 
 #include <chrono>
+#include <cstddef>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -66,6 +68,19 @@ public:
 
     Engine(const Engine&)            = delete;
     Engine& operator=(const Engine&) = delete;
+
+    // Offline layer-residual capture (KVA projector pipeline). Runs a reset prefill over
+    // `token_ids` and returns the requested layers' BF16 residuals, laid out
+    // [layer][token][hidden]. Requires an Engine built with EnginePurpose::CausalScoring.
+    // The prompt must fit a single prefill chunk; see kMaxDumpLayers for the layer bound.
+    static constexpr std::size_t kMaxDumpLayers = 32;
+    struct LayerResiduals {
+        std::vector<std::byte> bytes;
+        std::uint32_t tokens = 0;
+        std::uint32_t width  = 0;
+    };
+    [[nodiscard]] LayerResiduals dump_layer_residuals(std::vector<TokenId> token_ids,
+                                                      std::span<const std::uint32_t> layers);
 
     [[nodiscard]] PreparedPrompt prepare(PromptInput input,
                                          const PreparationControl& control = {}) const;

@@ -872,6 +872,10 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
                                                   std::uint32_t first_target);
+    // Offline layer-residual capture (KVA projector pipeline). See ProgramImpl::dump_layer_residuals.
+    void dump_layer_residuals(PreparedPrompt&& prompt, std::span<const std::uint32_t> layers,
+                              std::vector<std::byte>& out, std::uint32_t& tokens_out,
+                              std::uint32_t& width_out);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,

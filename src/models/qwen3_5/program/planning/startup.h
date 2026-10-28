@@ -20,6 +20,9 @@ namespace ninfer::models::qwen3_5::detail {
 
 using TensorLayout                              = TensorRegion;
 inline constexpr std::uint32_t kCausalScoreTile = 1024;
+// Maximum number of layers a single KVA residual dump may request. Must stay in sync with
+// Engine::kMaxDumpLayers (the public bound) and DFlashFeatureSink's 32-layer capture limit.
+inline constexpr std::uint64_t kKvaMaxDumpLayers = 32;
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;
@@ -40,6 +43,10 @@ struct PersistentLayout {
     qwen3_5::RoundStateLayout round;
     TensorLayout prefill_hidden;
     std::optional<TensorLayout> score_hidden;
+    // KVA layer-residual capture buffer (offline projector pipeline). Sized for the maximum
+    // dumpable layer count so any layer set fits without re-planning.
+    std::optional<TensorLayout> kva_features;
+    std::optional<TensorLayout> kva_positions;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
     std::size_t bytes            = 0;

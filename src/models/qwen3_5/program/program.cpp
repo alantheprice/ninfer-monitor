@@ -262,6 +262,13 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
     return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
 }
 
+void Program::dump_layer_residuals(PreparedPrompt&& prompt, std::span<const std::uint32_t> layers,
+                                   std::vector<std::byte>& out, std::uint32_t& tokens_out,
+                                   std::uint32_t& width_out) {
+    impl_->dump_layer_residuals(PreparedPromptAccess::take(std::move(prompt)), layers, out,
+                                tokens_out, width_out);
+}
+
 std::optional<AdmissionCandidate> Program::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
     const ContinuationHandle* source, const SharedPrefixHandle* shared_source,

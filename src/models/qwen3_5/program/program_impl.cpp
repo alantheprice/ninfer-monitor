@@ -239,6 +239,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
     }
+    if (plan.persistent.kva_features) {
+        kva_features = plan.persistent.kva_features->bind(backing);
+    }
+    if (plan.persistent.kva_positions) {
+        kva_positions = plan.persistent.kva_positions->bind(backing);
+    }
     if (plan.persistent.token_counts) {
         token_counts = plan.persistent.token_counts->bind(backing);
     }
@@ -462,6 +468,157 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         }
         cleanup();
         return output;
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        work.reset();
+        try {
+            cleanup();
+        } catch (...) {}
+        throw;
+    }
+}
+
+// Offline layer-residual capture for the KVA projector pipeline. Mirrors causal_score's resource
+// setup (reset state image, one KV row, chunked prefill) but attaches a caller-supplied feature
+// sink so arbitrary layer residuals land in `out`. No logits are produced and nothing is returned
+// beyond the capture. See improvements/kva/PORT-PLAN.md stage 1.
+void ProgramImpl::dump_layer_residuals(PreparedPromptData&& prompt,
+                                       std::span<const std::uint32_t> layers,
+                                       std::vector<std::byte>& out, std::uint32_t& tokens_out,
+                                       std::uint32_t& width_out) {
+    if (!causal_scoring || workspace_plan.causal_score == 0) {
+        throw std::logic_error("Program was not constructed for scoring");
+    }
+    if (layers.empty() || layers.size() > kKvaMaxDumpLayers) {
+        throw std::invalid_argument("layer dump requires 1..kKvaMaxDumpLayers layers");
+    }
+    const auto layer_count = static_cast<std::uint32_t>(parameters.text.layers.size());
+    for (const std::uint32_t layer : layers) {
+        if (layer >= layer_count) {
+            throw std::invalid_argument("layer dump layer index is out of range");
+        }
+    }
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        for (std::size_t j = i + 1; j < layers.size(); ++j) {
+            if (layers[i] == layers[j]) {
+                throw std::invalid_argument("layer dump layer indices must be unique");
+            }
+        }
+    }
+    const std::size_t token_count_size = prompt.token_ids.size();
+    if (token_count_size < 2 || token_count_size > capacity) {
+        throw std::invalid_argument("layer dump token count must be in [2,capacity]");
+    }
+    if (prompt.has_media()) {
+        throw std::invalid_argument("layer dump accepts text tokens only");
+    }
+    if (token_count_size - 1U > prefill_chunk) {
+        throw std::invalid_argument(
+            "layer dump requires the prompt to fit one prefill chunk (raise prefill_chunk)");
+    }
+
+    const auto token_count              = static_cast<std::uint32_t>(token_count_size);
+    const std::uint32_t predictor_count = token_count - 1U;
+    const std::uint32_t entitlement     = kv_pages_for_frontier(predictor_count);
+    if (entitlement == 0) { throw std::logic_error("layer dump has no KV entitlement"); }
+
+    const std::int32_t hidden = dimension(parameters.model.config().text.hidden_size);
+    if (prefill_hidden.ne[0] != hidden) {
+        throw std::logic_error("layer dump hidden width does not match the model");
+    }
+
+    // Feature buffer layout must match DFlashFeatureSink::capture_layer exactly: it writes layer
+    // `index` at byte offset index*hidden*2 within each row, with row pitch = features->nb[1].
+    // Must be persistent (the prefill resets the workspace per chunk).
+    if (!kva_features) { throw std::logic_error("Program has no KVA capture buffer"); }
+    const std::int32_t feature_width = hidden * static_cast<std::int32_t>(layers.size());
+    if (kva_features->ne[0] < feature_width) {
+        throw std::logic_error("KVA capture buffer is too narrow for the requested layers");
+    }
+    Tensor features = kva_features->slice(0, 0, feature_width);
+    if (!kva_positions) { throw std::logic_error("Program has no KVA position buffer"); }
+    Tensor positions = *kva_positions;
+    execution::DFlashFeatureSink sink{};
+    sink.features = &features;
+    sink.positions = &positions;
+    sink.layers   = layers;
+    sink.capture_only = true;
+    std::optional<StateImageHandle> state;
+    std::optional<KVAddressSpaceHandle> address;
+    const auto cleanup = [&] {
+        bool released = true;
+        if (address) {
+            if (text_kv_addresses->active(*address)) { text_kv_addresses->deactivate(*address); }
+            released = text_kv_addresses->release(*address) && released;
+            address.reset();
+        }
+        if (state) {
+            released = state_store->release(*state) && released;
+            state.reset();
+        }
+        if (!released) { throw std::logic_error("layer dump resources could not be released"); }
+    };
+
+    try {
+        state = state_store->reserve_reset(device.stream);
+        if (!state) { throw std::bad_alloc(); }
+        address = text_kv_addresses->create_active(entitlement, 0);
+        if (!address) { throw std::bad_alloc(); }
+        text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream);
+
+        const std::int32_t state_slot = state_store->physical_slot(*state);
+        std::uint32_t cursor          = 0;
+        while (cursor < predictor_count) {
+            const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
+            execution::PrefillContext schedule_state{
+                {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
+                 prefill_chunk, proposal_head},
+                decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
+                {},
+                decoder->text_kv,
+                nullptr,
+                nullptr,
+                cursor,
+                nullptr,
+                nullptr,
+                state_slot,
+                state_slot,
+                0,
+                nullptr};
+            mark_workspace_usage(workspace_plan.text_prefill);
+            const execution::PrefillChunkResult result = execution::prefill_text_chunk(
+                schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
+                false, sink);
+            if (result.finalized || result.processed_tokens == 0 ||
+                result.processed_tokens > nominal) {
+                throw std::logic_error("layer dump prefill made invalid progress");
+            }
+            cursor += result.processed_tokens;
+            text_kv_addresses->commit_frontier(*address, cursor);
+        }
+
+        device.synchronize();
+        const std::int32_t captured = sink.active_tokens;
+        if (captured <= 0) { throw std::logic_error("layer dump captured no tokens"); }
+        // Source rows are [hidden * layers] wide, with layer `i` starting at byte i*hidden*2.
+        // Emit [layer][token][hidden] so callers get a plain per-layer view.
+        const std::size_t row_bytes = static_cast<std::size_t>(hidden) * dtype_size(DType::BF16);
+        const std::size_t src_pitch = static_cast<std::size_t>(features.nb[1]);
+        out.resize(row_bytes * static_cast<std::size_t>(layers.size()) *
+                   static_cast<std::size_t>(captured));
+        auto* base = static_cast<std::byte*>(features.data);
+        for (std::size_t index = 0; index < layers.size(); ++index) {
+            CUDA_CHECK(cudaMemcpy2D(out.data() + index * row_bytes * captured, row_bytes,
+                                    base + index * row_bytes, src_pitch, row_bytes,
+                                    static_cast<std::size_t>(captured),
+                                    cudaMemcpyDeviceToHost));
+        }
+        device.synchronize();
+        tokens_out = static_cast<std::uint32_t>(captured);
+        width_out  = static_cast<std::uint32_t>(hidden);
+        cleanup();
     } catch (...) {
         try {
             device.synchronize();
