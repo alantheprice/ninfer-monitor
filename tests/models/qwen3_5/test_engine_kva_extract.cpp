@@ -26,18 +26,6 @@
 
 namespace {
 
-std::vector<std::uint32_t> parse_layers(const char* spec) {
-    std::vector<std::uint32_t> out;
-    std::stringstream ss(spec);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-        if (item.empty()) { continue; }
-        out.push_back(static_cast<std::uint32_t>(std::stoul(item)));
-    }
-    if (out.empty()) { throw std::runtime_error("no layers given"); }
-    return out;
-}
-
 std::string read_text(const char* path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) { throw std::runtime_error(std::string("cannot open ") + path); }
@@ -55,17 +43,42 @@ int main(int argc, char** argv) {
         return 77;
     }
     if (argc < 3) {
-        std::cerr << "usage: " << argv[0] << " <layer,layer,...> <out.bin> [prompt_file]\n";
+        std::cerr << "usage: " << argv[0] << " <layer,layer,...> <out.bin> [prompt_file]\n"
+                  << "       " << argv[0] << " --mixers <layer:width,...> <out.bin> [prompt_file]\n";
         return 2;
     }
     try {
-        const auto layers = parse_layers(argv[1]);
-        const std::string out_path = argv[2];
+        std::string mode = "residual";
+        std::vector<std::string> specs;
+        int argi = 1;
+        if (std::string(argv[1]) == "--mixers") {
+            mode = "mixers";
+            argi = 2;
+        }
+        if (argc <= argi + 1) {
+            std::cerr << "missing output path\n";
+            return 2;
+        }
+        {
+            std::stringstream ss(argv[argi]);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                if (!item.empty()) { specs.push_back(item); }
+            }
+        }
+        std::vector<std::uint32_t> layers;
+        if (mode == "residual") {
+            for (const auto& s : specs) {
+                layers.push_back(static_cast<std::uint32_t>(std::stoul(s)));
+            }
+            if (layers.empty()) { throw std::runtime_error("no layers given"); }
+        }
+        const std::string out_path = argv[argi + 1];
         const std::string text =
-            argc > 3 ? read_text(argv[3])
-                     : std::string("The specification document describes a recursive descent "
-                                   "parser that emits intermediate representations for each "
-                                   "production rule while tracking source positions.");
+            argc > argi + 2 ? read_text(argv[argi + 2])
+                            : std::string("The specification document describes a recursive descent "
+                                          "parser that emits intermediate representations for each "
+                                          "production rule while tracking source positions.");
 
         ninfer::EngineOptions options;
         options.artifact_path   = artifact;
@@ -76,10 +89,51 @@ int main(int argc, char** argv) {
         options.use_cuda_graph  = false;
         options.enable_vision   = false;
         options.purpose         = ninfer::EnginePurpose::CausalScoring;
+        // Device selection is explicit: EngineOptions::device defaults to 0 and cudaSetDevice()
+        // overrides CUDA_VISIBLE_DEVICES, so relying on the env var alone silently lands on GPU 0.
+        if (const char* dev = std::getenv("NINFER_TEST_DEVICE")) {
+            options.device = static_cast<int>(std::stol(dev));
+        }
 
         ninfer::Engine engine(options);
+        std::cout << "device: " << engine.options().device << std::endl;
         const auto ids = engine.tokenize_text(text);
-        std::cout << "tokens: " << ids.size() << "\n";
+        std::cout << "tokens: " << ids.size() << std::endl;
+
+        // Mixer-input mode: `--mixers layer:width,layer:width,...`
+        if (mode == "mixers") {
+            std::vector<std::uint32_t> layer_ids;
+            std::vector<std::int32_t> widths;
+            for (const auto& spec : specs) {
+                const auto colon = spec.find(':');
+                if (colon == std::string::npos) {
+                    throw std::runtime_error("mixer spec must be layer:width");
+                }
+                layer_ids.push_back(static_cast<std::uint32_t>(std::stoul(spec.substr(0, colon))));
+                widths.push_back(static_cast<std::int32_t>(std::stol(spec.substr(colon + 1))));
+            }
+            const auto dumped = engine.dump_mixer_inputs(ids, layer_ids, widths);
+            std::cout << "mixer capture: layers " << layer_ids.size()
+                      << "  tokens " << dumped.tokens
+                      << "  hidden " << dumped.hidden
+                      << "  bytes " << dumped.bytes.size() << std::endl;
+            std::ofstream out(out_path, std::ios::binary);
+            if (!out) { throw std::runtime_error("cannot write " + out_path); }
+            out.write(reinterpret_cast<const char*>(dumped.bytes.data()),
+                      static_cast<std::streamsize>(dumped.bytes.size()));
+            out.close();
+            // Sidecar: the widths, so the reader can split [hidden | proj] per layer.
+            std::ofstream meta(out_path + ".json");
+            meta << "{\"tokens\":" << dumped.tokens << ",\"hidden\":" << dumped.hidden
+                 << ",\"layers\":[";
+            for (std::size_t i = 0; i < layer_ids.size(); ++i) {
+                meta << (i ? "," : "") << "{\"layer\":" << layer_ids[i]
+                     << ",\"width\":" << dumped.widths[i] << "}";
+            }
+            meta << "]}\n";
+            std::cout << "wrote " << out_path << "\n";
+            return 0;
+        }
 
         // The public Engine API has no hidden-state access, so the capture goes through the
         // same feature-sink path the DFlash2 draft uses. See PORT-PLAN.md stage 1.

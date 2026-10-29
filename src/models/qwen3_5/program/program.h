@@ -876,6 +876,11 @@ public:
     void dump_layer_residuals(PreparedPrompt&& prompt, std::span<const std::uint32_t> layers,
                               std::vector<std::byte>& out, std::uint32_t& tokens_out,
                               std::uint32_t& width_out);
+    // Offline mixer-input capture (KVA projector verification).
+    void dump_mixer_inputs(PreparedPrompt&& prompt, std::span<const std::uint32_t> layers,
+                           std::span<const std::int32_t> widths, std::vector<std::byte>& out,
+                           std::uint32_t& tokens_out, std::uint32_t& hidden_out,
+                           std::vector<std::int32_t>& widths_out);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,

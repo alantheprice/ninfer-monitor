@@ -154,6 +154,12 @@ private:
 } // namespace
 
 void DFlashFeatureSink::begin(const Tensor& value) {
+    // Mixer-input capture does not use the residual feature buffer; skip its validation.
+    if (mixer_inputs != nullptr) {
+        captured_mask = 0;
+        active_tokens = value.ne[1];
+        return;
+    }
     const bool prefill = features != nullptr && positions != nullptr && batch_features == nullptr;
     const bool batch   = batch_features != nullptr && batch_lanes != nullptr &&
                        batch_valid_columns != nullptr && batch_width > 0 && batch_size > 0;
@@ -168,6 +174,8 @@ void DFlashFeatureSink::begin(const Tensor& value) {
 }
 
 void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream_t stream) {
+    // Mixer-input capture uses capture_mixer() instead; the residual buffer is unused.
+    if (mixer_inputs != nullptr) { return; }
     const auto it = std::find(layers.begin(), layers.end(), layer);
     if (it == layers.end()) { return; }
     const std::size_t index = static_cast<std::size_t>(it - layers.begin());
@@ -200,9 +208,52 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
     captured_mask |= 1U << index;
 }
 
+void DFlashFeatureSink::capture_mixer(int layer, const Tensor& h, const Tensor& proj,
+                                      cudaStream_t stream) {
+    if (mixer_inputs == nullptr) { return; }
+    const auto it = std::find(layers.begin(), layers.end(), layer);
+    if (it == layers.end()) { return; }
+    const std::size_t index = static_cast<std::size_t>(it - layers.begin());
+    if (index >= mixer_widths.size()) {
+        throw std::logic_error("KVA mixer capture metadata is incomplete");
+    }
+    const std::int32_t hidden = h.ne[0];
+    const std::int32_t width  = mixer_widths[index];
+    // The buffer row is [hidden | proj] for this layer.
+    if (mixer_inputs->ne[0] < hidden + width) {
+        throw std::logic_error("KVA mixer capture buffer is too narrow");
+    }
+    if (h.ne[1] != active_tokens || proj.ne[1] != active_tokens) {
+        throw std::logic_error("KVA mixer capture token count does not match the sink");
+    }
+    if (h.dtype != DType::BF16 || proj.dtype != DType::BF16) {
+        throw std::logic_error("KVA mixer capture requires BF16 inputs");
+    }
+    const std::size_t elem       = dtype_size(DType::BF16);
+    const std::size_t hidden_row = static_cast<std::size_t>(hidden) * elem;
+    // Layers are laid out as contiguous blocks, each a full [hidden + kKvaMaxMixerWidth, tokens]
+    // region with pitch nb[1]. `h` occupies the first `hidden` elements of every row and the
+    // projection the next `width`. Using the full pitch for every layer keeps the block stride
+    // uniform so the readback can index it without knowing the per-layer width.
+    auto* base = static_cast<std::byte*>(mixer_inputs->data) +
+                 index * static_cast<std::size_t>(mixer_inputs->nb[1]) * active_tokens;
+    CUDA_CHECK(cudaMemcpy2DAsync(base, static_cast<std::size_t>(mixer_inputs->nb[1]), h.data,
+                                 static_cast<std::size_t>(h.nb[1]), hidden_row,
+                                 static_cast<std::size_t>(active_tokens),
+                                 cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(base + hidden_row,
+                                 static_cast<std::size_t>(mixer_inputs->nb[1]), proj.data,
+                                 static_cast<std::size_t>(proj.nb[1]),
+                                 static_cast<std::size_t>(width) * elem,
+                                 static_cast<std::size_t>(active_tokens),
+                                 cudaMemcpyDeviceToDevice, stream));
+}
+
 void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t stream) {
-    const std::uint32_t complete_mask = layers.size() == 32 ? ~0U : ((1U << layers.size()) - 1U);
-    if (captured_mask != complete_mask) {
+    // Mixer-input capture does not publish per-layer features, so the completeness check and the
+    // position copy do not apply.
+    if (mixer_inputs != nullptr) { return; }
+    const std::uint32_t complete_mask = layers.size() == 32 ? ~0U : ((1U << layers.size()) - 1U);if (captured_mask != complete_mask) {
         throw std::logic_error("DFlash target call did not publish every feature layer");
     }
     if (batch_features != nullptr) {
@@ -865,6 +916,23 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
     attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    if (mixer_sink_ != nullptr && mixer_sink_->captures_mixer(fidx)) {
+        // The projector predicts k and v concatenated; stage them contiguously for capture.
+        Tensor kv = workspace::kva_mixer_probe(work_, config_, T);
+        Tensor kv_view = kv.view({2 * dimension(config_.attention->key_width()), T});
+        CUDA_CHECK(cudaMemcpy2DAsync(kv_view.data, static_cast<std::size_t>(kv_view.nb[1]),
+                                     k_flat.data, static_cast<std::size_t>(k_flat.nb[1]),
+                                     static_cast<std::size_t>(k_flat.ne[0]) * dtype_size(DType::BF16),
+                                     static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            static_cast<std::byte*>(kv_view.data) +
+                static_cast<std::size_t>(k_flat.ne[0]) * dtype_size(DType::BF16),
+            static_cast<std::size_t>(kv_view.nb[1]), v_flat.data,
+            static_cast<std::size_t>(v_flat.nb[1]),
+            static_cast<std::size_t>(v_flat.ne[0]) * dtype_size(DType::BF16),
+            static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
+        mixer_sink_->capture_mixer(fidx, h, kv_view, s);
+    }
 
     const auto results = workspace::text_attention_results(work_, config_, T);
     Tensor qn =
@@ -988,6 +1056,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
         Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
         gdn_projection(h, p, qkv, z_flat, work_, s);
+        if (mixer_sink_ != nullptr) { mixer_sink_->capture_mixer(gidx, h, qkv, s); }
         Tensor conv_state_in =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor conv_state_out =
@@ -1079,6 +1148,10 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    // KVA verification: expose the sink to the mixers when it wants mixer-input capture.
+    if constexpr (requires { tap.mixer_inputs; }) {
+        set_mixer_sink(tap.mixer_inputs != nullptr ? &tap : nullptr);
+    }
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
         const auto& block  = parameters_.text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;

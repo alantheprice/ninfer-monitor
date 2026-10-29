@@ -59,9 +59,19 @@ struct DFlashFeatureSink {
     // Capture-only sinks (offline layer-residual dumps) leave the features in the buffer and skip
     // the prefill consumer callback.
     bool capture_only = false;
+    // Optional mixer-input capture (KVA projector verification). When set, the engine copies each
+    // requested layer's normalized residual `h` and its raw mixer projections into these buffers.
+    // Layout per entry: [hidden + mixer_width, tokens] BF16, one entry per requested layer.
+    Tensor* mixer_inputs             = nullptr;
+    std::span<const std::int32_t> mixer_widths;
 
     void begin(const Tensor& value);
     void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
+    void capture_mixer(int layer, const Tensor& h, const Tensor& proj, cudaStream_t stream);
+    [[nodiscard]] bool captures_mixer(int layer) const noexcept {
+        return mixer_inputs != nullptr &&
+               std::find(layers.begin(), layers.end(), layer) != layers.end();
+    }
     void capture_positions(const Tensor& source, cudaStream_t stream);
     void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
 };
@@ -165,6 +175,9 @@ private:
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    // KVA verification: non-null while run_layers is executing with a mixer-capturing sink.
+    void set_mixer_sink(DFlashFeatureSink* sink) noexcept { mixer_sink_ = sink; }
+    DFlashFeatureSink* mixer_sink_ = nullptr;
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;

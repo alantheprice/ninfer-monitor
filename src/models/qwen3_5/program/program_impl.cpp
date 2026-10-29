@@ -245,6 +245,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.kva_positions) {
         kva_positions = plan.persistent.kva_positions->bind(backing);
     }
+    if (plan.persistent.kva_mixer) {
+        kva_mixer = plan.persistent.kva_mixer->bind(backing);
+    }
     if (plan.persistent.token_counts) {
         token_counts = plan.persistent.token_counts->bind(backing);
     }
@@ -514,11 +517,6 @@ void ProgramImpl::dump_layer_residuals(PreparedPromptData&& prompt,
     if (prompt.has_media()) {
         throw std::invalid_argument("layer dump accepts text tokens only");
     }
-    if (token_count_size - 1U > prefill_chunk) {
-        throw std::invalid_argument(
-            "layer dump requires the prompt to fit one prefill chunk (raise prefill_chunk)");
-    }
-
     const auto token_count              = static_cast<std::uint32_t>(token_count_size);
     const std::uint32_t predictor_count = token_count - 1U;
     const std::uint32_t entitlement     = kv_pages_for_frontier(predictor_count);
@@ -561,6 +559,15 @@ void ProgramImpl::dump_layer_residuals(PreparedPromptData&& prompt,
         if (!released) { throw std::logic_error("layer dump resources could not be released"); }
     };
 
+    // The sink captures into row 0..active_tokens-1 of the feature buffer and begin() resets
+    // active_tokens per chunk, so a multi-chunk prompt must be drained chunk by chunk into `out`
+    // at a running token offset. `out` is [layer][token][hidden].
+    const std::size_t row_bytes = static_cast<std::size_t>(hidden) * dtype_size(DType::BF16);
+    const std::size_t src_pitch = static_cast<std::size_t>(features.nb[1]);
+    out.clear();
+    out.reserve(row_bytes * layers.size() * static_cast<std::size_t>(predictor_count));
+    std::uint32_t captured_total = 0;
+
     try {
         state = state_store->reserve_reset(device.stream);
         if (!state) { throw std::bad_alloc(); }
@@ -595,28 +602,30 @@ void ProgramImpl::dump_layer_residuals(PreparedPromptData&& prompt,
                 result.processed_tokens > nominal) {
                 throw std::logic_error("layer dump prefill made invalid progress");
             }
+
+            // Drain this chunk before the next one overwrites rows 0..n-1.
+            device.synchronize();
+            const std::int32_t chunk_tokens = sink.active_tokens;
+            if (chunk_tokens <= 0) { throw std::logic_error("layer dump captured no tokens"); }
+            const std::size_t prev = out.size();
+            out.resize(prev + row_bytes * layers.size() * static_cast<std::size_t>(chunk_tokens));
+            auto* base = static_cast<std::byte*>(features.data);
+            for (std::size_t index = 0; index < layers.size(); ++index) {
+                CUDA_CHECK(cudaMemcpy2D(
+                    out.data() + index * row_bytes * static_cast<std::size_t>(captured_total) +
+                        prev,
+                    row_bytes, base + index * row_bytes, src_pitch, row_bytes,
+                    static_cast<std::size_t>(chunk_tokens), cudaMemcpyDeviceToHost));
+            }
+            device.synchronize();
+            captured_total += static_cast<std::uint32_t>(chunk_tokens);
+
             cursor += result.processed_tokens;
             text_kv_addresses->commit_frontier(*address, cursor);
         }
 
-        device.synchronize();
-        const std::int32_t captured = sink.active_tokens;
-        if (captured <= 0) { throw std::logic_error("layer dump captured no tokens"); }
-        // Source rows are [hidden * layers] wide, with layer `i` starting at byte i*hidden*2.
-        // Emit [layer][token][hidden] so callers get a plain per-layer view.
-        const std::size_t row_bytes = static_cast<std::size_t>(hidden) * dtype_size(DType::BF16);
-        const std::size_t src_pitch = static_cast<std::size_t>(features.nb[1]);
-        out.resize(row_bytes * static_cast<std::size_t>(layers.size()) *
-                   static_cast<std::size_t>(captured));
-        auto* base = static_cast<std::byte*>(features.data);
-        for (std::size_t index = 0; index < layers.size(); ++index) {
-            CUDA_CHECK(cudaMemcpy2D(out.data() + index * row_bytes * captured, row_bytes,
-                                    base + index * row_bytes, src_pitch, row_bytes,
-                                    static_cast<std::size_t>(captured),
-                                    cudaMemcpyDeviceToHost));
-        }
-        device.synchronize();
-        tokens_out = static_cast<std::uint32_t>(captured);
+        if (captured_total == 0) { throw std::logic_error("layer dump captured no tokens"); }
+        tokens_out = captured_total;
         width_out  = static_cast<std::uint32_t>(hidden);
         cleanup();
     } catch (...) {
@@ -631,8 +640,167 @@ void ProgramImpl::dump_layer_residuals(PreparedPromptData&& prompt,
     }
 }
 
-void ProgramImpl::start_context_transfer_timer(runtime::ContextResourceClass resource) {
-    context_transfer_timers_[context_resource_index(resource)].start();
+// Offline mixer-input capture for KVA projector verification. Same resource setup as
+// dump_layer_residuals, but the sink captures each requested layer's normalized residual and its
+// raw mixer projection instead of the layer output residual.
+void ProgramImpl::dump_mixer_inputs(PreparedPromptData&& prompt,
+                                    std::span<const std::uint32_t> layers,
+                                    std::span<const std::int32_t> widths,
+                                    std::vector<std::byte>& out, std::uint32_t& tokens_out,
+                                    std::uint32_t& hidden_out,
+                                    std::vector<std::int32_t>& widths_out) {
+    if (!causal_scoring || workspace_plan.causal_score == 0) {
+        throw std::logic_error("Program was not constructed for scoring");
+    }
+    if (layers.empty() || layers.size() > kKvaMixerBlocks) {
+        throw std::invalid_argument("mixer dump requires 1..kKvaMixerBlocks layers");
+    }
+    if (widths.size() != layers.size()) {
+        throw std::invalid_argument("mixer dump metadata must match the layer list");
+    }
+    const auto layer_count = static_cast<std::uint32_t>(parameters.text.layers.size());
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        if (layers[i] >= layer_count) {
+            throw std::invalid_argument("mixer dump layer index is out of range");
+        }
+        if (widths[i] <= 0 || widths[i] > static_cast<std::int32_t>(kKvaMaxMixerWidth)) {
+            throw std::invalid_argument("mixer dump width is out of range");
+        }
+        for (std::size_t j = i + 1; j < layers.size(); ++j) {
+            if (layers[i] == layers[j]) {
+                throw std::invalid_argument("mixer dump layer indices must be unique");
+            }
+        }
+    }
+    const std::size_t token_count_size = prompt.token_ids.size();
+    if (token_count_size < 2 || token_count_size > capacity) {
+        throw std::invalid_argument("mixer dump token count must be in [2,capacity]");
+    }
+    if (prompt.has_media()) {
+        throw std::invalid_argument("mixer dump accepts text tokens only");
+    }
+    const auto token_count              = static_cast<std::uint32_t>(token_count_size);
+    const std::uint32_t predictor_count = token_count - 1U;
+    const std::uint32_t entitlement     = kv_pages_for_frontier(predictor_count);
+    if (entitlement == 0) { throw std::logic_error("mixer dump has no KV entitlement"); }
+
+    const std::int32_t hidden = dimension(parameters.model.config().text.hidden_size);
+    if (!kva_mixer) { throw std::logic_error("Program has no KVA mixer capture buffer"); }
+
+    // The sink writes layer `index` at row offset index * nb[1] * active_tokens.
+    execution::DFlashFeatureSink sink{};
+    sink.layers        = layers;
+    sink.mixer_inputs  = &*kva_mixer;
+    sink.mixer_widths  = widths;
+    sink.capture_only  = true;
+    // capture_layer() is a no-op for this sink (features is null), but begin() requires a
+    // features/positions pair or a batch trio; supply the residual buffers so it validates.
+    if (!kva_features || !kva_positions) {
+        throw std::logic_error("Program has no KVA capture buffers");
+    }
+    Tensor features = kva_features->slice(0, 0, hidden);
+    sink.features   = &features;
+    sink.positions  = &*kva_positions;
+
+    std::optional<StateImageHandle> state;
+    std::optional<KVAddressSpaceHandle> address;
+    const auto cleanup = [&] {
+        bool released = true;
+        if (address) {
+            if (text_kv_addresses->active(*address)) { text_kv_addresses->deactivate(*address); }
+            released = text_kv_addresses->release(*address) && released;
+            address.reset();
+        }
+        if (state) {
+            released = state_store->release(*state) && released;
+            state.reset();
+        }
+        if (!released) { throw std::logic_error("mixer dump resources could not be released"); }
+    };
+
+    const std::size_t elem       = dtype_size(DType::BF16);
+    const std::size_t mixer_pitch = static_cast<std::size_t>(kva_mixer->nb[1]);
+    out.clear();
+    widths_out.assign(widths.begin(), widths.end());
+    std::uint32_t captured_total = 0;
+
+    try {
+        state = state_store->reserve_reset(device.stream);
+        if (!state) { throw std::bad_alloc(); }
+        address = text_kv_addresses->create_active(entitlement, 0);
+        if (!address) { throw std::bad_alloc(); }
+        text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream);
+
+        const std::int32_t state_slot = state_store->physical_slot(*state);
+        std::uint32_t cursor          = 0;
+        while (cursor < predictor_count) {
+            const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
+            execution::PrefillContext schedule_state{
+                {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
+                 prefill_chunk, proposal_head},
+                decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
+                {},
+                decoder->text_kv,
+                nullptr,
+                nullptr,
+                cursor,
+                nullptr,
+                nullptr,
+                state_slot,
+                state_slot,
+                0,
+                nullptr};
+            mark_workspace_usage(workspace_plan.text_prefill);
+            const execution::PrefillChunkResult result = execution::prefill_text_chunk(
+                schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
+                false, sink);
+            if (result.finalized || result.processed_tokens == 0 ||
+                result.processed_tokens > nominal) {
+                throw std::logic_error("mixer dump prefill made invalid progress");
+            }
+
+            device.synchronize();
+            const std::int32_t chunk_tokens = sink.active_tokens;
+            if (chunk_tokens <= 0) { throw std::logic_error("mixer dump captured no tokens"); }
+            for (std::size_t index = 0; index < layers.size(); ++index) {
+                // Each layer is a contiguous block of [hidden + kKvaMaxMixerWidth, tokens] with
+                // pitch mixer_pitch. We only want the first `hidden + widths[index]` elements of
+                // each row, so the copy width is narrower than the pitch.
+                const std::size_t row_bytes =
+                    (static_cast<std::size_t>(hidden) +
+                     static_cast<std::size_t>(widths[index])) * elem;
+                const std::size_t prev = out.size();
+                out.resize(prev + row_bytes * static_cast<std::size_t>(chunk_tokens));
+                auto* base = static_cast<std::byte*>(kva_mixer->data) +
+                             index * mixer_pitch * static_cast<std::size_t>(chunk_tokens);
+                CUDA_CHECK(cudaMemcpy2D(out.data() + prev, row_bytes, base, mixer_pitch, row_bytes,
+                                        static_cast<std::size_t>(chunk_tokens),
+                                        cudaMemcpyDeviceToHost));
+            }
+            device.synchronize();
+            captured_total += static_cast<std::uint32_t>(chunk_tokens);
+
+            cursor += result.processed_tokens;
+            text_kv_addresses->commit_frontier(*address, cursor);
+        }
+
+        if (captured_total == 0) { throw std::logic_error("mixer dump captured no tokens"); }
+        tokens_out = captured_total;
+        hidden_out = static_cast<std::uint32_t>(hidden);
+        cleanup();
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        work.reset();
+        try {
+            cleanup();
+        } catch (...) {}
+        throw;
+    }
+}
+
+void ProgramImpl::start_context_transfer_timer(runtime::ContextResourceClass resource) {    context_transfer_timers_[context_resource_index(resource)].start();
 }
 
 void ProgramImpl::stop_context_transfer_timer(runtime::ContextResourceClass resource) {

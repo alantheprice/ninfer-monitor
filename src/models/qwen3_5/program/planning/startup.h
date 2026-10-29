@@ -23,6 +23,11 @@ inline constexpr std::uint32_t kCausalScoreTile = 1024;
 // Maximum number of layers a single KVA residual dump may request. Must stay in sync with
 // Engine::kMaxDumpLayers (the public bound) and DFlashFeatureSink's 32-layer capture limit.
 inline constexpr std::uint64_t kKvaMaxDumpLayers = 32;
+// Widest mixer target the KVA projector predicts: GDN qkv(10240) + a(48) + b(48) = 10336.
+inline constexpr std::uint64_t kKvaMaxMixerWidth = 10336;
+// Number of layers the mixer-capture buffer can hold at once. Bounds the persistent allocation;
+// verification dumps use a handful of layers.
+inline constexpr std::uint64_t kKvaMixerBlocks = 8;
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;
@@ -47,6 +52,7 @@ struct PersistentLayout {
     // dumpable layer count so any layer set fits without re-planning.
     std::optional<TensorLayout> kva_features;
     std::optional<TensorLayout> kva_positions;
+    std::optional<TensorLayout> kva_mixer;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
     std::size_t bytes            = 0;

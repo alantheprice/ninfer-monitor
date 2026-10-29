@@ -301,6 +301,41 @@ Engine::LayerResiduals Engine::dump_layer_residuals(std::vector<TokenId> token_i
         impl_->core);
 }
 
+Engine::MixerInputs Engine::dump_mixer_inputs(std::vector<TokenId> token_ids,
+                                              std::span<const std::uint32_t> layers,
+                                              std::span<const std::int32_t> widths) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::CausalScoring) {
+        throw std::logic_error("dump_mixer_inputs requires a CausalScoring Engine");
+    }
+    if (token_ids.size() < 2 || token_ids.size() > impl_->options.max_context) {
+        throw std::invalid_argument("dump_mixer_inputs token count must be in [2,max_context]");
+    }
+    if (layers.empty() || layers.size() > kMaxDumpLayers || widths.size() != layers.size()) {
+        throw std::invalid_argument("dump_mixer_inputs requires 1..kMaxDumpLayers layers");
+    }
+    PreparedPrompt prompt = prepare_tokens(std::move(token_ids), false);
+    return std::visit(
+        [&](auto& core) -> MixerInputs {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                auto dumped = core->dump_mixers(
+                    std::move(prompt.impl_->value),
+                    std::vector<std::uint32_t>(layers.begin(), layers.end()),
+                    std::vector<std::int32_t>(widths.begin(), widths.end()));
+                MixerInputs out;
+                out.bytes  = std::move(dumped.bytes);
+                out.tokens = dumped.tokens;
+                out.hidden = dumped.hidden;
+                out.widths = std::move(dumped.widths);
+                return out;
+            } else {
+                throw std::logic_error("Engine scoring core is unavailable");
+            }
+        },
+        impl_->core);
+}
+
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->active->frontend.count_tokens(std::move(input), control);

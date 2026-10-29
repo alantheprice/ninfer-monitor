@@ -82,6 +82,20 @@ public:
     [[nodiscard]] LayerResiduals dump_layer_residuals(std::vector<TokenId> token_ids,
                                                       std::span<const std::uint32_t> layers);
 
+    // Offline mixer-input capture (KVA projector verification). For each layer emits the
+    // normalized residual followed by the layer's raw mixer projection, as BF16
+    // [layer][token][hidden + widths[i]]. `widths[i]` is the projection width for layers[i]
+    // (10336 for GDN, 2048 for full attention).
+    struct MixerInputs {
+        std::vector<std::byte> bytes;
+        std::uint32_t tokens = 0;
+        std::uint32_t hidden = 0;
+        std::vector<std::int32_t> widths;
+    };
+    [[nodiscard]] MixerInputs dump_mixer_inputs(std::vector<TokenId> token_ids,
+                                                std::span<const std::uint32_t> layers,
+                                                std::span<const std::int32_t> widths);
+
     [[nodiscard]] PreparedPrompt prepare(PromptInput input,
                                          const PreparationControl& control = {}) const;
 

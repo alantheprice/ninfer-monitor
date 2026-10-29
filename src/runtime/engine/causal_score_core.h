@@ -84,6 +84,12 @@ public:
         std::uint32_t tokens = 0;
         std::uint32_t width  = 0;
     };
+    struct MixerDumpResult {
+        std::vector<std::byte> bytes;
+        std::uint32_t tokens = 0;
+        std::uint32_t hidden = 0;
+        std::vector<std::int32_t> widths;
+    };
     [[nodiscard]] DumpResult dump_residuals(PreparedPrompt prompt,
                                             std::vector<std::uint32_t> layers) {
         std::scoped_lock call_lock(call_mutex_);
@@ -92,6 +98,28 @@ public:
         job->layers                             = std::move(layers);
         job->is_dump                            = true;
         std::future<DumpResult> result          = job->dump_promise.get_future();
+        {
+            std::lock_guard queue_lock(queue_mutex_);
+            if (stopping_) { throw std::runtime_error("causal scoring engine is stopping"); }
+            if (job_ != nullptr) {
+                throw std::logic_error("causal scoring core already has an in-flight job");
+            }
+            job_ = std::move(job);
+        }
+        queue_cv_.notify_one();
+        return result.get();
+    }
+
+    [[nodiscard]] MixerDumpResult dump_mixers(PreparedPrompt prompt,
+                                              std::vector<std::uint32_t> layers,
+                                              std::vector<std::int32_t> widths) {
+        std::scoped_lock call_lock(call_mutex_);
+        auto job                                = std::make_unique<Job>();
+        job->prompt                             = std::move(prompt);
+        job->layers                             = std::move(layers);
+        job->widths                             = std::move(widths);
+        job->is_mixer_dump                      = true;
+        std::future<MixerDumpResult> result     = job->mixer_promise.get_future();
         {
             std::lock_guard queue_lock(queue_mutex_);
             if (stopping_) { throw std::runtime_error("causal scoring engine is stopping"); }
@@ -140,9 +168,12 @@ private:
         PreparedPrompt prompt;
         std::uint32_t first_target = 0;
         std::vector<std::uint32_t> layers;
-        bool is_dump = false;
+        std::vector<std::int32_t> widths;
+        bool is_dump       = false;
+        bool is_mixer_dump = false;
         std::promise<std::vector<float>> promise;
         std::promise<DumpResult> dump_promise;
+        std::promise<MixerDumpResult> mixer_promise;
     };
 
     void worker_loop() noexcept {
@@ -158,6 +189,17 @@ private:
                 job = std::move(job_);
             }
             try {
+                if (job->is_mixer_dump) {
+                    MixerDumpResult result;
+                    {
+                        std::scoped_lock lock(execution_mutex_);
+                        instance_.program->dump_mixer_inputs(
+                            std::move(job->prompt), job->layers, job->widths, result.bytes,
+                            result.tokens, result.hidden, result.widths);
+                    }
+                    job->mixer_promise.set_value(std::move(result));
+                    continue;
+                }
                 if (job->is_dump) {
                     DumpResult result;
                     {
@@ -178,7 +220,9 @@ private:
                 job->promise.set_value(std::move(result));
             } catch (...) {
                 try {
-                    if (job->is_dump) {
+                    if (job->is_mixer_dump) {
+                        job->mixer_promise.set_exception(std::current_exception());
+                    } else if (job->is_dump) {
                         job->dump_promise.set_exception(std::current_exception());
                     } else {
                         job->promise.set_exception(std::current_exception());

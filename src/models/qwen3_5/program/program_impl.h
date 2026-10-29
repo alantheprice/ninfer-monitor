@@ -477,6 +477,14 @@ public:
     void dump_layer_residuals(PreparedPromptData&& prompt,
                               std::span<const std::uint32_t> layers, std::vector<std::byte>& out,
                               std::uint32_t& tokens_out, std::uint32_t& width_out);
+
+    // Offline mixer-input capture (KVA projector verification). For each requested layer, emits
+    // the normalized residual `h` followed by the layer's raw mixer projection, as BF16
+    // [layer][token][hidden + mixer_width]. `widths` must match `layers`.
+    void dump_mixer_inputs(PreparedPromptData&& prompt, std::span<const std::uint32_t> layers,
+                           std::span<const std::int32_t> widths, std::vector<std::byte>& out,
+                           std::uint32_t& tokens_out, std::uint32_t& hidden_out,
+                           std::vector<std::int32_t>& widths_out);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
@@ -634,6 +642,7 @@ public:
     std::optional<Tensor> score_hidden;
     std::optional<Tensor> kva_features;
     std::optional<Tensor> kva_positions;
+    std::optional<Tensor> kva_mixer;
     Tensor sampling_config;
     Tensor token_counts;
 

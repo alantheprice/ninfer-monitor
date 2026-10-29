@@ -256,6 +256,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.kva_positions =
             add_tensor(builder, DType::I32, {static_cast<std::int32_t>(effective_prefill_chunk)},
                        "kva layer capture positions");
+        // Mixer-input capture: one contiguous block per requested layer, each
+        // [hidden + kKvaMaxMixerWidth, prefill_chunk]. The layout is planned before any request
+        // is known, so this is sized for a bounded number of layers rather than the maximum:
+        // 8 covers the realistic verification use (a handful of layers at a time) at ~1 GB.
+        out.kva_mixer =
+            add_tensor(builder, DType::BF16,
+                       {dimension(config.hidden_size + kKvaMaxMixerWidth),
+                        static_cast<std::int32_t>(effective_prefill_chunk * kKvaMixerBlocks)},
+                       "kva mixer input capture");
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {

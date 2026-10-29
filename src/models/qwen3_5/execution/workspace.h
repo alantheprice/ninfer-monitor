@@ -122,6 +122,14 @@ Tensor gdn_prefill_conv(Allocator& allocator, const TextConfig& config, std::int
     return matrix(allocator, DType::BF16, dimension(config.gdn->conv_channels()), tokens);
 }
 
+// KVA verification scratch: contiguous [2 * key_width, tokens] staging for the attention mixer
+// probe (k and v concatenated, matching the projector's predicted target layout).
+template <class Allocator>
+Tensor kva_mixer_probe(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
+    return matrix(allocator, DType::BF16,
+                  2 * dimension(config.attention->key_width()), tokens);
+}
+
 template <class Allocator>
 Tensor gdn_recurrent_output(Allocator& allocator, const TextConfig& config, std::int32_t tokens) {
     return matrix(allocator, DType::BF16, dimension(config.gdn->value_width()), tokens);

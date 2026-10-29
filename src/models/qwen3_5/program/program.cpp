@@ -269,6 +269,14 @@ void Program::dump_layer_residuals(PreparedPrompt&& prompt, std::span<const std:
                                 tokens_out, width_out);
 }
 
+void Program::dump_mixer_inputs(PreparedPrompt&& prompt, std::span<const std::uint32_t> layers,
+                                std::span<const std::int32_t> widths, std::vector<std::byte>& out,
+                                std::uint32_t& tokens_out, std::uint32_t& hidden_out,
+                                std::vector<std::int32_t>& widths_out) {
+    impl_->dump_mixer_inputs(PreparedPromptAccess::take(std::move(prompt)), layers, widths, out,
+                             tokens_out, hidden_out, widths_out);
+}
+
 std::optional<AdmissionCandidate> Program::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
     const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
