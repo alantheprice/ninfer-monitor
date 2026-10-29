@@ -173,8 +173,10 @@ private:
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
 
-    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
+                  int layer_index);
+    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
+                 int layer_index);
     // KVA verification: non-null while run_layers is executing with a mixer-capturing sink.
     void set_mixer_sink(DFlashFeatureSink* sink) noexcept { mixer_sink_ = sink; }
     DFlashFeatureSink* mixer_sink_ = nullptr;

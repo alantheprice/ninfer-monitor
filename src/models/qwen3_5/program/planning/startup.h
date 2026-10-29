@@ -25,9 +25,10 @@ inline constexpr std::uint32_t kCausalScoreTile = 1024;
 inline constexpr std::uint64_t kKvaMaxDumpLayers = 32;
 // Widest mixer target the KVA projector predicts: GDN qkv(10240) + a(48) + b(48) = 10336.
 inline constexpr std::uint64_t kKvaMaxMixerWidth = 10336;
-// Number of layers the mixer-capture buffer can hold at once. Bounds the persistent allocation;
-// verification dumps use a handful of layers.
-inline constexpr std::uint64_t kKvaMixerBlocks = 8;
+// Number of layers the mixer-capture buffer can hold at once. Bounds the persistent allocation.
+// 32 covers all late layers in a single pass, which is what projector training data needs
+// (~1 GB at prefill_chunk 1024).
+inline constexpr std::uint64_t kKvaMixerBlocks = 32;
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;

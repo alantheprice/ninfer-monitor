@@ -891,7 +891,8 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
+void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph,
+                           int layer_index) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -916,7 +917,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
     attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
-    if (mixer_sink_ != nullptr && mixer_sink_->captures_mixer(fidx)) {
+    if (mixer_sink_ != nullptr && mixer_sink_->captures_mixer(layer_index)) {
         // The projector predicts k and v concatenated; stage them contiguously for capture.
         Tensor kv = workspace::kva_mixer_probe(work_, config_, T);
         Tensor kv_view = kv.view({2 * dimension(config_.attention->key_width()), T});
@@ -931,7 +932,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             static_cast<std::size_t>(v_flat.nb[1]),
             static_cast<std::size_t>(v_flat.ne[0]) * dtype_size(DType::BF16),
             static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
-        mixer_sink_->capture_mixer(fidx, h, kv_view, s);
+        mixer_sink_->capture_mixer(layer_index, h, kv_view, s);
     }
 
     const auto results = workspace::text_attention_results(work_, config_, T);
@@ -996,7 +997,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                     p.output.policy, work_, s);
 }
 
-void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
+void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph,
+                          int layer_index) {
     const auto& p  = std::get<GdnParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1056,7 +1058,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         Tensor qkv    = workspace::gdn_prefill_conv(work_, config_, T);
         Tensor z_flat = z.view({dimension(config_.gdn->value_width()), T});
         gdn_projection(h, p, qkv, z_flat, work_, s);
-        if (mixer_sink_ != nullptr) { mixer_sink_->capture_mixer(gidx, h, qkv, s); }
+        if (mixer_sink_ != nullptr) { mixer_sink_->capture_mixer(layer_index, h, qkv, s); }
         Tensor conv_state_in =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor conv_state_out =
@@ -1168,9 +1170,9 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
                 auto scope = work_.scope();
                 if (full) {
-                    attn_mix(block, x, compact, ph);
+                    attn_mix(block, x, compact, ph, static_cast<int>(layer));
                 } else {
-                    gdn_mix(block, x, compact, ph);
+                    gdn_mix(block, x, compact, ph, static_cast<int>(layer));
                 }
             }
             {

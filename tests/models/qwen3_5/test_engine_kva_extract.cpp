@@ -82,9 +82,11 @@ int main(int argc, char** argv) {
 
         ninfer::EngineOptions options;
         options.artifact_path   = artifact;
-        options.max_context     = 4096;
-        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(4096);
-        options.prefill_chunk   = 4096;
+        // Extraction chunks are bounded by max_context; a larger value amortizes the per-chunk
+        // overhead and lets a corpus be walked in fewer passes.
+        options.max_context     = 16384;
+        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(16384);
+        options.prefill_chunk   = 16384;
         options.max_concurrency = 1;
         options.use_cuda_graph  = false;
         options.enable_vision   = false;
