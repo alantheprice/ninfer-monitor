@@ -810,26 +810,48 @@ DiskContextArchive::prefetch(const Candidate& candidate) {
     const auto it = manifests_.find(candidate.manifest);
     if (it == manifests_.end() || it->second.superseded) { return nullptr; }
     ManifestRecord& record = it->second;
-    std::shared_ptr<Prefetch> prefetch(new Prefetch(*this));
-    prefetch->candidate_ = candidate;
-    std::size_t bytes    = 0;
+    // Lay out the image before touching staging: ~Prefetch re-acquires mutex_, so no Prefetch may
+    // exist while this function holds the lock and can still return early (staging exhaustion).
+    std::size_t bytes                                   = 0;
+    std::array<std::size_t, kArchivePageKinds> offsets{};
+    std::array<std::size_t, kArchivePageKinds> counts{};
     for (std::size_t kind = 0; kind < kArchivePageKinds; ++kind) {
-        prefetch->page_offsets_[kind] = bytes;
-        prefetch->page_counts_[kind]  = record.page_keys[kind].size();
-        bytes += prefetch->page_counts_[kind] * options_.page_bytes[kind];
+        offsets[kind] = bytes;
+        counts[kind]  = record.page_keys[kind].size();
+        bytes += counts[kind] * options_.page_bytes[kind];
     }
-    prefetch->identity_offset_ = bytes;
-    prefetch->identity_bytes_  = record.identity_bytes;
-    bytes                      = align_up(bytes + record.identity_bytes, 256);
-    prefetch->state_offset_    = bytes;
-    prefetch->state_bytes_     = record.state_bytes;
+    const std::size_t identity_offset = bytes;
+    const std::size_t identity_bytes  = record.identity_bytes;
+    bytes                             = align_up(bytes + record.identity_bytes, 256);
+    const std::size_t state_offset    = bytes;
+    const std::size_t state_bytes     = record.state_bytes;
     bytes += record.state_bytes;
     const std::optional<ArchiveStagingAllocator::Region> region = staging_.allocate(bytes);
     if (!region) { return nullptr; }
-    prefetch->staging_ = *region;
+    std::shared_ptr<Prefetch> prefetch;
+    try {
+        prefetch.reset(new Prefetch(*this));
+    } catch (...) {
+        staging_.release(*region);
+        throw;
+    }
+    prefetch->candidate_       = candidate;
+    prefetch->page_offsets_    = offsets;
+    prefetch->page_counts_     = counts;
+    prefetch->identity_offset_ = identity_offset;
+    prefetch->identity_bytes_  = identity_bytes;
+    prefetch->state_offset_    = state_offset;
+    prefetch->state_bytes_     = state_bytes;
+    prefetch->staging_         = *region;
     ++record.pins;
     ++stats_.prefetches_started;
-    read_queue_.push_back(prefetch);
+    try {
+        read_queue_.push_back(prefetch);
+    } catch (...) {
+        // Destroying the Prefetch under mutex_ would self-deadlock; unwind the lock first.
+        lock.unlock();
+        throw;
+    }
     lock.unlock();
     reader_cv_.notify_one();
     return prefetch;
