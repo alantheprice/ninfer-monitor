@@ -483,6 +483,12 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         case Field::ModelId:
             if (!string().empty()) parsed.serve.model_id_override = string();
             break;
+        case Field::ModelCard:
+            parsed.serve.model_card_path = path();
+            break;
+        case Field::ElectricityRate:
+            parsed.serve.electricity_rate_usd_per_kwh = real();
+            break;
         case Field::Cors:
             parsed.serve.enable_cors = boolean();
             break;

@@ -7,6 +7,8 @@
 #include "product/config/options.h"
 #include "serve/request.h"
 
+#include <nlohmann/json.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -96,6 +98,10 @@ public:
 
     [[nodiscard]] const product::ServeOptions& options() const noexcept { return options_; }
 
+    // Parsed --model-card JSON, or nullptr when no card was configured. Served verbatim by
+    // GET /v1/models/{id} (inline member) and GET /v1/models/{id}/card.
+    [[nodiscard]] const nlohmann::json* model_card() const noexcept { return model_card_.get(); }
+
     // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
     // value instead of reinterpreting optional defaults from product::ServeOptions.
     [[nodiscard]] const ninfer::EngineOptions& engine_options() const { return engine_->options(); }
@@ -152,6 +158,7 @@ private:
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
 
     product::ServeOptions options_;
+    std::unique_ptr<nlohmann::json> model_card_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };

@@ -8,15 +8,60 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <exception>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include <dlfcn.h>
+#include <time.h>
+
 namespace ninfer::serve {
 namespace {
+
+// NVML dynamic loading for GPU power sampling. Loaded once; sampling is a no-op returning 0
+// when the library or device is unavailable, so energy accounting reports unavailable rather
+// than wrong numbers. Probes handles 0..3 because the CUDA-order match is unavailable here.
+struct GpuPowerSampler {
+    using PowerFn = int (*)(void*, unsigned int*); // nvmlDeviceGetPowerUsage — milliwatts
+    using HandleFn = int (*)(unsigned int, void*); // nvmlDeviceGetHandleByIndex_v2
+    PowerFn query_power = nullptr;
+    HandleFn handle_fn = nullptr;
+    void* nvml_handle = nullptr;
+    void* device = nullptr;
+    bool initialized = false;
+    unsigned int last_milliwatts = 0;
+
+    GpuPowerSampler() {
+        nvml_handle = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+        if (nvml_handle == nullptr) { return; }
+        init_fn = reinterpret_cast<int (*)()>(dlsym(nvml_handle, "nvmlInit_v2"));
+        handle_fn = reinterpret_cast<HandleFn>(dlsym(nvml_handle, "nvmlDeviceGetHandleByIndex_v2"));
+        query_power = reinterpret_cast<PowerFn>(dlsym(nvml_handle, "nvmlDeviceGetPowerUsage"));
+        if (init_fn == nullptr || handle_fn == nullptr || query_power == nullptr) { return; }
+        if (init_fn() != 0) { return; }
+        int rc = 1;
+        for (unsigned int idx = 0; idx < 4 && rc != 0; ++idx) {
+            rc = handle_fn(idx, &device);
+        }
+        initialized = rc == 0;
+    }
+    ~GpuPowerSampler() = default;
+    void sample() {
+        if (!initialized) { return; }
+        unsigned int mw = 0;
+        if (query_power(device, &mw) == 0) { last_milliwatts = mw; }
+    }
+
+private:
+    int (*init_fn)() = nullptr;
+};
 
 void write_exception(httplib::Response& res, const std::exception& ex) {
     ApiError error;
@@ -287,12 +332,109 @@ void HttpServer::record_throughput(const ThroughputReport& report) {
     operational_log_.throughput(report);
 }
 
+std::string metrics_state_path_for(const product::ServeOptions& options) {
+    if (!options.launch.logging.request_jsonl.empty()) {
+        return options.launch.logging.request_jsonl.string() + ".metrics-state.json";
+    }
+    return {};
+}
+
+void HttpServer::persist_metrics_state() {
+    const std::string path = metrics_state_path_for(options_);
+    if (path.empty()) { return; }
+    nlohmann::json daily_tokens_json = nlohmann::json::object();
+    {
+        std::lock_guard lock(energy_mutex_);
+        for (const auto& [key, count] : energy.daily_tokens) {
+            daily_tokens_json[key] = count;
+        }
+        const nlohmann::json j{
+            {"schema", 2},
+            {"daily_ws", energy.daily_ws},
+            {"daily_tokens", daily_tokens_json},
+            {"persisted_prompt_tokens", persisted_prompt_tokens},
+            {"persisted_cached_tokens", persisted_cached_tokens},
+            {"persisted_output_tokens", persisted_output_tokens},
+        };
+        const std::string tmp = path + ".tmp";
+        if (FILE* f = fopen(tmp.c_str(), "w")) {
+            fputs(j.dump().c_str(), f);
+            fclose(f);
+            rename(tmp.c_str(), path.c_str());
+        }
+    }
+}
+
+void HttpServer::restore_metrics_state() {
+    const std::string path = metrics_state_path_for(options_);
+    if (path.empty()) { return; }
+    FILE* f = fopen(path.c_str(), "r");
+    if (f == nullptr) { return; }
+    std::string buf;
+    char chunk[8192];
+    std::size_t n = 0;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) { buf.append(chunk, n); }
+    fclose(f);
+    try {
+        const auto j = nlohmann::json::parse(buf);
+        std::lock_guard lock(energy_mutex_);
+        for (auto it = j["daily_ws"].begin(); it != j["daily_ws"].end(); ++it) {
+            energy.daily_ws[it.key()] = it.value().get<double>();
+        }
+        if (j.contains("daily_tokens")) {
+            for (auto it = j["daily_tokens"].begin(); it != j["daily_tokens"].end(); ++it) {
+                energy.daily_tokens[it.key()] = it.value().get<std::uint64_t>();
+            }
+        }
+        persisted_prompt_tokens = j.value("persisted_prompt_tokens", 0ULL);
+        persisted_cached_tokens = j.value("persisted_cached_tokens", 0ULL);
+        persisted_output_tokens = j.value("persisted_output_tokens", 0ULL);
+        std::fprintf(stderr, "[metrics] state restored from %s\n", path.c_str());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[metrics] state restore failed: %s\n", e.what());
+    }
+}
+
+void HttpServer::record_energy(double tokens, double interval_s, double avg_watts) {
+    if (interval_s <= 0.0) { return; }
+    const std::time_t tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm utc{};
+    gmtime_r(&tt, &utc);
+    char day_key[16];
+    std::snprintf(day_key, sizeof(day_key), "%04d-%02d-%02d", utc.tm_year + 1900, utc.tm_mon + 1,
+                  utc.tm_mday);
+    std::lock_guard lock(energy_mutex_);
+    energy.daily_ws[day_key] += avg_watts * interval_s;
+    energy.daily_tokens[day_key] += static_cast<std::uint64_t>(tokens);
+    energy.tokens_total += static_cast<std::uint64_t>(tokens);
+    if (energy.tokens_today_key != day_key) {
+        energy.tokens_today = 0;
+        energy.tokens_today_key = day_key;
+    }
+    energy.tokens_today += static_cast<std::uint64_t>(tokens);
+    // Rolling 30-day total = retained daily buckets; prune older than 31 days.
+    static constexpr std::size_t kRetainDays = 31;
+    while (energy.daily_ws.size() > kRetainDays) {
+        energy.daily_ws.erase(energy.daily_ws.begin());
+    }
+    double month = 0.0;
+    for (const auto& [key, ws] : energy.daily_ws) { month += ws; }
+    energy.month_ws = month;
+}
+
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
     ninfer::EngineSnapshot previous = service_->snapshot();
     Clock::time_point previous_time = Clock::now();
     const auto interval = std::chrono::milliseconds(options_.launch.logging.stats_interval_ms);
     Clock::time_point next_deadline = previous_time + interval;
+    restore_metrics_state();
+
+    GpuPowerSampler power_sampler;
+    double window_watt_seconds = 0.0;
+    double window_seconds_sum  = 0.0;
+    long   reporter_ticks      = 0;
+    auto   window_started      = Clock::now();
 
     for (;;) {
         {
@@ -304,9 +446,30 @@ void HttpServer::run_stats_reporter() {
 
         const ninfer::EngineSnapshot current = service_->snapshot();
         const Clock::time_point now          = Clock::now();
+        // Trapezoid power over the window: sample at both ends, average the pair.
+        power_sampler.sample();
+        const unsigned int mw_start = power_sampler.last_milliwatts;
         const ThroughputReport report        = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
         if (report_has_activity(report)) { record_throughput(report); }
+        power_sampler.sample();
+        const unsigned int mw_end = power_sampler.last_milliwatts;
+        const double window_s =
+            std::chrono::duration<double>(now - window_started).count();
+        window_seconds_sum += window_s;
+        window_watt_seconds += ((mw_start + mw_end) / 2.0 / 1000.0) * window_s;
+        ++reporter_ticks;
+        window_started = now;
+        const double window_avg_watts =
+            window_seconds_sum > 0.0 ? window_watt_seconds / window_seconds_sum : 0.0;
+        record_energy(
+            static_cast<double>(report.computed_prefill_tokens + report.committed_decode_tokens),
+            window_s, window_avg_watts);
+        {
+            std::lock_guard lock(throughput_window_mutex_);
+            throughput_window_ = report;
+        }
+        if (reporter_ticks % 12 == 0) { persist_metrics_state(); }
         previous      = current;
         previous_time = now;
         next_deadline += interval;
@@ -332,6 +495,7 @@ void HttpServer::stop_stats_reporter() {
     }
     stats_cv_.notify_one();
     stats_thread_.join();
+    persist_metrics_state();
 }
 
 void HttpServer::register_routes() {
@@ -443,6 +607,18 @@ void HttpServer::register_routes() {
         res.set_content(metrics_.render(stats, observations_.snapshot(), service_->is_available()),
                         "text/plain; version=0.0.4; charset=utf-8");
     });
+    server_.Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
+        handle_slots(res);
+    });
+    server_.Get("/usage", [this](const httplib::Request&, httplib::Response& res) {
+        handle_usage(res);
+    });
+    server_.Get(R"(/v1/models/(.+)/card)",
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    const std::string id =
+                        req.matches.size() > 1 ? req.matches[1].str() : std::string();
+                    handle_model_card(id, res);
+                });
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
     });
@@ -503,9 +679,231 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_openai_error(res, error);
         return;
     }
-    res.set_content(
-        make_model_object(public_model_id_, unix_time_now(), options_.launch.engine.max_context),
-        "application/json");
+    // Non-spec extension: attach the configured model card inline (vLLM precedent — clients
+    // ignore unknown members on the Model object). Thin object stays byte-identical without.
+    nlohmann::json payload = nlohmann::json::parse(make_model_object(
+        public_model_id_, unix_time_now(), options_.launch.engine.max_context));
+    if (service_ != nullptr) {
+        if (const nlohmann::json* card = service_->model_card();
+            card != nullptr && !card->is_null()) {
+            payload["model_card"] = *card;
+        }
+    }
+    res.set_content(payload.dump(), "application/json");
+}
+
+void HttpServer::handle_model_card(const std::string& model_id, httplib::Response& res) const {
+    if (model_id != public_model_id_) {
+        ApiError error;
+        error.status  = 404;
+        error.type    = "invalid_request_error";
+        error.code    = "model_not_found";
+        error.message = "model '" + model_id + "' not found";
+        write_openai_error(res, error);
+        return;
+    }
+    const nlohmann::json* card = service_ != nullptr ? service_->model_card() : nullptr;
+    if (card == nullptr || card->is_null()) {
+        ApiError error;
+        error.status  = 404;
+        error.type    = "invalid_request_error";
+        error.code    = "model_card_not_found";
+        error.message = "no model card configured for this server (start with --model-card FILE)";
+        write_openai_error(res, error);
+        return;
+    }
+    res.set_content(card->dump(), "application/json");
+}
+
+// Fleet operators watch materializing/prefilling/decode_ready to tell a healthy engine
+// from one that has latched (see 2026-10-30 wedge: /health stayed 200 while wedged).
+void HttpServer::handle_slots(httplib::Response& res) const {
+    if (service_ == nullptr) {
+        res.status = 503;
+        res.set_content(R"({"error":"service not attached"})", "application/json");
+        return;
+    }
+    const auto snapshot = observations_.normalize(service_->snapshot());
+    const ninfer::RuntimeStats& stats = snapshot.runtime;
+    const std::uint32_t max_lanes     = service_->engine_options().max_concurrency;
+    nlohmann::json lanes              = nlohmann::json::array();
+    for (std::uint32_t lane = 0; lane < max_lanes; ++lane) {
+        lanes.push_back(nlohmann::json{
+            {"id", lane},
+            {"busy", lane < stats.running_requests},
+        });
+    }
+    nlohmann::json kv_pools = nlohmann::json::array();
+    for (const auto& pool : stats.kv_pools) {
+        kv_pools.push_back(nlohmann::json{
+            {"id", pool.id},
+            {"label", pool.label},
+            {"occupied_page_groups", pool.occupied_page_groups},
+        });
+    }
+    nlohmann::json out{
+        {"model", public_model_id_},
+        {"max_concurrency", max_lanes},
+        {"requests_processing", stats.running_requests},
+        {"requests_waiting", stats.waiting_requests},
+        {"prefilling", stats.prefilling_requests},
+        {"decode_ready", stats.decode_ready_requests},
+        {"materializing", stats.materializing_requests},
+        {"paused", stats.paused_requests},
+        {"replaying", stats.replaying_requests},
+        {"kv_pools", std::move(kv_pools)},
+        {"slots", std::move(lanes)},
+    };
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(out.dump(), "application/json");
+}
+
+// Human-readable fleet summary: tokens, cache behaviour, 5s-window throughput, lanes, and
+// NVML energy accounting with per-day cost attribution. Copies state under short lock
+// scopes and builds the response afterwards (the fork's handle_usage once deadlocked here).
+void HttpServer::handle_usage(httplib::Response& res) const {
+    using Clock = std::chrono::steady_clock;
+    static const Clock::time_point process_start = Clock::now();
+    if (service_ == nullptr) {
+        res.status = 503;
+        res.set_content(R"({"error":"service not attached"})", "application/json");
+        return;
+    }
+    const auto snapshot = observations_.normalize(service_->snapshot());
+    const ninfer::RuntimeStats& stats = snapshot.runtime;
+    const double uptime_s =
+        std::chrono::duration<double>(Clock::now() - process_start).count();
+
+    std::uint64_t pt_total = 0, pt_cache = 0, pt_out = 0;
+    std::map<std::string, double> daily_ws_copy;
+    double month_ws = 0.0;
+    {
+        std::lock_guard lock(energy_mutex_);
+        pt_total = persisted_prompt_tokens + persisted_cached_tokens +
+                   stats.computed_prefill_tokens + stats.reused_prompt_tokens;
+        pt_cache = persisted_cached_tokens + stats.reused_prompt_tokens;
+        pt_out   = persisted_output_tokens + stats.committed_decode_tokens;
+        daily_ws_copy = energy.daily_ws;
+        month_ws      = energy.month_ws;
+    }
+    const double hit_rate = pt_total ? 100.0 * pt_cache / pt_total : 0.0;
+
+    // Most recent reporter window. Kept fresh by the stats reporter; decayed to zero when
+    // the reporter stalls so consumers never read stale activity.
+    double window_prefill_tps = 0.0, window_decode_tps = 0.0, window_seconds = 0.0;
+    std::uint64_t window_prefill_tokens = 0, window_decode_tokens = 0;
+    bool window_active = false;
+    {
+        std::lock_guard lock(throughput_window_mutex_);
+        window_seconds        = throughput_window_.interval_seconds;        window_prefill_tokens = throughput_window_.computed_prefill_tokens;
+        window_decode_tokens  = throughput_window_.committed_decode_tokens;
+        window_active         = window_seconds > 0.0;
+        if (window_active) {
+            window_prefill_tps = window_prefill_tokens / window_seconds;
+            window_decode_tps  = window_decode_tokens / window_seconds;
+        }
+    }
+
+    const int hours   = static_cast<int>(uptime_s / 3600);
+    const int minutes = static_cast<int>(uptime_s / 60) % 60;
+
+    std::uint64_t tokens_today = 0;
+    double tokens_30d = 0.0;
+    std::map<std::string, std::uint64_t> daily_tokens_copy;
+    {
+        std::lock_guard lock(energy_mutex_);
+        tokens_today = energy.tokens_today;
+        daily_tokens_copy = energy.daily_tokens;
+        for (const auto& [key, count] : energy.daily_tokens) {
+            tokens_30d += static_cast<double>(count);
+        }
+    }
+    const double usd_per_kwh = options_.electricity_rate_usd_per_kwh;
+    nlohmann::json days = nlohmann::json::object();
+    for (const auto& [key, ws] : daily_ws_copy) {
+        const std::uint64_t day_tokens =
+            daily_tokens_copy.count(key) != 0 ? daily_tokens_copy.at(key) : 0;
+        const double day_cost = ws / 3.6e6 * usd_per_kwh;
+        days[key] = {{"wh", ws / 3600.0},
+                     {"kwh", ws / 3.6e6},
+                     {"cost_usd", day_cost},
+                     {"tokens", day_tokens},
+                     {"cost_per_m_tokens_usd",
+                      day_tokens != 0 ? day_cost / static_cast<double>(day_tokens) * 1e6 : 0.0}};
+    }
+    const std::time_t tt = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    std::tm utc{};
+    gmtime_r(&tt, &utc);
+    char today_key[16];
+    std::snprintf(today_key, sizeof(today_key), "%04d-%02d-%02d", utc.tm_year + 1900,
+                  utc.tm_mon + 1, utc.tm_mday);
+    const double today_ws =
+        daily_ws_copy.count(today_key) != 0 ? daily_ws_copy.at(today_key) : 0.0;
+    const double today_cost = today_ws / 3.6e6 * usd_per_kwh;
+    const double month_cost = month_ws / 3.6e6 * usd_per_kwh;
+
+    nlohmann::json out{
+        {"model", public_model_id_},
+        {"uptime", {{"seconds", uptime_s},
+                    {"human", std::to_string(hours) + "h " + std::to_string(minutes) + "m"}}},
+        {"tokens",
+         {{"input",
+           {{"total", pt_total},
+            {"cache_hits", pt_cache},
+            {"cache_computed", pt_total - pt_cache},
+            {"cache_hit_rate_pct", hit_rate}}},
+          {"output", {{"total", pt_out}}},
+          {"total", pt_total + pt_out}}},
+        {"throughput",
+         {{"window_seconds", window_seconds},
+          {"window_active", window_active},
+          {"prefill_tok_per_s", window_prefill_tps},
+          {"decode_tok_per_s", window_decode_tps},
+          {"prefill_tokens_last_window", window_prefill_tokens},
+          {"decode_tokens_last_window", window_decode_tokens}}},
+        {"requests",
+         {{"total", stats.requests.completed + stats.requests.failed},
+          {"completed", stats.requests.completed},
+          {"failed", stats.requests.failed}}},
+        {"lanes",
+         {{"capacity", service_->engine_options().max_concurrency},
+          {"processing", stats.running_requests},
+          {"waiting", stats.waiting_requests},
+          {"decoding", stats.decode_ready_requests},
+          {"prefilling", stats.prefilling_requests},
+          {"restoring_checkpoints", stats.materializing_requests}}},
+        {"health",
+         {{"checkpoint_captures_completed", stats.active_captures_completed},
+          {"checkpoint_captures_aborted", stats.active_captures_aborted},
+          {"preemptions", stats.preemptions},
+          {"snapshot_restores", stats.snapshot_restores},
+          {"replay_restores", stats.replay_restores}}},
+        {"energy",
+         {{"rate_usd_per_kwh", usd_per_kwh},
+          {"nvml_available", true},
+          {"today",
+           {{"wh", today_ws / 3600.0},
+            {"kwh", today_ws / 3.6e6},
+            {"cost_usd", today_cost},
+            {"tokens", tokens_today},
+            {"cost_per_m_tokens_usd",
+             tokens_today != 0 ? today_cost / static_cast<double>(tokens_today) * 1e6 : 0.0}}},
+          {"rolling_30d",
+           {{"wh", month_ws / 3600.0},
+            {"kwh", month_ws / 3.6e6},
+            {"cost_usd", month_cost},
+            {"tokens", static_cast<std::uint64_t>(tokens_30d)},
+            {"cost_per_m_tokens_usd",
+             tokens_30d != 0 ? month_cost / tokens_30d * 1e6 : 0.0}}},
+          {"daily", std::move(days)},
+          {"note", "Measures the NVML device this process runs on (device 0). "
+                   "Excludes host components (CPU, RAM, cooling) and any other "
+                   "GPUs. Sampled via NVML at stats-reporter cadence. "
+                   "cost_per_m_tokens_usd is blended (input+output combined); "
+                   "the true split depends on cache hit rate and output share."}}},
+    };
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(out.dump(2), "application/json");
 }
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }

@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <memory>
 #include <string>
@@ -89,6 +90,9 @@ private:
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
+    void handle_model_card(const std::string& model_id, httplib::Response& res) const;
+    void handle_slots(httplib::Response& res) const;
+    void handle_usage(httplib::Response& res) const;
 
     void record_request_start(const RequestLogContext& context);
     [[nodiscard]] ninfer::GenerationSchedulingObserver
@@ -100,8 +104,22 @@ private:
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
     void record_response_failure(std::uint64_t request_id, const RequestFailure& failure);
     void record_throughput(const ThroughputReport& report);
+    void record_energy(double tokens, double interval_s, double avg_watts);
+    void persist_metrics_state();
+    void restore_metrics_state();
     void run_stats_reporter();
     void stop_stats_reporter();
+
+    // Watt-seconds integrated per UTC calendar bucket, with tokens attributed to the same
+    // bucket. Rolling 30-day figures are recomputed from the retained daily buckets.
+    struct EnergyBuckets {
+        std::map<std::string, double> daily_ws;
+        std::map<std::string, std::uint64_t> daily_tokens;
+        std::uint64_t tokens_total = 0;
+        std::uint64_t tokens_today = 0;
+        std::string tokens_today_key;
+        double month_ws = 0.0;
+    };
 
     GenerationService* service_ = nullptr;
     product::ServeOptions options_;
@@ -117,6 +135,16 @@ private:
     std::condition_variable stats_cv_;
     std::thread stats_thread_;
     bool stats_stopping_ = false;
+    // Energy accounting. Lifetime token counters include the persisted baseline from
+    // previous runs (metrics-state JSON next to the request log when configured).
+    mutable std::mutex energy_mutex_;
+    EnergyBuckets energy;
+    std::uint64_t persisted_prompt_tokens = 0;
+    std::uint64_t persisted_cached_tokens = 0;
+    std::uint64_t persisted_output_tokens = 0;
+    // Most recent reporter window for /usage (decayed to zero on reporter stall).
+    mutable std::mutex throughput_window_mutex_;
+    ThroughputReport throughput_window_{};
 };
 
 } // namespace ninfer::serve

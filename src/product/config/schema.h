@@ -48,6 +48,8 @@ enum class Field {
     ServerPort,
     ApiKey,
     ModelId,
+    ModelCard,
+    ElectricityRate,
     Cors,
     MaxRequestSize,
     ResponseRecords,

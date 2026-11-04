@@ -91,6 +91,8 @@ struct ServeOptions {
     int port             = 8080;
     std::string api_key;
     std::optional<std::string> model_id_override;
+    std::filesystem::path model_card_path;
+    double electricity_rate_usd_per_kwh   = 0.15;
     bool enable_cors                       = false;
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;

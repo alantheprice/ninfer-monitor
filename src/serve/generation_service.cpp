@@ -7,6 +7,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstddef>
+#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <stdexcept>
@@ -334,6 +335,21 @@ private:
 GenerationService::GenerationService(product::ServeOptions options,
                                      StartupObserver startup_observer)
     : options_(std::move(options)) {
+    if (!options_.model_card_path.empty()) {
+        std::ifstream card_input(options_.model_card_path, std::ios::binary);
+        if (!card_input) {
+            throw std::invalid_argument("failed to open model card file: " +
+                                        options_.model_card_path.string());
+        }
+        std::string card_text{std::istreambuf_iterator<char>(card_input),
+                              std::istreambuf_iterator<char>()};
+        try {
+            model_card_ = std::make_unique<nlohmann::json>(nlohmann::json::parse(card_text));
+        } catch (const nlohmann::json::exception& error) {
+            throw std::invalid_argument("invalid model card JSON in " +
+                                        options_.model_card_path.string() + ": " + error.what());
+        }
+    }
     auto engine_options             = options_.launch.engine;
     engine_options.startup_observer = std::move(startup_observer);
     engine_                         = std::make_unique<ninfer::Engine>(std::move(engine_options));

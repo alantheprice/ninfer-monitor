@@ -94,6 +94,11 @@ constexpr FieldSpec kFields[] = {
      "Authentication key; empty disables authentication.", Scope::Serve},
     {Field::ModelId, "server.model_id", "--model-id", "", "ID",
      "Public model alias; empty uses the artifact name.", Scope::Serve},
+    {Field::ModelCard, "server.model_card", "--model-card", "", "FILE",
+     "JSON model card served verbatim under model_card on /v1/models/{id} and at "
+     "/v1/models/{id}/card; parse errors are fatal.", Scope::Serve},
+    {Field::ElectricityRate, "server.electricity_rate", "--electricity-rate", "", "RATE",
+     "USD per kWh used by /usage energy cost figures (0.15).", Scope::Serve},
     {Field::Cors, "server.cors", "--cors", "--no-cors", "", "Permissive CORS headers.",
      Scope::Serve},
     {Field::MaxRequestSize, "server.max_request_size", "--max-request-size", "", "SIZE",
@@ -368,6 +373,8 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
         return std::uint64_t{parse_duration_ms(value, false)};
     case Field::Temperature:
         return real(value, command_line, 0, 2);
+    case Field::ElectricityRate:
+        return real(value, command_line, 0, 10);
     case Field::TopP:
     case Field::MinP:
         return real(value, command_line, 0, 1);
@@ -400,6 +407,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     case Field::CostPresets:
     case Field::ApiKey:
     case Field::ModelId:
+    case Field::ModelCard:
     case Field::RequestJsonl:
     case Field::Regex:
         return text(value);
