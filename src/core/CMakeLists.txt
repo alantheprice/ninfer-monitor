@@ -28,6 +28,7 @@ add_library(ninfer_core SHARED
   kda_replay_records.cpp
   cyclic_kv_cache.cpp
   context_pool.cpp
+  disk_context_archive.cpp
   paged_kv_cache.cpp
   paged_kv_geometry.cpp
   linear_attention_state.cpp

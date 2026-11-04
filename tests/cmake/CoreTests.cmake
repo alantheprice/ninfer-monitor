@@ -26,6 +26,10 @@ endif()
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_disk_context_archive_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_disk_context_archive.cpp"
+  LIBRARIES ninfer_core)
+
 set_tests_properties(ninfer_device_test PROPERTIES
   ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:")
 set(sync_modes spin blocking yield auto)
