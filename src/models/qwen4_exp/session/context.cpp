@@ -357,6 +357,12 @@ ContextProgress detail::SessionImpl::complete_context() {
     const auto spill_pages = migration.spill_page_groups();
     try {
         migration.publish();
+        // Demotions just made checkpoint bytes Host-resident; attempt their saves now rather
+        // than waiting for the next throttled poll sweep. The archive's write budget bounds
+        // the staging work, so this cannot stall the retire path (2026-10-30 wedge rules).
+        if (p.archive_ && p.archive_->enabled() &&
+            operation.kind() == ContextOperationKind::Demote)
+            p.archive_flush();
         if (operation.preparing_resources) {
             auto targets                 = migration.take_reservation();
             operation.previous_transfers = std::move(result.transfers);

@@ -281,7 +281,7 @@ std::optional<SessionEvent> SessionImpl::poll() {
             }
             // Retry declined archive saves at a throttled rate; the archive's write budget
             // refills over time, so an idle engine eventually drains its pending registrations.
-            if (archive_dirty && (archive_polls++ & 0x3F) == 0) archive_flush();
+            if (archive_dirty && (archive_polls++ & 0x7) == 0) archive_flush();
             auto event = executor().poll();
             if (!event) return {};
             if (const auto* failed = std::get_if<runtime::ExecutionFailed>(&*event))

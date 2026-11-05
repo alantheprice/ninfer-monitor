@@ -139,19 +139,40 @@ void SessionImpl::archive_flush() {
         }
         const auto& record = checkpoints.at(handle);
         // The save commits only from a fully Host-resident checkpoint; device-resident pages
-        // have no stable CPU bytes to stage yet. A later flush retries after a demotion.
-        bool resident = directory.states().host_resident(record.snapshot.continuation().image);
-        const auto pool_count = directory.pool_count();
-        for (std::uint16_t pool = 0; pool < pool_count && resident; ++pool) {
-            const auto& prefix = record.snapshot.prefix(pool);
-            if (!prefix.valid() || prefix.frontier() == 0) continue;
-            const auto pages = context::kv_pages_for_frontier(prefix.frontier());
-            auto& histories  = directory.pool(pool).histories();
-            resident         = histories.mapped_pages(prefix.history()) >= pages;
-            for (std::uint32_t i = 0; i < pages && resident; ++i) {
-                const auto page = histories.logical_page(prefix.history(), i);
-                resident        = directory.pool(pool).pages().host_replica_current(page);
+        // have no stable CPU bytes to stage yet. A page that lost both replicas can never
+        // stage again - abandon the save instead of retrying until retirement.
+        const auto scan = [&](const context::HistoryDirectory& histories,
+                              const context::PageDirectory& page_directory,
+                              const context::HistoryPrefix& prefix, bool& resident,
+                              bool& abandonable) {
+            const std::uint32_t count = context::kv_pages_for_frontier(prefix.frontier());
+            if (histories.mapped_pages(prefix.history()) < count) {
+                abandonable = true;
+                return;
             }
+            for (std::uint32_t i = 0; i < count; ++i) {
+                const auto page = histories.logical_page(prefix.history(), i);
+                if (page_directory.host_replica_current(page)) continue;
+                resident = false;
+                if (!page_directory.valid(page) || !page_directory.device_resident(page)) {
+                    abandonable = true;
+                    return;
+                }
+            }
+        };
+        bool resident    = directory.states().host_resident(record.snapshot.continuation().image);
+        bool abandonable = false;
+        const auto pool_count = directory.pool_count();
+        for (std::uint16_t pool = 0; pool < pool_count && !abandonable; ++pool) {
+            const auto& prefix = record.snapshot.prefix(pool);
+            if (prefix.valid() && prefix.frontier() != 0)
+                scan(directory.pool(pool).histories(), directory.pool(pool).pages(), prefix,
+                     resident, abandonable);
+        }
+        if (abandonable) {
+            archive_->discard_checkpoint(id);
+            entry = archive_ids.erase(entry);
+            continue;
         }
         if (!resident) {
             work_remains = true;

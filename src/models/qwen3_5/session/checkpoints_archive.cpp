@@ -136,22 +136,39 @@ void SessionImpl::archive_flush() {
         }
         const auto& record = checkpoint(handle);
         // The save commits only from a fully Host-resident checkpoint; device-resident pages
-        // have no stable CPU bytes to stage yet. A later flush retries after a demotion.
-        const auto& text_prefix  = record.text_prefix();
-        const std::uint32_t pages = context::kv_pages_for_frontier(record.frontier());
-        bool resident = state_store->host_resident(record.continuation().image) &&
-                        text_kv_histories->mapped_pages(text_prefix.history()) >= pages;
-        for (std::uint32_t i = 0; i < pages && resident; ++i) {
-            const auto page = text_kv_histories->logical_page(text_prefix.history(), i);
-            resident = text_kv_pages->host_replica_current(page);
-        }
-        if (const auto* backend = record.backend_prefix(); resident && backend) {
-            const auto backend_pages = context::kv_pages_for_frontier(record.backend_frontier());
-            resident = backend_kv_histories->mapped_pages(backend->history()) >= backend_pages;
-            for (std::uint32_t i = 0; i < backend_pages && resident; ++i) {
-                const auto page = backend_kv_histories->logical_page(backend->history(), i);
-                resident = backend_kv_pages->host_replica_current(page);
+        // have no stable CPU bytes to stage yet. A page that lost both replicas can never
+        // stage again - abandon the save instead of retrying until retirement.
+        const auto scan = [&](const context::HistoryDirectory& histories,
+                              const context::PageDirectory& page_directory,
+                              const context::HistoryPrefix& prefix, bool& resident,
+                              bool& abandonable) {
+            const std::uint32_t count = context::kv_pages_for_frontier(prefix.frontier());
+            if (histories.mapped_pages(prefix.history()) < count) {
+                abandonable = true;
+                return;
             }
+            for (std::uint32_t i = 0; i < count; ++i) {
+                const auto page = histories.logical_page(prefix.history(), i);
+                if (page_directory.host_replica_current(page)) continue;
+                resident = false;
+                if (!page_directory.valid(page) || !page_directory.device_resident(page)) {
+                    abandonable = true;
+                    return;
+                }
+            }
+        };
+        const auto& text_prefix   = record.text_prefix();
+        bool resident             = state_store->host_resident(record.continuation().image);
+        bool abandonable          = false;
+        scan(*text_kv_histories, *text_kv_pages, text_prefix, resident, abandonable);
+        if (!abandonable) {
+            if (const auto* backend = record.backend_prefix())
+                scan(*backend_kv_histories, *backend_kv_pages, *backend, resident, abandonable);
+        }
+        if (abandonable) {
+            archive_->discard_checkpoint(id);
+            entry = archive_ids.erase(entry);
+            continue;
         }
         if (!resident) {
             work_remains = true;
@@ -159,7 +176,11 @@ void SessionImpl::archive_flush() {
             continue;
         }
         std::vector<context::ContextArchiveLink::StagedPage> staged;
-        staged.reserve(2 * pages + 2);
+        staged.reserve(2 * context::kv_pages_for_frontier(record.frontier()) +
+                       (record.backend_prefix()
+                            ? 2 * context::kv_pages_for_frontier(record.backend_frontier())
+                            : 0) +
+                       2);
         const auto& digests = record.snapshot.identity().digests;
         const auto stage    = [&](const context::HistoryDirectory& histories,
                                const context::PageDirectory& page_directory,
