@@ -382,6 +382,28 @@ void Session::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
 PhysicalUsageSnapshot Session::physical_usage() const noexcept { return impl_->physical_usage(); }
 
+bool Session::archive_enabled() const noexcept {
+    return impl_->archive_ && impl_->archive_->enabled();
+}
+
+ninfer::DiskArchiveStats Session::archive_stats() const { return impl_->archive_->stats(); }
+
+std::optional<context::ContextArchiveLink::Candidate>
+Session::archive_find(std::uint32_t min_frontier, std::uint32_t max_frontier,
+                      const qwen::PrefixShortlistDigests& digests) const {
+    return impl_->archive_find(min_frontier, max_frontier, digests);
+}
+
+std::shared_ptr<ninfer::DiskContextArchive::Prefetch>
+Session::archive_prefetch(const context::ContextArchiveLink::Candidate& candidate) const {
+    return impl_->archive_prefetch(candidate);
+}
+
+void Session::attach_archive_host_arena(ninfer::ConstMemorySpan arena) {
+    impl_->archive_host_arena = arena;
+    impl_->archive_dirty      = true;
+}
+
 std::optional<SequenceHandle> Session::prefill_continuation() const {
     const auto owner = impl_->vision_window.owner();
     if (owner && impl_->valid_sequence(owner->sequence)) return owner->sequence;
@@ -410,6 +432,34 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
       causal_scoring(plan.causal_scoring) {
     if (!definition || !plan.profile || plan.context.pools.empty())
         throw std::invalid_argument("Session preparation is incomplete");
+    if (!plan.context_cache.context_disk_archive.empty()) {
+        context::ContextArchiveLink::Options archive;
+        archive.directory              = plan.context_cache.context_disk_archive;
+        archive.capacity_bytes         = plan.context_cache.context_disk_archive_capacity_bytes;
+        archive.write_bytes_per_second =
+            plan.context_cache.context_disk_archive_write_bytes_per_second;
+        archive.staging_bytes = plan.context_cache.context_disk_archive_staging_bytes;
+        // Page bytes: one full KV record per pool, taken from the directory layouts.
+        archive.page_bytes = {directory.pool(0).pages().layout().parts.front().record.bytes,
+                              directory.pool_count() > 1
+                                  ? directory.pool(1).pages().layout().parts.front().record.bytes
+                                  : 0};
+        // Model, layout and image scheme identity; digest keys are stable across restarts only
+        // when the archive refuses bytes from a different semantic context.
+        archive.signature = std::hash<std::string_view>{}(
+                                std::string_view(reinterpret_cast<const char*>(
+                                                     definition->artifact_id().data()),
+                                                 definition->artifact_id().size())) ^
+                            kArchiveIdentityScheme ^
+                            (static_cast<std::uint64_t>(archive.page_bytes[0]) << 24) ^
+                            (static_cast<std::uint64_t>(archive.page_bytes[1]) << 40);
+        try {
+            archive_ = std::make_unique<context::ContextArchiveLink>(std::move(archive));
+        } catch (const std::exception& error) {
+            throw std::runtime_error(std::string("context disk archive is unusable: ") +
+                                     error.what());
+        }
+    }
     checkpoints.configure(Checkpoints::capacity_for_metadata(directory.metadata_budget().limit()),
                           directory.metadata_budget(), &recovery_index);
     if (!causal_scoring) {
@@ -422,6 +472,11 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> definition_in, S
 
 SessionImpl::~SessionImpl() {
     if (executor_) fail_all_cleanup();
+    if (archive_) {
+        try {
+            archive_->flush_all();
+        } catch (...) {}
+    }
 }
 
 void SessionImpl::fail_all_cleanup() noexcept {
@@ -446,6 +501,11 @@ void SessionImpl::fail_all_cleanup() noexcept {
     release_ticket.reset();
     after_releases.reset();
     scoring.reset();
+    if (archive_) {
+        for (const auto& [slot, id] : archive_ids) archive_->discard_checkpoint(id);
+        archive_ids.clear();
+        archive_dirty = false;
+    }
     for (std::uint32_t l = 0; l < max_concurrency; ++l)
         if (requests[l].lifecycle != Lifecycle::Empty) clear_lane(sequences[l], requests[l]);
 }

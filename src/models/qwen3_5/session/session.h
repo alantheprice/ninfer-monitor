@@ -2,9 +2,11 @@
 
 #include "models/common/context/checkpoint_store.h"
 #include "models/common/context/directory.h"
+#include "models/common/context/disk_archive_link.h"
 #include "models/common/context/recovery.h"
 #include "models/common/context/release_inventory.h"
 #include "models/common/qwen/frontend/prepared_prompt.h"
+#include "models/common/qwen/prefix_identity.h"
 #include "models/qwen3_5/definition.h"
 #include "models/qwen3_5/planning.h"
 #include "models/qwen3_5/work.h"
@@ -443,6 +445,17 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     void fail_all_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+    // NVMe context archive (fork's disk tier): candidates for resume policy and save/IO stats.
+    [[nodiscard]] bool archive_enabled() const noexcept;
+    [[nodiscard]] ninfer::DiskArchiveStats archive_stats() const;
+    [[nodiscard]] std::optional<context::ContextArchiveLink::Candidate>
+    archive_find(std::uint32_t min_frontier, std::uint32_t max_frontier,
+                 const qwen::PrefixShortlistDigests& digests) const;
+    [[nodiscard]] std::shared_ptr<ninfer::DiskContextArchive::Prefetch>
+    archive_prefetch(const context::ContextArchiveLink::Candidate& candidate) const;
+    // Attached once after startup by the owning rank program; the Host context arena turns
+    // archive staging bindings into CPU addresses.
+    void attach_archive_host_arena(ninfer::ConstMemorySpan arena);
 private:
     std::unique_ptr<detail::SessionImpl> impl_;
 };

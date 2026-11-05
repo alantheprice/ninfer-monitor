@@ -278,6 +278,7 @@ void SessionImpl::publish_capture(CaptureOperation& tx, context::ContextTransact
                                                     .key      = group.key,
                                                     .origin   = group.origin,
                                                     .evidence = group.evidence});
+    for (const auto& [handle, role] : tx.points) archive_register(handle, checkpoint(handle));
     const auto writer =
         context::adopt_capture_writer(*state_store, source_state, migration.state_destination());
     state.continuation.image = writer.image;

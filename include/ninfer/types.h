@@ -128,6 +128,19 @@ struct ContextCacheOptions {
     std::optional<std::size_t> host_capacity_bytes;
     // Target spacing for optional intermediate prefill checkpoints.
     std::uint32_t checkpoint_interval = 8192;
+    // NVMe tier below the Host context tier: checkpoints whose pages reached the Host tier are
+    // archived under digest-derived keys, so a restarted engine can rediscover earlier
+    // conversations. Empty disables the tier.
+    std::filesystem::path context_disk_archive;
+    // Archive capacity in bytes; required when context_disk_archive is set.
+    std::uint64_t context_disk_archive_capacity_bytes = 0;
+    // Sustained archive write budget in bytes per second; 0 is unlimited. Saves beyond the
+    // budget are skipped and retried, never queued.
+    std::uint64_t context_disk_archive_write_bytes_per_second = 0;
+    // Save staging window in bytes; 0 selects a 512 MiB default. One save stages every page
+    // missing from the archive at once, so this must cover one checkpoint's first save
+    // (page_bytes × pages of the largest expected checkpoint).
+    std::uint64_t context_disk_archive_staging_bytes = 0;
 };
 
 struct ContextCostOptions {

@@ -49,6 +49,21 @@ constexpr FieldSpec kFields[] = {
     {Field::HostCapacity, "context_cache.host_capacity", "--host-cache-capacity", "",
      "SIZE|default", "Shared Host State/KV and in-flight capacity; 0B disables backing.",
      Scope::Generation, ConfigurationUnit::Bytes},
+    {Field::DiskArchive, "context_cache.disk_archive", "--context-disk-archive", "", "DIR",
+     "NVMe archive directory backing the Host context tier; empty disables the tier.",
+     Scope::Generation},
+    {Field::DiskArchiveCapacity, "context_cache.disk_archive_capacity",
+     "--context-disk-archive-capacity", "", "SIZE",
+     "Context archive capacity; required with disk_archive.", Scope::Generation,
+     ConfigurationUnit::Bytes},
+    {Field::DiskArchiveRate, "context_cache.disk_archive_rate",
+     "--context-disk-archive-rate", "", "RATE",
+     "Sustained archive write budget per second; skipped saves retry later. 0B is unlimited.",
+     Scope::Generation, ConfigurationUnit::Bytes},
+    {Field::DiskArchiveStaging, "context_cache.disk_archive_staging",
+     "--context-disk-archive-staging", "", "SIZE",
+     "Archive save staging window; 0B selects 512MiB. Must cover one checkpoint's first save.",
+     Scope::Generation, ConfigurationUnit::Bytes},
     {Field::CostPresets, "context_cache.cost_presets", "--context-cost-presets", "", "FILE",
      "Context-cost JSON overrides; empty uses built-in defaults."},
     {Field::SpecBackend, "speculative.backend", "--spec", "", "none|mtp|dflash|dflash2",
@@ -361,6 +376,9 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     case Field::HostCapacity:
     case Field::MediaCache:
     case Field::MemoryHeadroom:
+    case Field::DiskArchiveCapacity:
+    case Field::DiskArchiveRate:
+    case Field::DiskArchiveStaging:
         return quantity(value, true, false);
     case Field::MediaLive:
     case Field::VisionMemoryBudget:
@@ -410,6 +428,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     case Field::ModelCard:
     case Field::RequestJsonl:
     case Field::Regex:
+    case Field::DiskArchive:
         return text(value);
     case Field::StopIds: {
         std::vector<std::uint32_t> result;

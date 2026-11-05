@@ -413,6 +413,18 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         case Field::HostCapacity:
             engine.context_cache.host_capacity_bytes = u64();
             break;
+        case Field::DiskArchive:
+            engine.context_cache.context_disk_archive = path();
+            break;
+        case Field::DiskArchiveCapacity:
+            engine.context_cache.context_disk_archive_capacity_bytes = u64();
+            break;
+        case Field::DiskArchiveRate:
+            engine.context_cache.context_disk_archive_write_bytes_per_second = u64();
+            break;
+        case Field::DiskArchiveStaging:
+            engine.context_cache.context_disk_archive_staging_bytes = u64();
+            break;
         case Field::CostPresets:
             engine.context_cost.preset_path = path();
             break;

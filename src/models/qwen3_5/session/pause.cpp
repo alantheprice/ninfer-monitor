@@ -54,6 +54,7 @@ std::optional<CheckpointHandle> SessionImpl::detach_checkpoint(SequenceState& st
     state.kv.reset();
     state.continuation.image = {};
     state.pending_write      = {};
+    archive_register(handle, checkpoint(handle));
     return handle;
 }
 

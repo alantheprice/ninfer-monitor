@@ -66,6 +66,16 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
     if (!options.context_cache.checkpoint_interval)
         throw std::invalid_argument("checkpoint interval must be positive");
+    if (!options.context_cache.context_disk_archive.empty()) {
+        if (options.context_cache.context_disk_archive_capacity_bytes == 0) {
+            throw std::invalid_argument(
+                "context disk archive capacity must be positive when the archive is enabled");
+        }
+        if (!options.context_cache.enabled) {
+            throw std::invalid_argument(
+                "context disk archive requires the context cache to be enabled");
+        }
+    }
     return options;
 }
 

@@ -31,6 +31,11 @@ public:
         return rewrite_execution_frontiers_;
     }
 
+    // Fixed-width disk image for the context archive's identity blob. assign_image accepts only
+    // byte-exact images of the same schema and throws on anything else.
+    [[nodiscard]] std::vector<std::byte> image() const;
+    void assign_image(std::span<const std::byte> bytes);
+
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
     [[nodiscard]] bool equals(const ResidentPrefixIdentity& other) const;
     [[nodiscard]] bool prefix_equals(const ResidentPrefixIdentity& other, std::size_t count) const;
@@ -65,6 +70,11 @@ public:
     }
 
     [[nodiscard]] std::array<std::uint64_t, 2> at(std::size_t frontier) const;
+
+    // Fixed-width disk image for the context archive's identity blob; see
+    // ResidentPrefixIdentity::image().
+    [[nodiscard]] std::vector<std::byte> image() const;
+    void assign_image(std::span<const std::byte> bytes);
 
 private:
     std::vector<std::array<std::uint64_t, 2>> digests_;

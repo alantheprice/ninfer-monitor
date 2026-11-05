@@ -58,6 +58,10 @@ RankMemoryUsage RankProgram::observe_resources() const { return impl_->observe_r
 
 void RankProgram::reset_measurement_peaks() noexcept { impl_->reset_measurement_peaks(); }
 
+ConstMemorySpan RankProgram::host_context_span() const {
+    return impl_->resources.host_context.span();
+}
+
 std::unique_ptr<RankProgram> create_rank_program(const execution::Parameters& parameters,
                                                  SequencePlan&& plan, DeviceContext& device,
                                                  const StartupObserver& observer,

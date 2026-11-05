@@ -104,6 +104,13 @@ prepare_program(const Setup& setup, RankModelInstance<typename Setup::Types>& in
                                                    device, options.startup_observer,
                                                    models::GraphPreparationMode::Capture);
             prepared_session.emplace(prepare_session(setup.definition(), std::move(control_plan)));
+            if constexpr (requires { prepared_session->attach_archive_host_arena(
+                              instance.program->host_context_span()); }) {
+                if (prepared_session->archive_enabled()) {
+                    prepared_session->attach_archive_host_arena(
+                        instance.program->host_context_span());
+                }
+            }
             device.synchronize();
             ready = device_memory_snapshot(device.device());
             if (budget.fits(*ready)) {

@@ -33,6 +33,9 @@ public:
     [[nodiscard]] RankMemoryUsage observe_resources() const;
     [[nodiscard]] std::optional<GraphMemorySummary> graph_memory_observation() const;
     void reset_measurement_peaks() noexcept;
+    // The pinned Host context arena, address-stable for the process lifetime. The session's
+    // context archive resolves Host record bindings against this base.
+    [[nodiscard]] ninfer::ConstMemorySpan host_context_span() const;
 
 private:
     explicit RankProgram(std::unique_ptr<detail::RankProgramImpl>);

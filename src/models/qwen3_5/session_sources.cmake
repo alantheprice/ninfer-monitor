@@ -7,6 +7,7 @@ target_sources(ninfer_model_control PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/session/scoring.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/source.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/checkpoints.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/session/checkpoints_archive.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/binding.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/capture.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/session/pause.cpp"

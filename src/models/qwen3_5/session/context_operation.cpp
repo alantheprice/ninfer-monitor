@@ -129,6 +129,7 @@ void SessionImpl::retire_context(runtime::DeviceRetired retired) {
         out.complete = true;
     } else {
         transaction.publish();
+        archive_flush();
         if (auto* maintenance = std::get_if<MaintenanceOperation>(&operation.action);
             maintenance && (maintenance->demotion || maintenance->pause_sequence)) {
             auto targets      = transaction.take_reservation();

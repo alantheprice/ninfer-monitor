@@ -1,3 +1,7 @@
+ninfer_add_test(ninfer_disk_archive_link_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/context/test_disk_archive_link.cpp"
+  LIBRARIES ninfer_model_control ninfer_core)
+
 ninfer_add_test(ninfer_qwen_frontend_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/qwen/test_frontend.cpp"
   NEEDS_SOURCE_DIR

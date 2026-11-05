@@ -2,6 +2,7 @@
 
 #include "models/qwen3_5/session/session.h"
 #include "models/qwen3_5/state/continuation.h"
+#include "models/common/context/disk_archive_link.h"
 #include "models/common/context/snapshot.h"
 #include "models/common/context/work.h"
 #include "models/common/qwen/prefix_identity.h"
@@ -13,12 +14,16 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
 
 class SessionImpl;
 struct PendingContext;
+
+// Archive identity scheme; bump when the archived checkpoint image payload changes.
+inline constexpr std::uint64_t kArchiveIdentityScheme = 1;
 
 struct PreparedCaptureBacking {
     qwen::PrefixShortlistDigests digests;
@@ -430,6 +435,16 @@ public:
     std::unique_ptr<PendingContext> context_operation_;
     std::optional<ContextAssessment> pending_maintenance_;
     std::optional<SequenceHandle> normalizing_pause_;
+    std::unique_ptr<context::ContextArchiveLink> archive_;
+    // Checkpoint slot -> pending archive registration. Entries exist only while a save is
+    // unfinished; commit, retirement or replacement removes them.
+    std::unordered_map<std::uint32_t, std::uint64_t> archive_ids;
+    std::uint64_t next_archive_id = 1;
+    std::uint64_t archive_polls   = 0;
+    // Attached by the rank program after startup: the Host context arena, whose base turns
+    // ContextRecordBinding offsets into CPU addresses.
+    ConstMemorySpan archive_host_arena;
+    bool archive_dirty = false;
 
     struct PauseReservation {
         SequenceHandle sequence;
@@ -550,6 +565,16 @@ public:
     [[nodiscard]] bool prepare_backup(context::ContextTransaction&, CheckpointState&,
                                       bool shared_device, bool& preserve_state_device,
                                       context::ContextReservation&, const context::HostDemandIds&);
+    // NVMe archive seam: registers published checkpoints, stages saves once their pages are
+    // Host-resident, and exposes archive candidates to the resume policy.
+    void archive_register(CheckpointHandle handle, const CheckpointState& record);
+    void archive_discard(CheckpointHandle handle) noexcept;
+    void archive_flush();
+    [[nodiscard]] std::optional<context::ContextArchiveLink::Candidate>
+    archive_find(std::uint32_t min_frontier, std::uint32_t max_frontier,
+                 const qwen::PrefixShortlistDigests& digests) const;
+    [[nodiscard]] std::shared_ptr<ninfer::DiskContextArchive::Prefetch>
+    archive_prefetch(const context::ContextArchiveLink::Candidate& candidate) const;
     void install_binding(BindOperation&);
     void complete_binding(BindOperation&, context::ContextTransaction&, ContextProgress&);
     void publish_capture(CaptureOperation&, context::ContextTransaction&,

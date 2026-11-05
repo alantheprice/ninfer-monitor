@@ -1,6 +1,7 @@
 #include "models/common/qwen/prefix_identity.h"
 #include <algorithm>
 #include <bit>
+#include <cstring>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
@@ -377,6 +378,160 @@ void PrefixShortlistDigests::reserve(std::size_t tokens) {
         throw std::overflow_error("prefix shortlist capacity overflows size_t");
     }
     digests_.reserve(tokens + 1U);
+}
+
+namespace {
+
+constexpr std::uint32_t kIdentityImageSchema   = 1;
+constexpr std::uint64_t kIdentityImageDomain   = 0x6e696e6665722d69ULL; // "ninfer-i"
+constexpr std::uint64_t kDigestsImageDomain    = 0x6e696e6665722d64ULL; // "ninfer-d"
+
+void put_u32(std::vector<std::byte>& out, std::uint32_t value) {
+    for (std::size_t i = 0; i < 4; ++i) {
+        out.push_back(static_cast<std::byte>(value >> (8U * i)));
+    }
+}
+
+void put_u64(std::vector<std::byte>& out, std::uint64_t value) {
+    for (std::size_t i = 0; i < 8; ++i) {
+        out.push_back(static_cast<std::byte>(value >> (8U * i)));
+    }
+}
+
+std::uint32_t get_u32(std::span<const std::byte>& in) {
+    if (in.size() < 4) throw std::invalid_argument("identity image is truncated");
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < 4; ++i) {
+        value |= static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(in[i])) << (8U * i);
+    }
+    in = in.subspan(4);
+    return value;
+}
+
+std::uint64_t get_u64(std::span<const std::byte>& in) {
+    if (in.size() < 8) throw std::invalid_argument("identity image is truncated");
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < 8; ++i) {
+        value |= static_cast<std::uint64_t>(std::to_integer<std::uint8_t>(in[i])) << (8U * i);
+    }
+    in = in.subspan(8);
+    return value;
+}
+
+std::uint8_t get_u8(std::span<const std::byte>& in) {
+    if (in.empty()) throw std::invalid_argument("identity image is truncated");
+    const auto value = std::to_integer<std::uint8_t>(in.front());
+    in               = in.subspan(1);
+    return value;
+}
+
+} // namespace
+
+std::vector<std::byte> ResidentPrefixIdentity::image() const {
+    std::vector<std::byte> out;
+    out.reserve(96 + size() * 17 + vision_items_.size() * 96);
+    put_u32(out, kIdentityImageSchema);
+    put_u32(out, static_cast<std::uint32_t>(size()));
+    put_u32(out, static_cast<std::uint32_t>(vision_items_.size()));
+    put_u32(out, static_cast<std::uint32_t>(rewrite_execution_frontiers_.size()));
+    put_u32(out, static_cast<std::uint32_t>(regular_prefix_));
+    for (const auto origin : position_origins_) put_u32(out, static_cast<std::uint32_t>(origin));
+    for (std::size_t i = 0; i < size(); ++i) {
+        out.push_back(static_cast<std::byte>(token_types_[i]));
+        for (auto& axis : positions_) put_u32(out, static_cast<std::uint32_t>(axis[i]));
+    }
+    for (const auto& item : vision_items_) {
+        put_u32(out, static_cast<std::uint32_t>(item.modality));
+        put_u32(out, static_cast<std::uint32_t>(item.grid.temporal));
+        put_u32(out, static_cast<std::uint32_t>(item.grid.height));
+        put_u32(out, static_cast<std::uint32_t>(item.grid.width));
+        put_u64(out, item.patch_begin);
+        put_u64(out, item.patch_count);
+        for (const auto byte : item.content_digest) out.push_back(static_cast<std::byte>(byte));
+        put_u32(out, static_cast<std::uint32_t>(item.timestamps.size()));
+        for (const double timestamp : item.timestamps) {
+            put_u64(out, std::bit_cast<std::uint64_t>(timestamp));
+        }
+        put_u32(out, static_cast<std::uint32_t>(item.token_spans.size()));
+        for (const auto& span : item.token_spans) {
+            put_u64(out, span.begin);
+            put_u64(out, span.count);
+        }
+    }
+    for (const auto frontier : rewrite_execution_frontiers_) put_u32(out, frontier);
+    return out;
+}
+
+void ResidentPrefixIdentity::assign_image(std::span<const std::byte> bytes) {
+    std::span<const std::byte> in = bytes;
+    if (get_u32(in) != kIdentityImageSchema) {
+        throw std::invalid_argument("identity image schema differs");
+    }
+    const auto tokens  = get_u32(in);
+    const auto items   = get_u32(in);
+    const auto splits  = get_u32(in);
+    const auto regular = get_u32(in);
+    for (auto& origin : position_origins_) origin = static_cast<std::int32_t>(get_u32(in));
+    token_types_.resize(tokens);
+    for (auto& axis : positions_) axis.resize(tokens);
+    for (std::size_t i = 0; i < tokens; ++i) {
+        token_types_[i] = get_u8(in);
+        for (auto& axis : positions_) axis[i] = static_cast<std::int32_t>(get_u32(in));
+    }
+    vision_items_.resize(items);
+    for (auto& item : vision_items_) {
+        item.modality             = static_cast<models::frontend::Modality>(get_u32(in));
+        item.grid.temporal        = static_cast<std::int32_t>(get_u32(in));
+        item.grid.height          = static_cast<std::int32_t>(get_u32(in));
+        item.grid.width           = static_cast<std::int32_t>(get_u32(in));
+        item.patch_begin          = get_u64(in);
+        item.patch_count          = get_u64(in);
+        for (auto& byte : item.content_digest) byte = get_u8(in);
+        item.timestamps.resize(get_u32(in));
+        for (auto& timestamp : item.timestamps) {
+            timestamp = std::bit_cast<double>(get_u64(in));
+        }
+        item.token_spans.resize(get_u32(in));
+        for (auto& span : item.token_spans) {
+            span.begin = get_u64(in);
+            span.count = get_u64(in);
+        }
+    }
+    rewrite_execution_frontiers_.resize(splits);
+    for (auto& frontier : rewrite_execution_frontiers_) frontier = get_u32(in);
+    regular_prefix_ = std::min<std::size_t>(regular, tokens);
+    if (!in.empty()) throw std::invalid_argument("identity image has trailing bytes");
+}
+
+std::vector<std::byte> PrefixShortlistDigests::image() const {
+    std::vector<std::byte> out;
+    out.reserve(16 + (digests_.size()) * 16);
+    put_u32(out, kIdentityImageSchema);
+    put_u32(out, 0);
+    put_u64(out, kDigestsImageDomain ^ static_cast<std::uint64_t>(digests_.size()));
+    for (const auto& digest : digests_) {
+        put_u64(out, digest[0]);
+        put_u64(out, digest[1]);
+    }
+    return out;
+}
+
+void PrefixShortlistDigests::assign_image(std::span<const std::byte> bytes) {
+    std::span<const std::byte> in = bytes;
+    if (get_u32(in) != kIdentityImageSchema) {
+        throw std::invalid_argument("digest image schema differs");
+    }
+    (void)get_u32(in);
+    const auto domain = get_u64(in);
+    const std::size_t entries = in.size() / 16;
+    if (in.size() % 16 || domain != (kDigestsImageDomain ^ static_cast<std::uint64_t>(entries))) {
+        throw std::invalid_argument("digest image size differs");
+    }
+    digests_.clear();
+    digests_.reserve(entries);
+    for (std::size_t i = 0; i < entries; ++i) {
+        digests_.push_back({get_u64(in), get_u64(in)});
+    }
 }
 
 void PrefixShortlistDigests::clear() noexcept { digests_.clear(); }
