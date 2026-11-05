@@ -15,6 +15,7 @@ std::uint32_t count(std::uint64_t value) {
 SessionPlan plan_session(const ExecutionPlan& execution) {
     SessionPlan plan{execution.shape};
     plan.checkpoint_interval = execution.checkpoint_interval;
+    plan.context_cache       = execution.context_cache;
     const auto rank          = execution.profile->local.rank;
     const auto& image        = execution.persistent.state.images;
     const auto capacity      = execution.capacity.device_bytes + execution.host_context_bytes;

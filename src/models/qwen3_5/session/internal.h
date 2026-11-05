@@ -567,6 +567,13 @@ public:
                                       context::ContextReservation&, const context::HostDemandIds&);
     // NVMe archive seam: registers published checkpoints, stages saves once their pages are
     // Host-resident, and exposes archive candidates to the resume policy.
+    [[nodiscard]] bool archive_enabled() const noexcept {
+        return archive_ && archive_->enabled();
+    }
+    void attach_archive_host_arena(ninfer::ConstMemorySpan arena) {
+        archive_host_arena = arena;
+        archive_dirty      = true;
+    }
     void archive_register(CheckpointHandle handle, const CheckpointState& record);
     void archive_discard(CheckpointHandle handle) noexcept;
     void archive_flush();

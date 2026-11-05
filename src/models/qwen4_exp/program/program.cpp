@@ -234,6 +234,10 @@ RankMemoryBudget RankProgram::resource_budget() const {
 
 RankMemoryUsage RankProgram::observe_resources() const { return impl_->observe_resources(); }
 
+ConstMemorySpan RankProgram::host_context_span() const {
+    return impl_->resources.host_context_span();
+}
+
 MemorySpan RankProgram::input_storage() {
     return impl_->resources.vision ? impl_->resources.vision->staging() : MemorySpan{};
 }

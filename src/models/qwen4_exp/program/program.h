@@ -41,6 +41,10 @@ public:
     [[nodiscard]] std::optional<runtime::ExecutionEvent<ExecutionTypes>> poll();
     void drain();
     [[nodiscard]] RankMemoryUsage observe_resources() const;
+
+    // Host context arena backing checkpoint page replicas; consumed by the session's
+    // disk-archive seam to resolve staging bindings into CPU addresses.
+    [[nodiscard]] ConstMemorySpan host_context_span() const;
     [[nodiscard]] std::optional<GraphMemorySummary> graph_memory_observation() const;
     [[nodiscard]] RankMemoryBudget resource_budget() const;
     void reset_measurement_peaks() noexcept;

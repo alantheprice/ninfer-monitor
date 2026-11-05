@@ -1,5 +1,6 @@
 #include "models/qwen3_5/session/internal.h"
 
+#include <cstdio>
 #include <stdexcept>
 #include <utility>
 
@@ -57,6 +58,14 @@ PreparedSession::PreparedSession(std::unique_ptr<detail::SessionImpl> impl)
 PreparedSession::PreparedSession(PreparedSession&&) noexcept            = default;
 PreparedSession& PreparedSession::operator=(PreparedSession&&) noexcept = default;
 PreparedSession::~PreparedSession()                                     = default;
+
+bool PreparedSession::archive_enabled() const noexcept {
+    return impl_ && impl_->archive_enabled();
+}
+
+void PreparedSession::attach_archive_host_arena(ninfer::ConstMemorySpan arena) {
+    if (impl_) impl_->attach_archive_host_arena(arena);
+}
 
 PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definition,
                                 SessionPlan plan) {

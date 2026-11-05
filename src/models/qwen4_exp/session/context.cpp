@@ -424,6 +424,7 @@ ContextProgress detail::SessionImpl::complete_context() {
                 p.checkpoints.publish(record,
                                       {*tx->snapshot, role, s.captures[s.next_capture].origin,
                                        s.captures[s.next_capture].evidence});
+                p.archive_register(record, p.checkpoints.at(record));
                 result.captured_checkpoints.push_back(record);
             }
             const auto writer    = context::adopt_capture_writer(states, s.continuation.image,

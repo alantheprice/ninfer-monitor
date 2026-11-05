@@ -42,6 +42,7 @@ std::optional<CheckpointHandle> SessionImpl::detach(Sequence& s, runtime::Checkp
     }
     s.continuation.image = {};
     for (auto& history : s.histories) history.reset();
+    archive_register(record, checkpoints.at(record));
     return record;
 }
 

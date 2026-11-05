@@ -1,6 +1,8 @@
 #include "models/qwen4_exp/session/internal.h"
 
 #include <algorithm>
+#include <functional>
+#include <string_view>
 
 namespace ninfer::models::qwen4_exp::detail {
 
@@ -18,6 +20,34 @@ SessionImpl::SessionImpl(std::shared_ptr<const ModelDefinition> model, SessionPl
     releases.reserve(shape.max_concurrency);
     for (std::uint16_t i = 0; i < pool_count(); ++i)
         pools.push_back({{i}, i == 0 ? "main" : "mtp"});
+    if (!plan.context_cache.context_disk_archive.empty()) {
+        context::ContextArchiveLink::Options archive;
+        archive.directory              = plan.context_cache.context_disk_archive;
+        archive.capacity_bytes         = plan.context_cache.context_disk_archive_capacity_bytes;
+        archive.write_bytes_per_second =
+            plan.context_cache.context_disk_archive_write_bytes_per_second;
+        archive.staging_bytes = plan.context_cache.context_disk_archive_staging_bytes;
+        // Page bytes: one full KV record per pool, taken from the directory layouts.
+        archive.page_bytes = {directory.pool(0).pages().layout().parts.front().record.bytes,
+                              directory.pool_count() > 1
+                                  ? directory.pool(1).pages().layout().parts.front().record.bytes
+                                  : 0};
+        // Model, layout and image scheme identity; digest keys are stable across restarts only
+        // when the archive refuses bytes from a different semantic context.
+        archive.signature = std::hash<std::string_view>{}(
+                                std::string_view(reinterpret_cast<const char*>(
+                                                     definition->artifact_id().data()),
+                                                 definition->artifact_id().size())) ^
+                            kArchiveIdentityScheme ^
+                            (static_cast<std::uint64_t>(archive.page_bytes[0]) << 24) ^
+                            (static_cast<std::uint64_t>(archive.page_bytes[1]) << 40);
+        try {
+            archive_ = std::make_unique<context::ContextArchiveLink>(std::move(archive));
+        } catch (const std::exception& error) {
+            throw std::runtime_error(std::string("context disk archive is unusable: ") +
+                                     error.what());
+        }
+    }
 }
 
 SessionImpl::~SessionImpl() { cleanup(); }
@@ -314,6 +344,14 @@ PreparedSession::~PreparedSession()                                     = defaul
 PreparedSession::PreparedSession(PreparedSession&&) noexcept            = default;
 PreparedSession& PreparedSession::operator=(PreparedSession&&) noexcept = default;
 
+bool PreparedSession::archive_enabled() const noexcept {
+    return impl_ && impl_->archive_enabled();
+}
+
+void PreparedSession::attach_archive_host_arena(ninfer::ConstMemorySpan arena) {
+    if (impl_) impl_->attach_archive_host_arena(arena);
+}
+
 PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definition,
                                 SessionPlan plan) {
     return PreparedSession(
@@ -335,6 +373,28 @@ std::span<const runtime::KvPoolDescriptor> Session::kv_pools() const noexcept {
 }
 
 PhysicalUsageSnapshot Session::physical_usage() const noexcept { return impl_->usage(); }
+
+bool Session::archive_enabled() const noexcept {
+    return impl_->archive_ && impl_->archive_->enabled();
+}
+
+ninfer::DiskArchiveStats Session::archive_stats() const { return impl_->archive_->stats(); }
+
+std::optional<context::ContextArchiveLink::Candidate>
+Session::archive_find(std::uint32_t min_frontier, std::uint32_t max_frontier,
+                      const qwen::PrefixShortlistDigests& digests) const {
+    return impl_->archive_find(min_frontier, max_frontier, digests);
+}
+
+std::shared_ptr<ninfer::DiskContextArchive::Prefetch>
+Session::archive_prefetch(const context::ContextArchiveLink::Candidate& candidate) const {
+    return impl_->archive_prefetch(candidate);
+}
+
+void Session::attach_archive_host_arena(ninfer::ConstMemorySpan arena) {
+    impl_->archive_host_arena = arena;
+    impl_->archive_dirty      = true;
+}
 
 bool Session::has_context_operation() const noexcept {
     return impl_->operation || impl_->pending_maintenance || impl_->release_ticket ||
@@ -392,6 +452,8 @@ std::optional<SessionEvent> Session::poll() {
             }
             if (p.pending_maintenance) (void)p.try_pending_maintenance();
             p.submit_releases();
+            // Archive staging is polled work: bounded, throttled, never queued (wedge rules).
+            if (p.archive_dirty && (p.archive_polls++ & 0x3F) == 0) p.archive_flush();
             auto event = p.executor->poll();
             if (!event) return {};
             std::visit(

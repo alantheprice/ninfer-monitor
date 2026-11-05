@@ -35,6 +35,7 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
     auto planned = plan_execution(profile, table_->geometry(), options, device, available,
                                   host ? offload_ : nullptr, true, available_host_bytes);
     if (!planned) return {};
+    planned->context_cache = options.context_cache;
     const auto capacity = planned->capacity;
     const auto chunk    = planned->shape.prefill_chunk;
     const auto moe      = planned->moe;

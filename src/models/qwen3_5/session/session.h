@@ -43,6 +43,10 @@ public:
     ~PreparedSession();
     PreparedSession(const PreparedSession&)            = delete;
     PreparedSession& operator=(const PreparedSession&) = delete;
+    // Startup attach surface: the rank program hands its Host context arena to the archive
+    // seam before the engine starts serving (see engine startup attach block).
+    [[nodiscard]] bool archive_enabled() const noexcept;
+    void attach_archive_host_arena(ninfer::ConstMemorySpan arena);
 
 private:
     explicit PreparedSession(std::unique_ptr<detail::SessionImpl>);

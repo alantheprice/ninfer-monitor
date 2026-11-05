@@ -7,6 +7,7 @@
 #include "models/qwen4_exp/program/buffers.h"
 #include "models/qwen4_exp/ple/disk/prepare.h"
 #include "models/qwen4_exp/ple/upload.h"
+#include "ninfer/types.h"
 #include "runtime/engine/context_capacity.h"
 #include "models/common/graph_preparation.h"
 #include "models/common/moe/schedule.h"
@@ -37,6 +38,9 @@ struct ExecutionPlan {
     std::size_t pinned_draft_bytes       = 0;
     runtime::ContextCapacityResolution capacity;
     std::uint32_t checkpoint_interval = 8192;
+    // Context-cache + disk-archive configuration, copied from EngineOptions at plan time so the
+    // session can build its archive seam without re-reading engine options.
+    ContextCacheOptions context_cache;
     bool graph_probe                  = false;
 
     [[nodiscard]] std::size_t device_bytes() const;

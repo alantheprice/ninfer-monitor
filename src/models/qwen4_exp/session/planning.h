@@ -2,6 +2,7 @@
 
 #include "models/common/context/directory.h"
 #include "models/qwen4_exp/execution_shape.h"
+#include "ninfer/types.h"
 
 namespace ninfer::models::qwen4_exp {
 
@@ -12,6 +13,8 @@ struct SessionPlan {
     context::ContextDirectorySpec context;
     std::uint32_t vision_max_features = 0;
     std::uint32_t checkpoint_interval = 8192;
+    // Context-cache + disk-archive configuration carried from the execution plan.
+    ContextCacheOptions context_cache;
 
     bool operator==(const SessionPlan&) const = default;
 };

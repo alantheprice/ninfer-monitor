@@ -3,15 +3,20 @@
 #include "models/qwen4_exp/session/session.h"
 #include "models/qwen4_exp/state/continuation.h"
 #include "models/qwen4_exp/definition.h"
+#include "models/common/context/disk_archive_link.h"
 #include "models/common/context/snapshot.h"
 #include "models/common/qwen/prefix_identity.h"
 #include "models/common/qwen/vision/control.h"
 
 #include <deque>
+#include <unordered_map>
 
 namespace ninfer::models::qwen4_exp::detail {
 using Image        = context::StateId;
 using Continuation = context::Continuation<ContinuationMetadata>;
+
+// Archive identity scheme; bump when the archived checkpoint image payload changes.
+inline constexpr std::uint64_t kArchiveIdentityScheme = 1;
 
 struct CapturePoint {
     std::uint32_t frontier;
@@ -302,6 +307,23 @@ public:
     [[nodiscard]] PreparedCheckpoint prepare_checkpoint(Sequence&);
     [[nodiscard]] std::optional<CheckpointHandle> detach(Sequence&, runtime::CheckpointRole,
                                                          PreparedCheckpoint = {});
+    // NVMe archive seam: registers published checkpoints, stages saves once their pages are
+    // Host-resident, and exposes archive candidates to the resume policy.
+    [[nodiscard]] bool archive_enabled() const noexcept {
+        return archive_ && archive_->enabled();
+    }
+    void attach_archive_host_arena(ninfer::ConstMemorySpan arena) {
+        archive_host_arena = arena;
+        archive_dirty      = true;
+    }
+    void archive_register(CheckpointHandle handle, const Checkpoint& record);
+    void archive_discard(CheckpointHandle handle) noexcept;
+    void archive_flush();
+    [[nodiscard]] std::optional<context::ContextArchiveLink::Candidate>
+    archive_find(std::uint32_t min_frontier, std::uint32_t max_frontier,
+                 const qwen::PrefixShortlistDigests& digests) const;
+    [[nodiscard]] std::shared_ptr<ninfer::DiskContextArchive::Prefetch>
+    archive_prefetch(const context::ContextArchiveLink::Candidate& candidate) const;
     [[nodiscard]] std::vector<context::PageId> checkpoint_pages(std::span<const CheckpointHandle>,
                                                                 std::uint32_t pool) const;
     [[nodiscard]] std::vector<Image> checkpoint_images(std::span<const CheckpointHandle>) const;
@@ -334,6 +356,16 @@ public:
     context::ContextDirectory directory;
     mutable context::RecoveryIndex<> recovery_index{directory.metadata_budget()};
     Checkpoints checkpoints;
+    // NVMe context archive seam (fork's disk tier). Registrations live in archive_ids until
+    // their save commits (or the checkpoint retires, whichever comes first); archive_dirty
+    // paces the staging pass from the poll loop.
+    std::unique_ptr<context::ContextArchiveLink> archive_;
+    std::unordered_map<std::uint32_t, std::uint64_t> archive_ids;
+    std::uint64_t next_archive_id = 1;
+    std::uint64_t archive_polls   = 0;
+    // Host context arena attached once after startup; staging bindings resolve against it.
+    ConstMemorySpan archive_host_arena;
+    bool archive_dirty = false;
     context::MetadataAccount count_storage{directory.metadata_budget()};
     TokenCountBuilder count_builder;
     std::array<std::unique_ptr<Sequence>, kMaximumConcurrency> sequences;

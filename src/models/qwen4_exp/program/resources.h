@@ -35,6 +35,9 @@ public:
 
     [[nodiscard]] MemorySpan context_counts() { return context_counts_.span(); }
 
+    // Host context arena backing checkpoint page replicas; empty when the Host tier is off.
+    [[nodiscard]] ConstMemorySpan host_context_span() const { return host_context_.span(); }
+
     [[nodiscard]] MemorySpan workspace_storage() { return workspace_.span(); }
 
     [[nodiscard]] CudaExecutionView ple_transfer() const { return ple_transfer_; }

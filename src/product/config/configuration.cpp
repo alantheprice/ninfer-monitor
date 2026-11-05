@@ -154,6 +154,18 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
         case Field::HostCapacity:
             value = optional_value(e.context_cache.host_capacity_bytes, "default (target/model)");
             break;
+        case Field::DiskArchive:
+            value = e.context_cache.context_disk_archive.string();
+            break;
+        case Field::DiskArchiveCapacity:
+            value = std::uint64_t{e.context_cache.context_disk_archive_capacity_bytes};
+            break;
+        case Field::DiskArchiveRate:
+            value = std::uint64_t{e.context_cache.context_disk_archive_write_bytes_per_second};
+            break;
+        case Field::DiskArchiveStaging:
+            value = std::uint64_t{e.context_cache.context_disk_archive_staging_bytes};
+            break;
         case Field::CostPresets:
             value = e.context_cost.preset_path.string();
             break;
