@@ -9,8 +9,8 @@
 namespace ninfer::models::qwen4_exp {
 namespace detail {
 
-// Mirrors kStateSentinel in checkpoints_archive.cpp.
-constexpr std::uint64_t kImportStateSentinel = 0x414E4142494E3141ULL;
+// Mirrors kStateSentinel in checkpoints_archive.cpp ("NINFER!2").
+constexpr std::uint64_t kImportStateSentinel = 0x4E494E4645522132ULL;
 
 // Identity image layout (checkpoints_archive.cpp:archive_entry):
 // [u32 positions bytes][positions image][u32 digests bytes][digests image][u64 tag]
@@ -94,10 +94,17 @@ std::optional<CheckpointHandle> Session::archive_import(const RequestBasePlan& b
         return std::nullopt;
     const auto& plan_identity = base.plan_->identity;
     const auto prompt = base.summary().prompt_tokens;
+    static const bool trace = [] {
+        const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
+        return v && v[0] == '1';
+    }();
 
     try {
         const auto candidate = p.archive_find(1, prompt, plan_identity->digests);
-        if (!candidate) return std::nullopt;
+        if (!candidate) {
+            if (trace) std::fprintf(stderr, "archive-import: no candidate (prompt=%u)\n", prompt);
+            return std::nullopt;
+        }
         // One import per manifest per boot; imported checkpoints retire through the normal
         // reclaim paths, and a retired import's lineage is proven stale for this session.
         if (const auto found = p.import_memo.find(candidate->manifest);
@@ -127,9 +134,19 @@ std::optional<CheckpointHandle> Session::archive_import(const RequestBasePlan& b
         const auto state_image = state_blob.subspan(sizeof(metadata) + 16);
         if (parsed.tag != plan_identity->tag)
             throw std::invalid_argument("archived identity tag mismatch");
+        // Intermediate checkpoints carry the full-sequence identity (their digests span the
+        // whole prompt, not just the capture frontier); the archive's chain match already
+        // proves the request's digests agree up to the candidate frontier.
         if (metadata.main_frontier != candidate->frontier ||
-            parsed.tokens.size() != candidate->frontier)
+            parsed.tokens.size() < candidate->frontier) {
+            if (trace)
+                std::fprintf(stderr,
+                             "archive-import: declined: inconsistent (manifest=%u metadata=%u "
+                             "tokens=%zu state_blob=%zu)\n",
+                             candidate->frontier, metadata.main_frontier, parsed.tokens.size(),
+                             state_blob.size());
             throw std::invalid_argument("archived checkpoint is inconsistent");
+        }
 
         const bool mtp = metadata.mtp_frontier.has_value() && *metadata.mtp_frontier > 0;
         const auto main_frontier = candidate->frontier;

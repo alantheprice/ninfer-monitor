@@ -595,8 +595,15 @@ std::optional<DiskContextArchive::SaveJob> DiskContextArchive::begin_save(SaveRe
     std::unique_lock lock(mutex_);
     for (auto& [id, record] : manifests_) {
         if (record.frontier == request.frontier && record.prefix_key == request.prefix_key) {
-            record.last_used = now_ns();
-            return std::nullopt;
+            // Legacy manifests saved before state images were archived carry only the
+            // serialized metadata (no restorable state). They must not shadow a full save,
+            // and a new full save supersedes them.
+            constexpr std::size_t kMinRestorableStateBytes = 64;
+            if (record.state_bytes > kMinRestorableStateBytes) {
+                record.last_used = now_ns();
+                return std::nullopt;
+            }
+            break;
         }
     }
     SaveJob job;
@@ -796,7 +803,23 @@ std::optional<DiskContextArchive::Candidate> DiskContextArchive::find(std::uint3
             (best && record.frontier <= best->frontier)) {
             continue;
         }
-        if (key_at(record.frontier) != record.prefix_key) { continue; }
+        if (key_at(record.frontier) != record.prefix_key) {
+            static const bool trace = [] {
+                const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
+                return v && v[0] == '1';
+            }();
+            static std::atomic<std::uint32_t> misses{0};
+            if (trace && misses.fetch_add(1) < 12)
+                std::fprintf(stderr,
+                             "archive-find: key mismatch manifest=%llu frontier=%u "
+                             "want=%016llx/%016llx have=%016llx/%016llx\n",
+                             static_cast<unsigned long long>(record.id), record.frontier,
+                             static_cast<unsigned long long>(key_at(record.frontier)[0]),
+                             static_cast<unsigned long long>(key_at(record.frontier)[1]),
+                             static_cast<unsigned long long>(record.prefix_key[0]),
+                             static_cast<unsigned long long>(record.prefix_key[1]));
+            continue;
+        }
         best = Candidate{.manifest         = id,
                          .frontier         = record.frontier,
                          .backend_frontier = record.backend_frontier};

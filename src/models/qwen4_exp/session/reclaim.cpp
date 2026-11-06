@@ -330,7 +330,10 @@ context::HostWriteRequirements SessionImpl::host_requirements(const Demotion& pl
     context::HostWriteRequirements write;
     write.kv_pages.resize(directory.pool_count());
     for (const auto image : plan.images)
-        write.state_images += !directory.states().host_resident(image);
+        if (!directory.states().host_resident(image)) {
+            write.state_images += 1;
+            write.state_variant = directory.states().variant(image);
+        }
     for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool) {
         for (const auto page : plan.pages[pool]) {
             write.kv_pages[pool] += !directory.pool(pool).pages().host_replica_current(page);

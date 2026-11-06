@@ -381,6 +381,10 @@ public:
     // paces the staging pass from the poll loop.
     std::unique_ptr<context::ContextArchiveLink> archive_;
     std::unordered_map<std::uint32_t, std::uint64_t> archive_ids;
+    // Pending saves that never became Host-resident retire with their checkpoint after this
+    // many flush sweeps. Without pressure (no demotions) a save can only stall; a stalled
+    // save pins its checkpoint, which keeps the save pending - the pin must be bounded.
+    std::unordered_map<std::uint64_t, std::uint32_t> archive_stalls;
     mutable std::vector<CheckpointHandle> archive_pin_cache;
     // Imported manifests this boot: manifest id -> published handle (invalid once retired).
     std::unordered_map<std::uint64_t, CheckpointHandle> import_memo;

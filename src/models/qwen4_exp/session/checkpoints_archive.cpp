@@ -99,18 +99,20 @@ context::ContextArchiveLink::CheckpointEntry archive_entry(const Checkpoint& rec
 
 } // namespace
 
+// Diagnostics: NINFER_ARCHIVE_TRACE=1 traces register/flush outcomes; =2 adds noisy
+// per-sweep probes. The archive is on the hot path only at demotion boundaries; the
+// getenv probe is startup-cheap and cached.
+static const bool kArchiveTrace = [] {
+    const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
+    return v && v[0] == '1';
+}();
+
 void SessionImpl::archive_register(CheckpointHandle handle, const Checkpoint& record) {
     if (!archive_ || !archive_->enabled()) return;
     if (record.frontier() == 0 || record.snapshot.prefixes().empty() ||
         !record.snapshot.prefix(0).valid())
         return;
-    // Diagnostics: NINFER_ARCHIVE_TRACE=1 traces register/flush outcomes; =2 adds noisy
-    // per-sweep probes. The
-    // archive is on the hot path only at demotion boundaries; getenv here is startup-cheap.
-    static const bool trace = [] {
-        const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
-        return v && v[0] == '1';
-    }();
+    const bool trace = kArchiveTrace;
     if (trace)
         std::fprintf(stderr, "archive-register: frontier=%u pools=%zu\n", record.frontier(),
                      record.snapshot.prefixes().size());
@@ -189,6 +191,7 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
     }
     return archive_pin_cache;
 }void SessionImpl::archive_flush() {
+    const bool trace = kArchiveTrace;
     if (!archive_ || !archive_->enabled() || !archive_dirty) return;
     if (!archive_host_arena.data) return;
     if (archive_ids.empty()) { archive_dirty = false; return; }
@@ -198,10 +201,6 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
         const auto handle = checkpoints.handle(entry->first);
         if (!checkpoints.valid(handle)) {
             // Retired before its save committed: nothing was archived, nothing to unreference.
-            static const bool trace = [] {
-                const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
-                return v && v[0] == '1';
-            }();
             if (trace)
                 std::fprintf(stderr, "archive-flush: id=%llu RETIRED-PENDING\n",
                              static_cast<unsigned long long>(id));
@@ -234,10 +233,6 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
         };
         bool resident    = directory.states().host_resident(record.snapshot.continuation().image);
         bool abandonable = false;
-        static const bool trace = [] {
-            const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
-            return v && v[0] == '1';
-        }();
         static const bool trace_noise = [] {
             const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
             return v && v[0] == '2';
@@ -269,34 +264,29 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
             continue;
         }
         if (!resident) {
-            if (trace) {
-                std::uint32_t resident_pages = 0, total_pages = 0;
-                for (std::uint16_t pool = 0; pool < pool_count; ++pool) {
-                    const auto& prefix = record.snapshot.prefix(pool);
-                    if (!prefix.valid() || prefix.frontier() == 0) continue;
-                    const auto pages = context::kv_pages_for_frontier(prefix.frontier());
-                    auto& histories  = directory.pool(pool).histories();
-                    for (std::uint32_t i = 0; i < pages; ++i) {
-                        ++total_pages;
-                        const auto page = histories.logical_page(prefix.history(), i);
-                        if (directory.pool(pool).pages().host_replica_current(page))
-                            ++resident_pages;
-                    }
-                }
-                static std::uint32_t not_resident_logs = 0;
-                if (not_resident_logs++ < 12)
-                    std::fprintf(stderr,
-                                 "archive-flush: id=%llu NOT resident (state=%d pages=%u/%u) "
-                                 "mapped=%u hist=%u\n",
-                                 static_cast<unsigned long long>(id),
-                                 directory.states().host_resident(
-                                     record.snapshot.continuation().image)
-                                     ? 1
-                                     : 0,
-                                 resident_pages, total_pages,
-                                 directory.pool(0).histories().mapped_pages(
-                                     record.snapshot.prefix(0).history()),
-                                 record.snapshot.prefix(0).history().index);
+            // The checkpoint can never become resident again once retired (or once its lineage
+            // was re-prefilled and evicted); drop the pending save instead of retrying forever.
+            const bool gone = !checkpoints.valid(handle);
+            if (gone) {
+                archive_->discard_checkpoint(id);
+                entry = archive_ids.erase(entry);
+                if (trace)
+                    std::fprintf(stderr, "archive-flush: id=%llu DISCARDED (checkpoint retired)\n",
+                                 static_cast<unsigned long long>(id));
+                continue;
+            }
+            // No pressure means no demotion, so a device-resident checkpoint may never become
+            // Host-resident. Bound the pin: retire the save after too many idle sweeps (the
+            // 12-per-boot flush cadence makes ~4 sweeps ≈ 5 minutes of stalled pins).
+            constexpr std::uint32_t kArchiveStallSweeps = 4;
+            if (++archive_stalls[id] >= kArchiveStallSweeps) {
+                archive_stalls.erase(id);
+                archive_->discard_checkpoint(id);
+                entry = archive_ids.erase(entry);
+                if (trace)
+                    std::fprintf(stderr, "archive-flush: id=%llu DISCARDED (stalled, no host tier)\n",
+                                 static_cast<unsigned long long>(id));
+                continue;
             }
             work_remains = true;
             ++entry;
@@ -342,12 +332,24 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
             std::vector<ConstMemorySpan> state_parts;
             {
                 const auto image = record.snapshot.continuation().image;
-                const auto variant = directory.states().variant(image);
-                for (const auto rank : directory.states().ranks(variant)) {
+                for (const auto rank : directory.states().ranks(directory.states().variant(image))) {
                     const auto binding = directory.states().host_binding(image, rank);
+                    if (binding.bytes == 0) continue; // No Host replica on this rank part.
                     state_parts.push_back(
                         archive_host_arena.subspan(static_cast<std::size_t>(binding.offset),
                                                    binding.bytes));
+                }
+                // A save without the state image cannot be restored; require every rank part.
+                const auto expected = directory.states().ranks(directory.states().variant(image));
+                if (state_parts.size() != expected.size()) {
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "archive-flush: id=%llu INCOMPLETE (state parts %zu/%zu)\n",
+                                     static_cast<unsigned long long>(id), state_parts.size(),
+                                     expected.size());
+                    work_remains = true;
+                    ++entry;
+                    continue;
                 }
             }
             const auto result = archive_->flush(id, staged, state_parts);
