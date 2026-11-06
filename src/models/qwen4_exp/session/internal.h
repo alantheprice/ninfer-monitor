@@ -113,6 +113,16 @@ struct Suspended {
 // Pin budget for registered-but-unsaved archive checkpoints (see archive_save_pins).
 inline constexpr std::size_t kArchiveSavePins = 4;
 
+// Registered-but-unsaved checkpoints are shielded from PLAIN RELEASE only: groups holding
+// one are dropped from release selection (physical facts keep them eligible, so reclaim can
+// still demote them - which is the point: demotion lands their pages on Host, the flush
+// stages the save, the pin drops). Excluding them outright would make their device pages
+// unreclaimable: excluded handles never form groups, so nothing plans a demotion for them
+// and the pages leak until the pin clears - observed live as a prefill livelock at full
+// KV pools with 0 archive-demote lines across 40 minutes.
+[[nodiscard]] std::span<const CheckpointHandle> archive_save_pins(
+    const SessionImpl& session, std::span<const CheckpointHandle> seed);
+
 struct Demotion {
     struct PageVersion {
         std::uint64_t epoch;

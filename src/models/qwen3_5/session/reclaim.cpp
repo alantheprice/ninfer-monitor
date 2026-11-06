@@ -17,10 +17,22 @@ PhysicalFacts physical_facts(const SessionImpl& session, std::span<const Checkpo
     const std::array pools{
         context::ReclaimPool{session.text_kv_histories, session.text_kv_pages},
         context::ReclaimPool{session.backend_kv_histories, session.backend_kv_pages}};
-    if (const auto pins = session.archive_save_pins(excluded); !pins.empty())
-        excluded = pins;
     return PhysicalFacts(session.checkpoints, session.directory,
                          std::span(pools).first(session.directory.pool_count()), allowed, excluded);
+}
+
+// Drop groups holding a pinned checkpoint from release selection (see qwen4_exp reclaim.cpp
+// for the rationale: pins must stay eligible for demotion planning, just not plain release).
+void strip_pinned_releases(PhysicalFacts& facts, const SessionImpl& session) {
+    if (!session.archive_enabled()) return;
+    const auto pins = session.archive_save_pins({});
+    if (pins.empty()) return;
+    for (auto& group : facts.groups) {
+        if (std::any_of(group.sources.begin(), group.sources.end(), [&](const auto& source) {
+                return std::find(pins.begin(), pins.end(), source) != pins.end();
+            }))
+            group.released = {};
+    }
 }
 
 struct StateDemotion {
@@ -219,6 +231,7 @@ ContextReclaimPlan SessionImpl::plan_reclaim(std::span<const CheckpointHandle> a
                                              const ContextDemand& demand) const {
     ContextReclaimPlan result;
     result.impl_     = std::make_shared<ReclaimPlan>(*this, allowed, excluded, demand);
+    strip_pinned_releases(result.impl_->facts, *this);
     result.inventory = result.impl_->facts.inventory;
     if (has_context_operation()) return result;
     const bool demote = host_context_enabled &&
@@ -237,6 +250,7 @@ SessionImpl::plan_releases(std::span<const CheckpointHandle> allowed,
                            std::span<const CheckpointHandle> excluded,
                            const ContextDemand& demand) const {
     auto evaluation = std::make_shared<ReclaimPlan>(*this, allowed, excluded, demand);
+    strip_pinned_releases(evaluation->facts, *this);
     context::ReleasePlan<ContextRelease, ContextReleaseSet> result{{}, evaluation->facts.inventory};
     if (has_context_operation()) return result;
     auto selection = result.inventory->select();

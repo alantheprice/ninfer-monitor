@@ -232,12 +232,20 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
                             ++resident_pages;
                     }
                 }
-                std::fprintf(stderr, "archive-flush: id=%llu NOT resident (state=%d pages=%u/%u)\n",
-                             static_cast<unsigned long long>(id),
-                             directory.states().host_resident(record.snapshot.continuation().image)
-                                 ? 1
-                                 : 0,
-                             resident_pages, total_pages);
+                static std::uint32_t not_resident_logs = 0;
+                if (not_resident_logs++ < 12)
+                    std::fprintf(stderr,
+                                 "archive-flush: id=%llu NOT resident (state=%d pages=%u/%u) "
+                                 "mapped=%u hist=%u\n",
+                                 static_cast<unsigned long long>(id),
+                                 directory.states().host_resident(
+                                     record.snapshot.continuation().image)
+                                     ? 1
+                                     : 0,
+                                 resident_pages, total_pages,
+                                 directory.pool(0).histories().mapped_pages(
+                                     record.snapshot.prefix(0).history()),
+                                 record.snapshot.prefix(0).history().index);
             }
             work_remains = true;
             ++entry;

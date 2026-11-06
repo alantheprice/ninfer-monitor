@@ -4,6 +4,8 @@
 #include "models/common/qwen/recovery_store.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_set>
 
 namespace ninfer::models::qwen4_exp::detail {
@@ -28,9 +30,28 @@ context::PhysicalReclaim physical_facts(const SessionImpl& session,
         const auto& pool = session.directory.pool(i);
         pools.push_back({&pool.histories(), &pool.pages()});
     }
-    if (const auto pins = session.archive_save_pins(excluded); !pins.empty())
-        excluded = pins;
     return {session.checkpoints, session.directory, pools, allowed, excluded};
+}
+
+std::span<const CheckpointHandle> archive_save_pins(const SessionImpl& session,
+                                                    std::span<const CheckpointHandle> seed) {
+    return session.archive_save_pins(seed);
+}
+
+// Drop groups holding a pinned checkpoint from the release selection. Group sources are
+// disjoint across cohorts, so a full-group skip cannot strand another checkpoint's pages:
+// shared pages live in the union cohort, which is itself dropped when a pin is among its
+// holders. Demotion planning reads groups' states/pages, untouched here.
+void strip_pinned_releases(context::PhysicalReclaim& facts, const SessionImpl& session) {
+    if (!session.archive_enabled()) return;
+    const auto pins = session.archive_save_pins({});
+    if (pins.empty()) return;
+    for (auto& group : facts.groups) {
+        if (std::any_of(group.sources.begin(), group.sources.end(), [&](const auto& source) {
+                return std::find(pins.begin(), pins.end(), source) != pins.end();
+            }))
+            group.released = {};
+    }
 }
 
 void seal(Demotion& plan) {
@@ -321,6 +342,17 @@ context::HostWriteRequirements SessionImpl::host_requirements(const Demotion& pl
 bool SessionImpl::prepare_demotion(context::ContextTransaction& migration, const Demotion& plan,
                                    context::ContextReservation& targets,
                                    const context::HostDemandIds& target_ids) {
+    static const bool trace = [] {
+        const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
+        return v && v[0] == '1';
+    }();
+    if (trace) {
+        std::size_t kv_pages = 0;
+        for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool)
+            kv_pages += plan.pages[pool].size();
+        std::fprintf(stderr, "archive-demote: images=%zu kv_pages=%zu sources=%zu\n",
+                     plan.images.size(), kv_pages, plan.records.size());
+    }
     std::vector<Image> redundant;
     auto state_targets =
         target_ids.state.valid() ? targets.take(target_ids.state) : context::RecordReservation{};
@@ -371,6 +403,7 @@ context::ReleasePlan<ContextRelease, ContextReleaseSet>
 SessionImpl::plan_releases(std::span<const CheckpointHandle> allowed,
                            std::span<const CheckpointHandle> excluded, const ContextDemand&) const {
     auto facts = physical_facts(*this, allowed, excluded);
+    strip_pinned_releases(facts, *this);
     context::ReleasePlan<ContextRelease, ContextReleaseSet> result{{}, facts.inventory};
     if (operation) return result;
     auto selected = facts.inventory->select();
@@ -386,6 +419,7 @@ ContextReclaimPlan SessionImpl::plan_reclaim(std::span<const CheckpointHandle> a
                                              std::span<const CheckpointHandle> excluded,
                                              const ContextDemand& demand) const {
     auto facts = physical_facts(*this, allowed, excluded);
+    strip_pinned_releases(facts, *this);
     ContextReclaimPlan result;
     result.inventory = facts.inventory;
     if (operation) return result;
