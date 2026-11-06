@@ -48,10 +48,13 @@ public:
     };
 
     // One Host-resident page offered to the save: the registered key it belongs to and its CPU
-    // bytes (the full Host record, matching the page kind's configured byte count).
+    // bytes (the full Host record, matching the page kind's configured byte count). Kind is
+    // part of the identity: pools share the digest table (main and MTP frontiers overlap), so
+    // the same ArchiveKey names a kind-0 page and a kind-1 page whose byte sizes differ.
     struct StagedPage {
         ArchiveKey key;
         ConstMemorySpan bytes;
+        std::size_t kind = 0;
     };
 
     struct Options {

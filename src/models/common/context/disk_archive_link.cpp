@@ -1,5 +1,8 @@
 #include "models/common/context/disk_archive_link.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -89,18 +92,38 @@ ContextArchiveLink::FlushResult ContextArchiveLink::flush(std::uint64_t id,
         return FlushResult::Declined;
     }
 
-    std::unordered_map<ArchiveKey, ConstMemorySpan, ArchiveKeyHash> offered;
-    offered.reserve(staged.size());
-    for (const auto& page : staged) offered.emplace(page.key, page.bytes);
+    // Per-kind offered maps: pools share the digest table (main and MTP frontiers overlap),
+    // so one flat key map would let a kind-0 page satisfy a kind-1 lookup with the wrong
+    // byte size (observed live: bytes_found=1 bytes_match=0 on every kind-1 page).
+    std::array<std::unordered_map<ArchiveKey, ConstMemorySpan, ArchiveKeyHash>, 2> offered;
+    for (auto& map : offered) map.reserve(staged.size());
+    for (const auto& page : staged) offered[page.kind].emplace(page.key, page.bytes);
 
-    for (std::size_t kind = 0; kind < kArchivePageKinds; ++kind) {
+    for (std::size_t kind = 0; kind < 2; ++kind) {
         const auto page_bytes = options_.page_bytes[kind];
         const auto missing    = job->missing(kind);
         for (std::size_t i = 0; i < missing.size(); ++i) {
             const auto& key = entry.page_keys[kind][missing[i]];
-            const auto bytes = offered.find(key);
-            if (bytes == offered.end() || bytes->second.bytes != page_bytes) {
+            const auto& map = offered[kind];
+            const auto bytes = map.find(key);
+            if (bytes == map.end() || bytes->second.bytes != page_bytes) {
                 // Host tier cannot supply this page yet; keep the save armed.
+                static const bool trace = [] {
+                    const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
+                    return v && v[0] == '1';
+                }();
+                if (trace)
+                    std::fprintf(stderr,
+                                 "archive-link: INCOMPLETE kind=%zu missing_idx=%zu "
+                                 "entry_key=%016lx/%016lx bytes_found=%d bytes_match=%d "
+                                 "offered=%zu\n",
+                                 kind, i, static_cast<unsigned long long>(key[0]),
+                                 static_cast<unsigned long long>(key[1]),
+                                 bytes != map.end() ? 1 : 0,
+                                 bytes != map.end()
+                                     ? static_cast<int>(bytes->second.bytes == page_bytes)
+                                     : -1,
+                                 map.size());
                 return FlushResult::Incomplete;
             }
             auto destination = job->page(kind, i);

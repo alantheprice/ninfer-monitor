@@ -211,7 +211,7 @@ void SessionImpl::archive_flush() {
         const auto& digests = record.snapshot.identity().digests;
         const auto stage    = [&](const context::HistoryDirectory& histories,
                                const context::PageDirectory& page_directory,
-                               const context::HistoryPrefix& prefix) {
+                               const context::HistoryPrefix& prefix, std::size_t kind) {
             const std::uint32_t count = context::kv_pages_for_frontier(prefix.frontier());
             for (std::uint32_t i = 0; i < count; ++i) {
                 const auto page = histories.logical_page(prefix.history(), i);
@@ -221,13 +221,14 @@ void SessionImpl::archive_flush() {
                     const auto binding = page_directory.host_binding(page, part.rank);
                     staged.push_back(
                         {key, archive_host_arena.subspan(static_cast<std::size_t>(binding.offset),
-                                                         binding.bytes)});
+                                                         binding.bytes),
+                         kind});
                 }
             }
         };
-        stage(*text_kv_histories, *text_kv_pages, text_prefix);
+        stage(*text_kv_histories, *text_kv_pages, text_prefix, 0);
         if (const auto* backend = record.backend_prefix()) {
-            stage(*backend_kv_histories, *backend_kv_pages, *backend);
+            stage(*backend_kv_histories, *backend_kv_pages, *backend, 1);
         }
         try {
             const auto result = archive_->flush(id, staged);

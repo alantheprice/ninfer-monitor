@@ -118,10 +118,36 @@ void SessionImpl::archive_register(CheckpointHandle handle, const Checkpoint& re
         // Pin-budget eviction: registered-but-unsaved checkpoints are excluded from plain
         // release (archive_save_pins) so their saves can complete; cap the intervention by
         // dropping the oldest pending save when a new registration would exceed it. The
-        // incoming slot is exempt (it was just replaced above, never evict what we register).
+        // incoming slot is exempt, and a save with any Host-resident page is progressing
+        // (one sweep from staging) - skip it and take the next candidate so capture churn
+        // cannot kill saves that already paid their demotion cost.
         if (archive_ids.size() >= kArchiveSavePins) {
             auto evict = archive_ids.begin();
-            if (evict->first == handle.index) evict = std::next(evict);
+            const auto progressing = [&](CheckpointHandle victim) {
+                if (!checkpoints.valid(victim)) return false;
+                const auto& vrec = checkpoints.at(victim);
+                if (directory.states().host_resident(vrec.snapshot.continuation().image))
+                    return true;
+                for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool) {
+                    const auto& prefix = vrec.snapshot.prefix(pool);
+                    if (!prefix.valid() || prefix.frontier() == 0) continue;
+                    const auto& histories = directory.pool(pool).histories();
+                    if (histories.mapped_pages(prefix.history()) <
+                        context::kv_pages_for_frontier(prefix.frontier()))
+                        continue;
+                    const std::uint32_t pages =
+                        context::kv_pages_for_frontier(prefix.frontier());
+                    for (std::uint32_t i = 0; i < pages; ++i) {
+                        if (directory.pool(pool).pages().host_replica_current(
+                                histories.logical_page(prefix.history(), i)))
+                            return true;
+                    }
+                }
+                return false;
+            };
+            while (evict != archive_ids.end() &&
+                   (evict->first == handle.index || progressing(checkpoints.handle(evict->first))))
+                ++evict;
             if (evict != archive_ids.end()) {
                 archive_->discard_checkpoint(evict->second);
                 archive_ids.erase(evict);
@@ -169,6 +195,13 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
         const auto handle = checkpoints.handle(entry->first);
         if (!checkpoints.valid(handle)) {
             // Retired before its save committed: nothing was archived, nothing to unreference.
+            static const bool trace = [] {
+                const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
+                return v && v[0] == '1';
+            }();
+            if (trace)
+                std::fprintf(stderr, "archive-flush: id=%llu RETIRED-PENDING\n",
+                             static_cast<unsigned long long>(id));
             archive_->discard_checkpoint(id);
             entry = archive_ids.erase(entry);
             continue;
@@ -203,6 +236,17 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
             return v && v[0] == '1';
         }();
         const auto pool_count = directory.pool_count();
+        if (trace) {
+            const auto& m = record.snapshot.continuation().metadata;
+            const auto entry_slot = archive_ids.find(handle.index);
+            std::fprintf(stderr,
+                         "archive-flush: id=%llu rec_f=%u map_id=%llu rec_handle_idx=%u\n",
+                         static_cast<unsigned long long>(id), record.frontier(),
+                         entry_slot == archive_ids.end() ? 0ULL
+                                                         : static_cast<unsigned long long>(
+                                                             entry_slot->second),
+                         handle.index);
+        }
         for (std::uint16_t pool = 0; pool < pool_count && !abandonable; ++pool) {
             const auto& prefix = record.snapshot.prefix(pool);
             if (prefix.valid() && prefix.frontier() != 0)
@@ -278,7 +322,8 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
                         directory.pool(pool).pages().host_binding(page, part.rank);
                     staged.push_back(
                         {key, archive_host_arena.subspan(static_cast<std::size_t>(binding.offset),
-                                                         binding.bytes)});
+                                                         binding.bytes),
+                         pool});
                 }
             }
         }
@@ -292,10 +337,16 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
                 continue;
             }
             // Incomplete (host tier not ready) or Declined (budget/staging): retry later.
-            if (trace)
-                std::fprintf(stderr, "archive-flush: id=%llu outcome=%d pages=%zu\n",
+            if (trace) {
+                const auto s = archive_->stats();
+                std::fprintf(stderr,
+                             "archive-flush: id=%llu outcome=%d pages=%zu "
+                             "committed=%llu budget_skip=%llu staging_skip=%llu\n",
                              static_cast<unsigned long long>(id), static_cast<int>(result),
-                             staged.size());
+                             staged.size(), static_cast<unsigned long long>(s.saves_committed),
+                             static_cast<unsigned long long>(s.saves_skipped_budget),
+                             static_cast<unsigned long long>(s.saves_skipped_staging));
+            }
             work_remains = true;
         } catch (...) {
             if (trace) std::fputs("archive-flush: save threw\n", stderr);
