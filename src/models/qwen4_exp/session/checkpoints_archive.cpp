@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -101,6 +102,15 @@ void SessionImpl::archive_register(CheckpointHandle handle, const Checkpoint& re
     if (record.frontier() == 0 || record.snapshot.prefixes().empty() ||
         !record.snapshot.prefix(0).valid())
         return;
+    // Diagnostics: NINFER_ARCHIVE_TRACE=1 traces register/flush outcomes to stderr. The
+    // archive is on the hot path only at demotion boundaries; getenv here is startup-cheap.
+    static const bool trace = [] {
+        const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
+        return v && v[0] == '1';
+    }();
+    if (trace)
+        std::fprintf(stderr, "archive-register: frontier=%u pools=%zu\n", record.frontier(),
+                     record.snapshot.prefixes().size());
     try {
         // A slot's earlier pending registration (if any) is replaced by the newer checkpoint.
         const auto existing = archive_ids.find(handle.index);
@@ -162,6 +172,10 @@ void SessionImpl::archive_flush() {
         };
         bool resident    = directory.states().host_resident(record.snapshot.continuation().image);
         bool abandonable = false;
+        static const bool trace = [] {
+            const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
+            return v && v[0] == '1';
+        }();
         const auto pool_count = directory.pool_count();
         for (std::uint16_t pool = 0; pool < pool_count && !abandonable; ++pool) {
             const auto& prefix = record.snapshot.prefix(pool);
@@ -172,9 +186,33 @@ void SessionImpl::archive_flush() {
         if (abandonable) {
             archive_->discard_checkpoint(id);
             entry = archive_ids.erase(entry);
+            if (trace)
+                std::fprintf(stderr, "archive-flush: id=%llu ABANDONED (pages lost both)\n",
+                              static_cast<unsigned long long>(id));
             continue;
         }
         if (!resident) {
+            if (trace) {
+                std::uint32_t resident_pages = 0, total_pages = 0;
+                for (std::uint16_t pool = 0; pool < pool_count; ++pool) {
+                    const auto& prefix = record.snapshot.prefix(pool);
+                    if (!prefix.valid() || prefix.frontier() == 0) continue;
+                    const auto pages = context::kv_pages_for_frontier(prefix.frontier());
+                    auto& histories  = directory.pool(pool).histories();
+                    for (std::uint32_t i = 0; i < pages; ++i) {
+                        ++total_pages;
+                        const auto page = histories.logical_page(prefix.history(), i);
+                        if (directory.pool(pool).pages().host_replica_current(page))
+                            ++resident_pages;
+                    }
+                }
+                std::fprintf(stderr, "archive-flush: id=%llu NOT resident (state=%d pages=%u/%u)\n",
+                             static_cast<unsigned long long>(id),
+                             directory.states().host_resident(record.snapshot.continuation().image)
+                                 ? 1
+                                 : 0,
+                             resident_pages, total_pages);
+            }
             work_remains = true;
             ++entry;
             continue;
@@ -213,13 +251,20 @@ void SessionImpl::archive_flush() {
         try {
             const auto result = archive_->flush(id, staged);
             if (result == context::ContextArchiveLink::FlushResult::Committed) {
+                if (trace)
+                    std::fprintf(stderr, "archive-flush: id=%llu COMMITTED (%zu pages)\n",
+                                 static_cast<unsigned long long>(id), staged.size());
                 entry = archive_ids.erase(entry);
                 continue;
             }
             // Incomplete (host tier not ready) or Declined (budget/staging): retry later.
+            if (trace)
+                std::fprintf(stderr, "archive-flush: id=%llu outcome=%d pages=%zu\n",
+                             static_cast<unsigned long long>(id), static_cast<int>(result),
+                             staged.size());
             work_remains = true;
         } catch (...) {
-            // The archive is an accelerator; a failed save retries on a later sweep.
+            if (trace) std::fputs("archive-flush: save threw\n", stderr);
             work_remains = true;
         }
         ++entry;
