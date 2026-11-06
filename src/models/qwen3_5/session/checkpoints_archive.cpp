@@ -231,7 +231,20 @@ void SessionImpl::archive_flush() {
             stage(*backend_kv_histories, *backend_kv_pages, *backend, 1);
         }
         try {
-            const auto result = archive_->flush(id, staged);
+            // State-image bytes ride along (see qwen4_exp): the residency gate above already
+            // required the image Host-resident; ranks stored in variant rank order.
+            std::vector<ConstMemorySpan> state_parts;
+            {
+                const auto image = record.continuation().image;
+                const auto variant = state_store->variant(image);
+                for (const auto rank : state_store->ranks(variant)) {
+                    const auto binding = state_store->host_binding(image, rank);
+                    state_parts.push_back(
+                        archive_host_arena.subspan(static_cast<std::size_t>(binding.offset),
+                                                   binding.bytes));
+                }
+            }
+            const auto result = archive_->flush(id, staged, state_parts);
             if (result == context::ContextArchiveLink::FlushResult::Committed) {
                 entry = archive_ids.erase(entry);
                 continue;

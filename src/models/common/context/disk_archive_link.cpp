@@ -60,7 +60,8 @@ void ContextArchiveLink::register_checkpoint(std::uint64_t id, CheckpointEntry e
 void ContextArchiveLink::discard_checkpoint(std::uint64_t id) { pending_.erase(id); }
 
 ContextArchiveLink::FlushResult ContextArchiveLink::flush(std::uint64_t id,
-                                                          std::span<const StagedPage> staged) {
+                                                          std::span<const StagedPage> staged,
+                                                          std::span<const ConstMemorySpan> state_parts) {
     if (!archive_) return FlushResult::Declined;
     const auto found = pending_.find(id);
     if (found == pending_.end() || !found->second.armed) return FlushResult::Declined;
@@ -74,7 +75,9 @@ ContextArchiveLink::FlushResult ContextArchiveLink::flush(std::uint64_t id,
     request.prefix_key       = entry.prefix_key;
     request.page_keys        = entry.page_keys;
     request.identity_bytes   = entry.identity.size();
-    request.state_bytes      = entry.state.size();
+    std::size_t state_image_bytes = 0;
+    for (const auto& part : state_parts) state_image_bytes += part.bytes;
+    request.state_bytes      = entry.state.size() + state_image_bytes;
     request.retain           = entry.retain;
     const auto& lineage      = entry.lineage;
     const auto before        = archive_->stats();
@@ -136,10 +139,15 @@ ContextArchiveLink::FlushResult ContextArchiveLink::flush(std::uint64_t id,
     }
     std::memcpy(identity.data(), entry.identity.data(), identity.size());
     auto state = job->state();
-    if (state.size() != entry.state.size()) {
+    if (state.size() != entry.state.size() + state_image_bytes) {
         throw std::logic_error("context archive state staging size differs");
     }
-    std::memcpy(state.data(), entry.state.data(), state.size());
+    std::memcpy(state.data(), entry.state.data(), entry.state.size());
+    auto cursor = state.data() + entry.state.size();
+    for (const auto& part : state_parts) {
+        std::memcpy(cursor, part.data, part.bytes);
+        cursor += part.bytes;
+    }
     archive_->commit(std::move(*job));
     pending_.erase(found);
     return FlushResult::Committed;

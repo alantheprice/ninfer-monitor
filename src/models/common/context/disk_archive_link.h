@@ -89,10 +89,14 @@ public:
 
     // Attempts the armed save for one checkpoint. The caller stages pages only after the
     // directory reports every page of the checkpoint Host-resident, and passes the checkpoint's
-    // full page set; pages already in the archive may be omitted. Incomplete: the offer does not
-    // cover the pages the archive is missing. Declined: write budget or staging exhausted —
-    // retry from a later flush. Committed: durable handoff done (writer thread owns the IO).
-    [[nodiscard]] FlushResult flush(std::uint64_t id, std::span<const StagedPage> staged);
+    // full page set; pages already in the archive may be omitted. `state_image` is the
+    // checkpoint's Host-resident state-image bytes (appended after the metadata block in the
+    // stored state blob); an empty span archives metadata only (stateless checkpoints).
+    // Incomplete: the offer does not cover the pages the archive is missing. Declined: write
+    // budget or staging exhausted — retry from a later flush. Committed: durable handoff done
+    // (writer thread owns the IO).
+    [[nodiscard]] FlushResult flush(std::uint64_t id, std::span<const StagedPage> staged,
+                                    std::span<const ConstMemorySpan> state_parts = {});
 
     [[nodiscard]] DiskArchiveStats stats() const;
 

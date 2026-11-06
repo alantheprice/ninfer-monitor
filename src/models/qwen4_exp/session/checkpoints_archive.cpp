@@ -58,7 +58,9 @@ void put_u64(std::vector<std::byte>& out, std::uint64_t value) {
 
 // identity image: [u32 positions bytes][positions image][u32 digests bytes][digests image]
 //                 [u64 tag][u64 token count][TokenId x tokens]
-// state image:    [ContinuationMetadata][u64 role][u64 sentinel]
+// state image:    [ContinuationMetadata][u64 role][u64 sentinel][state-image rank bytes]
+//                 (rank bytes appended at flush from the Host-resident image, in
+//                  states().ranks(variant) order; empty for stateless checkpoints)
 
 context::ContextArchiveLink::CheckpointEntry archive_entry(const Checkpoint& record) {
     const auto& identity = record.snapshot.identity();
@@ -333,7 +335,22 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
             }
         }
         try {
-            const auto result = archive_->flush(id, staged);
+            // State-image bytes ride along: the recurrent state (GDN/PLE/QSA) is not
+            // reconstructible from KV pages, so a save without it cannot be restored. The
+            // residency gate above already required the image Host-resident; ranks are
+            // stored in variant rank order so a restore can reassemble the image.
+            std::vector<ConstMemorySpan> state_parts;
+            {
+                const auto image = record.snapshot.continuation().image;
+                const auto variant = directory.states().variant(image);
+                for (const auto rank : directory.states().ranks(variant)) {
+                    const auto binding = directory.states().host_binding(image, rank);
+                    state_parts.push_back(
+                        archive_host_arena.subspan(static_cast<std::size_t>(binding.offset),
+                                                   binding.bytes));
+                }
+            }
+            const auto result = archive_->flush(id, staged, state_parts);
             if (result == context::ContextArchiveLink::FlushResult::Committed) {
                 if (trace)
                     std::fprintf(stderr, "archive-flush: id=%llu COMMITTED (%zu pages)\n",
