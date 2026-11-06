@@ -103,6 +103,17 @@ void SessionImpl::archive_register(CheckpointHandle handle, const CheckpointStat
         // A slot's earlier pending registration (if any) is replaced by the newer checkpoint.
         const auto existing = archive_ids.find(handle.index);
         if (existing != archive_ids.end()) archive_->discard_checkpoint(existing->second);
+        // Pin-budget eviction: see qwen4_exp archive_register (archive_save_pins caps the
+        // plain-release intervention; drop the oldest pending save beyond the cap). The
+        // incoming slot is exempt.
+        if (archive_ids.size() >= kArchiveSavePins) {
+            auto evict = archive_ids.begin();
+            if (evict->first == handle.index) evict = std::next(evict);
+            if (evict != archive_ids.end()) {
+                archive_->discard_checkpoint(evict->second);
+                archive_ids.erase(evict);
+            }
+        }
         const auto id = next_archive_id++;
         archive_->register_checkpoint(id, archive_entry(record));
         archive_ids[handle.index] = id;
@@ -119,6 +130,22 @@ void SessionImpl::archive_discard(CheckpointHandle handle) noexcept {
     if (found == archive_ids.end()) return;
     archive_->discard_checkpoint(found->second);
     archive_ids.erase(found);
+}
+
+std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
+    std::span<const CheckpointHandle> seed) const {
+    if (!archive_enabled() || archive_ids.empty()) return {};
+    if (seed.size() >= kArchiveSavePins) return {};
+    const auto room = kArchiveSavePins - seed.size();
+    archive_pin_cache.clear();
+    for (const auto [index, id] : archive_ids) {
+        const auto handle = checkpoints.handle(index);
+        if (!checkpoints.valid(handle)) continue;
+        if (std::find(seed.begin(), seed.end(), handle) != seed.end()) continue;
+        archive_pin_cache.push_back(handle);
+        if (archive_pin_cache.size() == room) break;
+    }
+    return archive_pin_cache;
 }
 
 void SessionImpl::archive_flush() {

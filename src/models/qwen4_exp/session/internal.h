@@ -110,6 +110,9 @@ struct Suspended {
     ~Suspended();
 };
 
+// Pin budget for registered-but-unsaved archive checkpoints (see archive_save_pins).
+inline constexpr std::size_t kArchiveSavePins = 4;
+
 struct Demotion {
     struct PageVersion {
         std::uint64_t epoch;
@@ -316,7 +319,11 @@ public:
         archive_host_arena = arena;
         archive_dirty      = true;
     }
-    void archive_register(CheckpointHandle handle, const Checkpoint& record);
+    // Registered-but-unsaved checkpoints, FIFO capped at kArchiveSavePins (reclaim.cpp).
+    // Const: reclaim quotes run on const sessions; the memo is mutable, overflow eviction
+    // happens at registration. The seed's entries are skipped (already excluded upstream).
+    [[nodiscard]] std::span<const CheckpointHandle> archive_save_pins(
+        std::span<const CheckpointHandle> seed) const;void archive_register(CheckpointHandle handle, const Checkpoint& record);
     void archive_discard(CheckpointHandle handle) noexcept;
     void archive_flush();
     [[nodiscard]] std::optional<context::ContextArchiveLink::Candidate>
@@ -361,6 +368,7 @@ public:
     // paces the staging pass from the poll loop.
     std::unique_ptr<context::ContextArchiveLink> archive_;
     std::unordered_map<std::uint32_t, std::uint64_t> archive_ids;
+    mutable std::vector<CheckpointHandle> archive_pin_cache;
     std::uint64_t next_archive_id = 1;
     std::uint64_t archive_polls   = 0;
     // Host context arena attached once after startup; staging bindings resolve against it.

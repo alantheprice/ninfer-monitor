@@ -115,6 +115,18 @@ void SessionImpl::archive_register(CheckpointHandle handle, const Checkpoint& re
         // A slot's earlier pending registration (if any) is replaced by the newer checkpoint.
         const auto existing = archive_ids.find(handle.index);
         if (existing != archive_ids.end()) archive_->discard_checkpoint(existing->second);
+        // Pin-budget eviction: registered-but-unsaved checkpoints are excluded from plain
+        // release (archive_save_pins) so their saves can complete; cap the intervention by
+        // dropping the oldest pending save when a new registration would exceed it. The
+        // incoming slot is exempt (it was just replaced above, never evict what we register).
+        if (archive_ids.size() >= kArchiveSavePins) {
+            auto evict = archive_ids.begin();
+            if (evict->first == handle.index) evict = std::next(evict);
+            if (evict != archive_ids.end()) {
+                archive_->discard_checkpoint(evict->second);
+                archive_ids.erase(evict);
+            }
+        }
         const auto id = next_archive_id++;
         archive_->register_checkpoint(id, archive_entry(record));
         archive_ids[handle.index] = id;
@@ -133,7 +145,21 @@ void SessionImpl::archive_discard(CheckpointHandle handle) noexcept {
     archive_ids.erase(found);
 }
 
-void SessionImpl::archive_flush() {
+std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
+    std::span<const CheckpointHandle> seed) const {
+    if (!archive_enabled() || archive_ids.empty()) return {};
+    if (seed.size() >= kArchiveSavePins) return {};
+    const auto room = kArchiveSavePins - seed.size();
+    archive_pin_cache.clear();
+    for (const auto [index, id] : archive_ids) {
+        const auto handle = checkpoints.handle(index);
+        if (!checkpoints.valid(handle)) continue;
+        if (std::find(seed.begin(), seed.end(), handle) != seed.end()) continue;
+        archive_pin_cache.push_back(handle);
+        if (archive_pin_cache.size() == room) break;
+    }
+    return archive_pin_cache;
+}void SessionImpl::archive_flush() {
     if (!archive_ || !archive_->enabled() || !archive_dirty) return;
     if (!archive_host_arena.data) return;
     if (archive_ids.empty()) { archive_dirty = false; return; }

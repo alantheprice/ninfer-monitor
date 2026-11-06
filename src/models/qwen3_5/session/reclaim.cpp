@@ -17,6 +17,8 @@ PhysicalFacts physical_facts(const SessionImpl& session, std::span<const Checkpo
     const std::array pools{
         context::ReclaimPool{session.text_kv_histories, session.text_kv_pages},
         context::ReclaimPool{session.backend_kv_histories, session.backend_kv_pages}};
+    if (const auto pins = session.archive_save_pins(excluded); !pins.empty())
+        excluded = pins;
     return PhysicalFacts(session.checkpoints, session.directory,
                          std::span(pools).first(session.directory.pool_count()), allowed, excluded);
 }

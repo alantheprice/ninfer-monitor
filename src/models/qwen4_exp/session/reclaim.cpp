@@ -28,6 +28,8 @@ context::PhysicalReclaim physical_facts(const SessionImpl& session,
         const auto& pool = session.directory.pool(i);
         pools.push_back({&pool.histories(), &pool.pages()});
     }
+    if (const auto pins = session.archive_save_pins(excluded); !pins.empty())
+        excluded = pins;
     return {session.checkpoints, session.directory, pools, allowed, excluded};
 }
 

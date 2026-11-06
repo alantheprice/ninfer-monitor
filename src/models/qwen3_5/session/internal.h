@@ -113,8 +113,10 @@ struct SequenceState {
     }
 };
 
-struct CaptureReservation {
-    SessionImpl* owner = nullptr;
+// Pin budget for registered-but-unsaved archive checkpoints (see archive_save_pins).
+inline constexpr std::size_t kArchiveSavePins = 4;
+
+struct CaptureReservation {    SessionImpl* owner = nullptr;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
     context::StateId state;
     std::optional<context::RecordReservation> host;
@@ -439,6 +441,7 @@ public:
     // Checkpoint slot -> pending archive registration. Entries exist only while a save is
     // unfinished; commit, retirement or replacement removes them.
     std::unordered_map<std::uint32_t, std::uint64_t> archive_ids;
+    mutable std::vector<CheckpointHandle> archive_pin_cache;
     std::uint64_t next_archive_id = 1;
     std::uint64_t archive_polls   = 0;
     // Attached by the rank program after startup: the Host context arena, whose base turns
@@ -575,6 +578,10 @@ public:
         archive_dirty      = true;
     }
     void archive_register(CheckpointHandle handle, const CheckpointState& record);
+    // Registered-but-unsaved checkpoints, capped at kArchiveSavePins (reclaim.cpp): returned
+    // as plain-release exclusions so reclaim must demote them instead of retiring them.
+    [[nodiscard]] std::span<const CheckpointHandle> archive_save_pins(
+        std::span<const CheckpointHandle> seed) const;
     void archive_discard(CheckpointHandle handle) noexcept;
     void archive_flush();
     [[nodiscard]] std::optional<context::ContextArchiveLink::Candidate>
