@@ -121,6 +121,66 @@ int main() {
                     "another lineage matched");
         }
         {
+            // Two page kinds sharing one digest key (pools overlap frontiers) plus
+            // state-image bytes: the flat-key collision that dropped kind-1 pages live,
+            // and the state blob layout [metadata][role][sentinel][image ranks].
+            context::ContextArchiveLink::Options opts = options(root / "kinds", 1ULL << 20);
+            opts.page_bytes                           = {kPageBytes, kPageBytes / 2};
+            context::ContextArchiveLink link(opts);
+            auto entry               = entry_for(a, 700);
+            const auto shared_key    = a.key_at(700);
+            entry.page_keys[0]       = {shared_key};
+            entry.page_keys[1]       = {shared_key};
+            const auto state_meta_bytes = entry.state.size();
+            const std::vector<std::byte> state_meta(entry.state.begin(), entry.state.end());
+            std::vector<std::byte> main(kPageBytes), mtp(kPageBytes / 2), image(77);
+            for (std::size_t i = 0; i < main.size(); ++i) main[i] = pattern(800, i);
+            for (std::size_t i = 0; i < mtp.size(); ++i) mtp[i] = pattern(801, i);
+            for (std::size_t i = 0; i < image.size(); ++i) image[i] = pattern(802, i);
+            const std::array<context::ContextArchiveLink::StagedPage, 2> staged{
+                {{shared_key, {main.data(), main.size(), Device::cpu()}, 0},
+                 {shared_key, {mtp.data(), mtp.size(), Device::cpu()}, 1}}};
+            link.register_checkpoint(1, std::move(entry));
+            const ConstMemorySpan state_part{image.data(), image.size(), Device::cpu()};
+            const auto two_kind_result = link.flush(1, staged, {&state_part, 1});
+            if (two_kind_result != context::ContextArchiveLink::FlushResult::Committed) {
+                const auto s = link.stats();
+                std::cerr << "DEBUG result=" << static_cast<int>(two_kind_result)
+                          << " enabled=" << link.enabled()
+                          << " budget=" << s.saves_skipped_budget
+                          << " staging=" << s.saves_skipped_staging << "\n";
+            }
+            require(two_kind_result == context::ContextArchiveLink::FlushResult::Committed,
+                    "a two-kind offer with state bytes was declined");
+            link.flush_all();
+            const auto candidate = link.find(1, 700, [&](std::uint32_t f) { return a.key_at(f); });
+            require(candidate && candidate->frontier == 700, "the two-kind save was not found");
+            const auto prefetch = link.prefetch(*candidate);
+            require(prefetch->wait_for(std::chrono::seconds(10)) ==
+                        DiskContextArchive::Prefetch::Status::Ready,
+                    "two-kind prefetch did not become ready");
+            const auto read_main = prefetch->pages(0);
+            const auto read_mtp  = prefetch->pages(1);
+            require(read_main.size() == kPageBytes && read_mtp.size() == kPageBytes / 2,
+                    "two-kind page sizes differ");
+            require(std::memcmp(read_main.data(), main.data(), kPageBytes) == 0,
+                    "kind-0 page bytes differ");
+            require(std::memcmp(read_mtp.data(), mtp.data(), kPageBytes / 2) == 0,
+                    "kind-1 page bytes differ (flat-key collision regression)");
+            const auto read_state = prefetch->state();
+            std::cerr << "MARK sizes main=" << read_main.size() << " mtp=" << read_mtp.size()
+                      << " state=" << read_state.size() << " expect_state="
+                      << (state_meta_bytes + image.size()) << "\n";
+            require(read_state.size() == state_meta_bytes + image.size(),
+                    "state blob size differs");
+            require(std::memcmp(read_state.data(), state_meta.data(), state_meta_bytes) == 0,
+                    "state metadata block differs");
+            require(std::memcmp(read_state.data() + state_meta_bytes, image.data(),
+                                image.size()) == 0,
+                    "state image bytes differ");
+            std::cerr << "MARK2 two-kind block passed\n";
+        }
+        {
             // Persistence across instances: the restarted engine rediscovers the checkpoint.
             context::ContextArchiveLink link(options(root / "basic", 1ULL << 20));
             require(link.stats().saves_committed == 0, "stats leaked across instances");
