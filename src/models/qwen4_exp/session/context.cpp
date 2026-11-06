@@ -204,6 +204,15 @@ detail::SessionImpl::plan_binding(const RequestBasePlan& base, runtime::LaneId l
             plan.evaluation.source_valid = false;
             return plan;
         }
+        // A pending archive save pins its checkpoint here too: retiring it would discard a
+        // save whose pages already paid their demotion cost (RETIRED-PENDING kills the save).
+        if (archive_enabled()) {
+            const auto pins = archive_save_pins({});
+            if (std::find(pins.begin(), pins.end(), point) != pins.end()) {
+                plan.evaluation.source_valid = false;
+                return plan;
+            }
+        }
         plan.retired.push_back(point);
         for (std::uint16_t pool = 0; pool < directory.pool_count(); ++pool)
             retired_prefixes[pool].push_back(&checkpoints.at(point).snapshot.prefix(pool));
