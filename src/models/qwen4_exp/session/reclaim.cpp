@@ -599,6 +599,13 @@ Session::plan_releases(std::span<const CheckpointHandle> allowed,
 ContextReclaimPlan Session::plan_reclaim(std::span<const CheckpointHandle> allowed,
                                          std::span<const CheckpointHandle> excluded,
                                          const ContextDemand& demand) const {
+    // Demote->save->Host-cleanup handoff: reclaim can only demote pinned groups after Host
+    // space frees up, Host space frees up after committed saves drop their Host replicas,
+    // and saves commit in archive_flush - which otherwise only runs on transaction publish,
+    // unreachable while prefill starves on reclaim. The flush is budget-paced internally
+    // (one bounded sweep per call), so polling it here is the fork's pacing, not a new
+    // unbounded wait. Non-const cast is sound: archive state is not part of reclaim facts.
+    const_cast<Session*>(this)->impl_->archive_flush();
     return impl_->plan_reclaim(allowed, excluded, demand);
 }
 
@@ -635,6 +642,9 @@ std::size_t Session::release_redundant_host(std::span<const CheckpointHandle> ex
                                             std::optional<SequenceHandle> keep) {
     auto& session = *impl_;
     if (!detail::has_host(session)) return 0;
+    // Committed saves make their Host replicas redundant; flush first so this sweep can
+    // drop them (same pacing argument as plan_reclaim).
+    session.archive_flush();
     const auto protected_images = session.checkpoint_images(excluded);
     std::vector<CheckpointHandle> all;
     for (std::uint32_t i = 0; i < session.checkpoints.size(); ++i) {
