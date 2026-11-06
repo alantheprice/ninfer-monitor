@@ -106,6 +106,22 @@ public:
         prune(session);
         std::vector<SourceChoice> result;
         if (enabled_) {
+            // NVMe archive import: before matching against the (volatile) in-memory index,
+            // give the model a chance to restore a matching archived checkpoint into the
+            // store. The import registers the result through publish() below, so the next
+            // candidates() round (or this one, via the shared entry) finds it naturally.
+            if constexpr (requires { session.archive_import(base); }) {
+                if (session.archive_enabled() && !own_resume) {
+                    try {
+                        if (const auto imported = session.archive_import(base)) {
+                            publish(session, 0, *imported);
+                        }
+                    } catch (const std::exception&) {
+                        // The import refuses operation-adjacent sessions itself; treat any
+                        // residual failure as "no archived source".
+                    }
+                }
+            }
             for (const auto handle : index_.matches(session, base)) {
                 if (session.checkpoint_metadata(handle).frontier > maximum_frontier) { continue; }
                 for (const auto& owner : owners_) {

@@ -272,6 +272,7 @@ public:
     // Startup attach surface: the rank program hands its Host context arena to the archive
     // seam before the engine starts serving (see engine startup attach block).
     [[nodiscard]] bool archive_enabled() const noexcept;
+    void attach_archive_host_arena_mut(ninfer::MemorySpan arena);
     void attach_archive_host_arena(ninfer::ConstMemorySpan arena);
 
 private:
@@ -413,9 +414,15 @@ public:
                  const qwen::PrefixShortlistDigests& digests) const;
     [[nodiscard]] std::shared_ptr<ninfer::DiskContextArchive::Prefetch>
     archive_prefetch(const context::ContextArchiveLink::Candidate& candidate) const;
+    // Restores one archived checkpoint into the store as a Host-resident SharedPrefix the
+    // prefix cache can bind; bounded (single prefetch wait) and CPU-only. Returns nullopt
+    // when the archive has no match, the import already ran, or the session is mid-operation.
+    [[nodiscard]] std::optional<CheckpointHandle>
+    archive_import(const RequestBasePlan& base);
     // Attached once after startup by the owning rank program; the Host context arena turns
     // archive staging bindings into CPU addresses.
     void attach_archive_host_arena(ninfer::ConstMemorySpan arena);
+    void attach_archive_host_arena_mut(ninfer::MemorySpan arena);
 
 private:
     std::unique_ptr<detail::SessionImpl> impl_;

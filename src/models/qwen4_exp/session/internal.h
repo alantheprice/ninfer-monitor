@@ -329,6 +329,9 @@ public:
         archive_host_arena = arena;
         archive_dirty      = true;
     }
+    void attach_archive_host_arena_mut(ninfer::MemorySpan arena) {
+        archive_host_arena_mut = arena;
+    }
     // Registered-but-unsaved checkpoints, FIFO capped at kArchiveSavePins (reclaim.cpp).
     // Const: reclaim quotes run on const sessions; the memo is mutable, overflow eviction
     // happens at registration. The seed's entries are skipped (already excluded upstream).
@@ -379,10 +382,14 @@ public:
     std::unique_ptr<context::ContextArchiveLink> archive_;
     std::unordered_map<std::uint32_t, std::uint64_t> archive_ids;
     mutable std::vector<CheckpointHandle> archive_pin_cache;
+    // Imported manifests this boot: manifest id -> published handle (invalid once retired).
+    std::unordered_map<std::uint64_t, CheckpointHandle> import_memo;
     std::uint64_t next_archive_id = 1;
     std::uint64_t archive_polls   = 0;
     // Host context arena attached once after startup; staging bindings resolve against it.
+    // The mutable view backs import-side record fills (restores write, saves read).
     ConstMemorySpan archive_host_arena;
+    MemorySpan archive_host_arena_mut;
     bool archive_dirty = false;
     context::MetadataAccount count_storage{directory.metadata_budget()};
     TokenCountBuilder count_builder;

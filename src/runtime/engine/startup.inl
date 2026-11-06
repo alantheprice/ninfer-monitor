@@ -111,6 +111,13 @@ prepare_program(const Setup& setup, RankModelInstance<typename Setup::Types>& in
                         instance.program->host_context_span());
                 }
             }
+            if constexpr (requires { prepared_session->attach_archive_host_arena_mut(
+                              instance.program->host_context_span_mut()); }) {
+                if (prepared_session->archive_enabled()) {
+                    prepared_session->attach_archive_host_arena_mut(
+                        instance.program->host_context_span_mut());
+                }
+            }
             device.synchronize();
             ready = device_memory_snapshot(device.device());
             if (budget.fits(*ready)) {

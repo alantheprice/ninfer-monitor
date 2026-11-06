@@ -37,6 +37,7 @@ public:
 
     // Host context arena backing checkpoint page replicas; empty when the Host tier is off.
     [[nodiscard]] ConstMemorySpan host_context_span() const { return host_context_.span(); }
+    [[nodiscard]] MemorySpan host_context_span_mut() { return host_context_.span(); }
 
     [[nodiscard]] MemorySpan workspace_storage() { return workspace_.span(); }
 

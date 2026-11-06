@@ -352,6 +352,10 @@ void PreparedSession::attach_archive_host_arena(ninfer::ConstMemorySpan arena) {
     if (impl_) impl_->attach_archive_host_arena(arena);
 }
 
+void PreparedSession::attach_archive_host_arena_mut(ninfer::MemorySpan arena) {
+    if (impl_) impl_->attach_archive_host_arena_mut(arena);
+}
+
 PreparedSession prepare_session(std::shared_ptr<const ModelDefinition> definition,
                                 SessionPlan plan) {
     return PreparedSession(
@@ -394,6 +398,10 @@ Session::archive_prefetch(const context::ContextArchiveLink::Candidate& candidat
 void Session::attach_archive_host_arena(ninfer::ConstMemorySpan arena) {
     impl_->archive_host_arena = arena;
     impl_->archive_dirty      = true;
+}
+
+void Session::attach_archive_host_arena_mut(ninfer::MemorySpan arena) {
+    impl_->archive_host_arena_mut = arena;
 }
 
 bool Session::has_context_operation() const noexcept {

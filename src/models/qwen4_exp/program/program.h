@@ -45,6 +45,8 @@ public:
     // Host context arena backing checkpoint page replicas; consumed by the session's
     // disk-archive seam to resolve staging bindings into CPU addresses.
     [[nodiscard]] ConstMemorySpan host_context_span() const;
+    // Writable view of the same pinned arena for restore-side record fills.
+    [[nodiscard]] MemorySpan host_context_span_mut();
     [[nodiscard]] std::optional<GraphMemorySummary> graph_memory_observation() const;
     [[nodiscard]] RankMemoryBudget resource_budget() const;
     void reset_measurement_peaks() noexcept;
