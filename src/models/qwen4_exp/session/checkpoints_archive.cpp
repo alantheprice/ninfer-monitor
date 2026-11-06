@@ -102,7 +102,8 @@ void SessionImpl::archive_register(CheckpointHandle handle, const Checkpoint& re
     if (record.frontier() == 0 || record.snapshot.prefixes().empty() ||
         !record.snapshot.prefix(0).valid())
         return;
-    // Diagnostics: NINFER_ARCHIVE_TRACE=1 traces register/flush outcomes to stderr. The
+    // Diagnostics: NINFER_ARCHIVE_TRACE=1 traces register/flush outcomes; =2 adds noisy
+    // per-sweep probes. The
     // archive is on the hot path only at demotion boundaries; getenv here is startup-cheap.
     static const bool trace = [] {
         const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
@@ -235,8 +236,12 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
             const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
             return v && v[0] == '1';
         }();
+        static const bool trace_noise = [] {
+            const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
+            return v && v[0] == '2';
+        }();
         const auto pool_count = directory.pool_count();
-        if (trace) {
+        if (trace_noise) {
             const auto& m = record.snapshot.continuation().metadata;
             const auto entry_slot = archive_ids.find(handle.index);
             std::fprintf(stderr,
