@@ -139,8 +139,8 @@ template <class ConvGeometry, class Gemv, int KWarps = 4, int AggregateColumns =
 void dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
               const ConstStateFieldView& states, const Tensor& valid, Tensor& query, Tensor& key,
               Tensor& value, Tensor& z, Publish publish, bool aggregate, cudaStream_t stream) {
-    if (x.ne[1] < 1 || x.ne[1] > 16 || x.ne[2] < 1 || x.ne[2] > 8 ||
-        (aggregate && (x.ne[1] > 8 || x.ne[1] * x.ne[2] > AggregateColumns)) ||
+    if (x.ne[1] < 1 || x.ne[1] > 16 || x.ne[2] < 1 || x.ne[2] > 16 ||
+        (aggregate && (x.ne[1] > 16 || x.ne[1] * x.ne[2] > AggregateColumns)) ||
         (!aggregate && x.ne[2] != 1))
         throw std::invalid_argument("Q8 fused convolution: invalid temporal tile");
     static constexpr auto launches =

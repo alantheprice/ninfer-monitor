@@ -109,7 +109,7 @@ void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, Tensor& output
 
     const std::int32_t batch = input.ne[2];
     const std::int32_t width = input.ne[1];
-    if (input.ne[0] != 5120 || (width < 2 || width > 16) || batch < 1 || batch > 8 ||
+    if (input.ne[0] != 5120 || (width < 2 || width > 16) || batch < 1 || batch > 16 ||
         input.ne[3] != 1) {
         throw std::invalid_argument(
             "rmsnorm_pack_tail: input must have shape [5120,W,B], W=2..16, B=1..8");

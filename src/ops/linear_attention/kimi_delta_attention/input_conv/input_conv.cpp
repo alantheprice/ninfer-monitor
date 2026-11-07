@@ -19,7 +19,7 @@ void validate_profile(const LinearProfile& p) {
 
 std::size_t capacity(const LinearProfile& p, int batch, int first, int last, bool update) {
     validate_profile(p);
-    if (batch < 1 || batch > 8 || first < 1 || last < first)
+    if (batch < 1 || batch > 16 || first < 1 || last < first)
         throw std::invalid_argument("KDA input: invalid batch or token interval");
     if (last > std::numeric_limits<int>::max() / batch)
         throw std::overflow_error("KDA input: flattened token extent exceeds int32");

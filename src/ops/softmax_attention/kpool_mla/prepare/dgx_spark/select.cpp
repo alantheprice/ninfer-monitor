@@ -26,7 +26,7 @@ PrepareGeometry prepare_geometry(const KpoolMlaPrepareProfile& p, KpoolMlaStorag
         (index_format != KvCacheVectorFormat::BFloat16 &&
          index_format != KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0) ||
         p.hidden != 4096 || p.latent_dim != 512 || p.index_dim != 128 || p.query_rank != q ||
-        p.index_heads != heads || p.pool_size != 4 || batch < 1 || batch > 8 || lo <= 0 ||
+        p.index_heads != heads || p.pool_size != 4 || batch < 1 || batch > 16 || lo <= 0 ||
         hi < lo || sms <= 0)
         throw std::invalid_argument("Kpool Prepare: unsupported geometry, format or extent");
     return {768 + q + heads, q, heads};

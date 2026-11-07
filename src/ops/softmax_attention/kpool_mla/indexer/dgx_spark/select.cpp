@@ -10,7 +10,7 @@ void indexer_geometry(const KpoolIndexerProfile& p, KvCacheVectorFormat format,
     require(format == KvCacheVectorFormat::BFloat16 ||
                 format == KvCacheVectorFormat::Fp8E4m3fnGroup128Ue8m0,
             "unsupported Indexer format");
-    require(lo > 0 && hi >= lo && batch >= 1 && batch <= 8 && sms > 0, "Indexer T/B/device");
+    require(lo > 0 && hi >= lo && batch >= 1 && batch <= 16 && sms > 0, "Indexer T/B/device");
     require(envelope.max_visible_tokens <= kKpoolMaxVisibleTokens, "Indexer context limit");
 }
 

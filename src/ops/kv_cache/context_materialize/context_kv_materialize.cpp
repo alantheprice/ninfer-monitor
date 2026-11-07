@@ -52,7 +52,7 @@ void require_weight(const Weight& weight, const char* name, Device device) {
 }
 
 void require_profile(std::int32_t width, std::int32_t batch) {
-    if (batch < 1 || batch > 8 || width < 1) {
+    if (batch < 1 || batch > 16 || width < 1) {
         throw std::invalid_argument("context_kv_materialize: invalid W/B");
     }
     if (width <= kBlockWidth) return;
@@ -61,7 +61,7 @@ void require_profile(std::int32_t width, std::int32_t batch) {
 }
 
 void require_interval(std::int32_t batch, std::int32_t min_width, std::int32_t max_width) {
-    if (batch < 1 || batch > 8 || min_width < 1 || max_width < min_width) {
+    if (batch < 1 || batch > 16 || min_width < 1 || max_width < min_width) {
         throw std::invalid_argument("context_kv_materialize workspace: invalid interval");
     }
     if (batch == 1) {

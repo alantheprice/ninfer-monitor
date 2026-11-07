@@ -81,7 +81,7 @@ RecurrenceGeometry validate_recurrent_batch_update(const Tensor& q, const Tensor
                                                    ConstStateFieldView source_state,
                                                    StateFieldView destination_state,
                                                    const Tensor& out, Device device) {
-    constexpr std::int32_t kMaximumBatch = 8;
+    constexpr std::int32_t kMaximumBatch = 16;
     common::operand::dtype(q, DType::BF16, "gated_delta_net", "q must be BF16");
     common::operand::dtype(k, DType::BF16, "gated_delta_net", "k must be BF16");
     common::operand::dtype(v, DType::BF16, "gated_delta_net", "v must be BF16");

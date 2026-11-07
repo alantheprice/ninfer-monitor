@@ -7,7 +7,7 @@ namespace {
 constexpr detail::qsa::ViewValidation v{"qsa_indexer"};
 
 void profile(int lo, int hi, int batch, QsaIndexerExecutionEnvelope envelope) {
-    v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 8, "T/B interval");
+    v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 16, "T/B interval");
     v.require(envelope.max_visible_tokens <= detail::qsa::kIndexerMaxVisibleTokens,
               "visible-token capacity");
 }

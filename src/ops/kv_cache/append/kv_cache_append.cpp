@@ -100,7 +100,7 @@ void validate_inputs(const Tensor& k, const Tensor& v, const Tensor& positions,
     const std::int32_t tokens = k.ne[2];
     const std::int32_t batch  = k.ne[3];
     if (tokens < 1) { throw std::invalid_argument("kv_cache_append_prefix: T must be positive"); }
-    if (batch < 1 || batch > 8) {
+    if (batch < 1 || batch > 16) {
         throw std::invalid_argument("kv_cache_append_prefix: B must be 1..8");
     }
     require_shape(k, head_dim, kv_heads, tokens, batch, kPrefixAppendOp, "k");

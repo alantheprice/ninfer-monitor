@@ -11,7 +11,7 @@ select_sliding_window_attention_plan(std::uint32_t window, std::int32_t tokens, 
     if (window != 2048 && window != 4096) {
         throw std::invalid_argument("sliding_window_attention plan: unsupported window");
     }
-    if (tokens < 1 || tokens > 16 || batch < 1 || batch > 8) {
+    if (tokens < 1 || tokens > 16 || batch < 1 || batch > 16) {
         throw std::invalid_argument(
             "sliding_window_attention plan: T must be 1..16 and B must be 1..8");
     }

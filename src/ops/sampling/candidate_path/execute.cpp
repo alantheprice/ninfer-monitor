@@ -5,7 +5,7 @@
 
 namespace ninfer::ops::candidate_path_detail {
 SelectorRoute select_candidate_path(int steps, int batch) {
-    if (steps < 1 || steps > 15 || batch < 1 || batch > 8)
+    if (steps < 1 || steps > 15 || batch < 1 || batch > 16)
         throw std::invalid_argument("invalid selector K/B");
     return steps <= 4 ? SelectorRoute::Direct : SelectorRoute::Lattice;
 }

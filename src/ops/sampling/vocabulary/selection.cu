@@ -169,7 +169,7 @@ void vocabulary_candidates(const Tensor& logits, int token_begin, int token_doma
                            const Tensor& drafts, Tensor& keys, MemoryArena& workspace,
                            CudaExecutionView execution) {
     const int rows = logits.ne[0], tokens = logits.ne[1], batch = logits.ne[2], cap = keys.ne[0];
-    if (tokens <= 0 || batch < 1 || batch > 8 || token_begin < 0 || token_domain <= 0)
+    if (tokens <= 0 || batch < 1 || batch > 16 || token_begin < 0 || token_domain <= 0)
         throw std::invalid_argument("vocabulary_candidates: invalid vocabulary or T/B");
     const auto columns  = std::int64_t(tokens) * batch;
     const auto selected = plan(rows, columns, cap);

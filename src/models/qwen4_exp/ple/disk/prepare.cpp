@@ -5,6 +5,7 @@
 #include "ninfer/types.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -45,8 +46,8 @@ struct PrepareService::Impl {
     struct Window {
         MemorySpan output;
         std::vector<std::int32_t> ids;
-        std::array<SequenceIdentity, 8> identities{};
-        std::array<std::uint32_t, 8> known{}, planned{}, valid{};
+        std::array<SequenceIdentity, kMaximumConcurrency> identities{};
+        std::array<std::uint32_t, kMaximumConcurrency> known{}, planned{}, valid{};
         std::uint64_t generation = 0;
         std::uint32_t tokens = 0, batch = 0;
         PrepareStatus status = PrepareStatus::Preparing;
@@ -172,7 +173,7 @@ struct PrepareService::Impl {
                     std::array<std::uint32_t, 32 * kHeads> rows;
                     hash_tokens({ids + start, count}, tail, eos, table.parameters().hash,
                                 std::span(rows).first(count * kHeads));
-                    for (std::size_t r = 0; r < count * kHeads; ++r)
+                                        for (std::size_t r = 0; r < count * kHeads; ++r)
                         reader.request(i, (b * w.tokens + start) * kHeads + r, rows[r]);
                     w.planned[b] += count;
                     budget -= count;
@@ -299,7 +300,7 @@ void PrepareService::append(Ticket ticket, std::span<const Append> rows) {
     auto& w = p.get(ticket);
     if (w.sealed || w.cancelled || w.status != PrepareStatus::Preparing)
         throw std::invalid_argument("PLE window is closed to append");
-    std::array<bool, 8> seen{};
+    std::array<bool, kMaximumConcurrency> seen{};
     for (const auto& row : rows) {
         if (row.batch_row >= w.batch || seen[row.batch_row] ||
             row.ids.size() > w.tokens - w.known[row.batch_row])

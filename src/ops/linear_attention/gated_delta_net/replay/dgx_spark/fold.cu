@@ -134,7 +134,7 @@ __global__ __launch_bounds__(common::kWarpSize* kFoldWarps, 2) void fold_kernel(
 
 static_assert(sizeof(GdnReplayFoldKernelRow) == 32);
 static_assert(alignof(GdnReplayFoldKernelRow) == 16);
-static_assert(sizeof(GdnReplayFoldKernelRows) == 256);
+static_assert(sizeof(GdnReplayFoldKernelRows) == 512);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 

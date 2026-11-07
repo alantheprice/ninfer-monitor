@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/memory.h"
+#include "ninfer/types.h"
 
 #include <array>
 #include <span>
@@ -32,8 +33,8 @@ struct Append {
 
 struct InputWindow {
     std::uint32_t tokens, batch;
-    std::array<std::uint32_t, 8> valid_columns;
-    std::array<SequenceIdentity, 8> identities;
+    std::array<std::uint32_t, kMaximumConcurrency> valid_columns;
+    std::array<SequenceIdentity, kMaximumConcurrency> identities;
 };
 
 // Ready BF16 [2560,T,B] words, dimension zero fastest; inactive columns are exact +0.

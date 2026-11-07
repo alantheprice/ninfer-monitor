@@ -12,7 +12,7 @@ namespace ninfer::ops::detail::gated_delta_net {
 namespace {
 static_assert(sizeof(GdnReplayFoldKernelRow) == 32);
 static_assert(alignof(GdnReplayFoldKernelRow) == 16);
-static_assert(sizeof(GdnReplayFoldKernelRows) == 256);
+static_assert(sizeof(GdnReplayFoldKernelRows) == 512);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 

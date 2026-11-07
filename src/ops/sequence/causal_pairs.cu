@@ -66,7 +66,7 @@ void prepare_causal_pairs(const CausalPairInputs& in, const CausalPairOutputs& o
     constexpr const char* op = "prepare_causal_pairs";
     const int d = in.hidden.ne[0], w = in.hidden.ne[1], b = in.hidden.ne[2];
     const int p = out.hidden.ne[1], c = out.hidden.ne[2];
-    if (d <= 0 || d % 8 || w < 1 || p < 1 || b < 1 || b > 8 || c < 1 || c > 8 ||
+    if (d <= 0 || d % 8 || w < 1 || p < 1 || b < 1 || b > 16 || c < 1 || c > 16 ||
         (!in.rows.data && c != b))
         throw std::invalid_argument("prepare_causal_pairs: invalid shape");
     check_hidden(in.hidden, {d, w, b}, "hidden", cuda);

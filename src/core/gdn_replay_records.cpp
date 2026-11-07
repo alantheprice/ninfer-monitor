@@ -9,7 +9,7 @@ namespace ninfer {
 namespace {
 
 constexpr std::size_t kRecordAlignment        = 256;
-constexpr std::int32_t kMaximumRecordCapacity = 8;
+constexpr std::int32_t kMaximumRecordCapacity = 16;
 
 void require_positive(std::int32_t value, const char* label) {
     if (value <= 0) {

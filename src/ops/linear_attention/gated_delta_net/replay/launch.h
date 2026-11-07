@@ -8,7 +8,7 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail::gated_delta_net {
-inline constexpr std::int32_t kMaximumReplayRows = 8;
+inline constexpr std::int32_t kMaximumReplayRows = 16;
 
 enum class FoldGeometryId { Layers48Heads48, Layers30Heads32, Layers36Heads48, Layers36Heads24 };
 
