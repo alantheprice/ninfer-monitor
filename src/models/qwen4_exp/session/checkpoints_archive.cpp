@@ -4,6 +4,7 @@
 #include "models/common/context/work.h"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -190,7 +191,61 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
         if (archive_pin_cache.size() == room) break;
     }
     return archive_pin_cache;
-}void SessionImpl::archive_flush() {
+}// Save-driven demotion, poll-slot only: the flush (which runs on plan/retire paths)
+// merely marks archive_demote_want; this runs inside Session::poll where the session is
+// quiescent, mirroring try_pending_maintenance's guards. One attempted demotion per call;
+// the archive's write budget paces saves, never the reverse (2026-10-30 wedge rules).
+void SessionImpl::try_archive_demote() {
+    const bool trace = kArchiveTrace;
+    if (operation || pending_maintenance || release_ticket || compute ||
+        executor->has_pending_work()) {
+        return;
+    }
+    while (!archive_demote_want.empty()) {
+        const auto handle = archive_demote_want.front();
+        if (!checkpoints.valid(handle)) {
+            archive_demote_want.erase(archive_demote_want.begin());
+            continue;
+        }
+        auto plan = demotion(std::span{&handle, 1});
+        if (!plan) {
+            // Nothing movable (fully Host-resident, or not demotable right now); drop the
+            // want - the stall bound in the flush retires the save if residency never comes.
+            archive_demote_want.erase(archive_demote_want.begin());
+            return;
+        }
+        ContextDemand demand;
+        const auto target_ids = demand.add_host(host_requirements(*plan));
+        const auto placement  = directory.assess(demand, {});
+        if (!placement.feasible() || placement.requires_maintenance()) return;
+        auto execution = executor->try_reserve(runtime::FrameKind::Context);
+        if (!execution) return;
+        auto reserved = directory.reserve(demand);
+        if (!reserved.reservation || !reserved.reservation->ready()) {
+            reserved.reservation.reset();
+            return;
+        }
+        DemoteOperation action{std::move(plan), {}, std::move(target_ids)};
+        action.sources.push_back(checkpoints.lease(handle));
+        try {
+            operation = std::make_unique<ContextOperation>(directory, std::move(action),
+                                                           std::move(*execution));
+            const auto& saved_plan = *std::get<DemoteOperation>(operation->action).plan;
+            if (!prepare_demotion(operation->migration, saved_plan, *reserved.reservation,
+                                  std::get<DemoteOperation>(operation->action).targets)) {
+                throw std::logic_error("save demotion lost its destination");
+            }
+            submit_context();
+            if (trace) std::fprintf(stderr, "archive-flush: SAVE-DEMOTE queued\n");
+        } catch (...) {
+            cancel_operation();
+            throw;
+        }
+        return;
+    }
+}
+
+void SessionImpl::archive_flush() {
     const bool trace = kArchiveTrace;
     if (!archive_ || !archive_->enabled() || !archive_dirty) return;
     if (!archive_host_arena.data) return;
@@ -275,18 +330,40 @@ std::span<const CheckpointHandle> SessionImpl::archive_save_pins(
                                  static_cast<unsigned long long>(id));
                 continue;
             }
+            // Mark the save as wanting Host residency; the poll slot attempts one demotion
+            // per sweep (try_archive_demote). The flush itself never starts demotions.
+            if (std::find(archive_demote_want.begin(), archive_demote_want.end(), handle) ==
+                archive_demote_want.end()) {
+                archive_demote_want.push_back(handle);
+            }
             // No pressure means no demotion, so a device-resident checkpoint may never become
-            // Host-resident. Bound the pin: retire the save after too many idle sweeps (the
-            // 12-per-boot flush cadence makes ~4 sweeps ≈ 5 minutes of stalled pins).
-            constexpr std::uint32_t kArchiveStallSweeps = 4;
-            if (++archive_stalls[id] >= kArchiveStallSweeps) {
-                archive_stalls.erase(id);
-                archive_->discard_checkpoint(id);
-                entry = archive_ids.erase(entry);
-                if (trace)
-                    std::fprintf(stderr, "archive-flush: id=%llu DISCARDED (stalled, no host tier)\n",
-                                 static_cast<unsigned long long>(id));
-                continue;
+            // Host-resident. Bound the pin by WALL TIME, not sweeps: an idle engine spins
+            // sweeps at kHz rates, and the queued save-demotion needs seconds to complete.
+            // Sweeps with pending work are skipped entirely - they could not have run a
+            // demotion anyway, so they cannot count as stall evidence.
+            constexpr std::uint64_t kArchiveStallSeconds = 600;
+            if (!executor->has_pending_work()) {
+                const auto now = std::chrono::steady_clock::now();
+                auto started   = archive_stalls.find(id);
+                if (started == archive_stalls.end()) {
+                    archive_stalls.emplace(id, now.time_since_epoch().count());
+                } else if (now.time_since_epoch().count() - started->second >=
+                           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                               std::chrono::seconds(kArchiveStallSeconds))
+                               .count()) {
+                    archive_stalls.erase(started);
+                    archive_->discard_checkpoint(id);
+                    entry = archive_ids.erase(entry);
+                    archive_demote_want.erase(
+                        std::remove(archive_demote_want.begin(), archive_demote_want.end(),
+                                    handle),
+                        archive_demote_want.end());
+                    if (trace)
+                        std::fprintf(stderr,
+                                     "archive-flush: id=%llu DISCARDED (stalled, no host tier)\n",
+                                     static_cast<unsigned long long>(id));
+                    continue;
+                }
             }
             work_remains = true;
             ++entry;

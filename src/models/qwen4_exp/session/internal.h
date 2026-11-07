@@ -382,9 +382,16 @@ public:
     std::unique_ptr<context::ContextArchiveLink> archive_;
     std::unordered_map<std::uint32_t, std::uint64_t> archive_ids;
     // Pending saves that never became Host-resident retire with their checkpoint after this
-    // many flush sweeps. Without pressure (no demotions) a save can only stall; a stalled
-    // save pins its checkpoint, which keeps the save pending - the pin must be bounded.
-    std::unordered_map<std::uint64_t, std::uint32_t> archive_stalls;
+    // long without progress (steady_clock nanoseconds at first sighting). Without pressure
+    // (no demotions) a save can only stall; a stalled save pins its checkpoint, which keeps
+    // the save pending - the pin must be bounded, but by time, not sweep count.
+    std::unordered_map<std::uint64_t, std::chrono::steady_clock::rep> archive_stalls;
+    // Checkpoints whose pending save needs Host residency and may still reach it. The flush
+    // only marks this queue (it runs on plan/retire paths); the demotion attempt itself runs
+    // exclusively from the serialized poll slot (try_archive_demote), never alongside
+    // admission or executor callbacks.
+    std::vector<CheckpointHandle> archive_demote_want;
+    void try_archive_demote();
     mutable std::vector<CheckpointHandle> archive_pin_cache;
     // Imported manifests this boot: manifest id -> published handle (invalid once retired).
     std::unordered_map<std::uint64_t, CheckpointHandle> import_memo;

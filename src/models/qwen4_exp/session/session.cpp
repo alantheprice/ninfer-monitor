@@ -461,7 +461,10 @@ std::optional<SessionEvent> Session::poll() {
             if (p.pending_maintenance) (void)p.try_pending_maintenance();
             p.submit_releases();
             // Archive staging is polled work: bounded, throttled, never queued (wedge rules).
-            if (p.archive_dirty && (p.archive_polls++ & 0x7) == 0) p.archive_flush();
+            if (p.archive_dirty && (p.archive_polls++ & 0x7) == 0) {
+                p.archive_flush();
+                p.try_archive_demote();
+            }
             auto event = p.executor->poll();
             if (!event) return {};
             std::visit(

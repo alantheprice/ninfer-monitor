@@ -197,7 +197,8 @@ std::optional<CheckpointHandle> Session::archive_import(const RequestBasePlan& b
         auto& states = p.directory.states();
         const auto shell = states.reserve_destination(targets.take(state_device_id), 0);
         if (!shell) throw std::invalid_argument("import state device reservation failed");
-        states.freeze(*shell);
+        // ReservedDestination -> ActiveMutable (freeze() requires the promoted role).
+        states.complete_initialization(*shell);
         auto transfer = states.reserve_device_to_host(*shell, targets.take(state_host_id));
         if (!transfer) throw std::invalid_argument("import state host reservation failed");
         {
@@ -219,6 +220,10 @@ std::optional<CheckpointHandle> Session::archive_import(const RequestBasePlan& b
                         bytes);
         }
         transfer->publish(true);
+        // The D2H transfer has landed its Host replica; promote the image to
+        // CheckpointImmutable before the device donor replica is dropped (freeze requires
+        // no pending replica; after publish there is none).
+        states.freeze(*shell);
         if (!states.drop_device_replica(*shell))
             throw std::invalid_argument("import state donor drop failed");
 
