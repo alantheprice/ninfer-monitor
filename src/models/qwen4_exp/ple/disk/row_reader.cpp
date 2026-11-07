@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <cstdio>
 #include <stdexcept>
 #include <system_error>
 
@@ -392,11 +393,21 @@ void RowReader::begin(std::uint32_t id, std::span<std::uint16_t> output, bool re
 void RowReader::request(std::uint32_t owner_id, std::uint32_t destination, std::uint32_t row_id) {
     auto& p     = *impl_;
     auto& owner = p.owner(owner_id);
-    if (destination >= owner.output.size() / kRowElements || row_id >= p.table.parameters().rows)
+    if (destination >= owner.output.size() / kRowElements || row_id >= p.table.parameters().rows) {
+        std::fprintf(stderr,
+                     "PLE-DBG invalid row request: owner=%u dest=%u out_rows=%zu row_id=%u\n",
+                     owner_id, destination, owner.output.size() / kRowElements, row_id);
         throw std::invalid_argument("invalid PLE row request");
+    }
     const auto target_id = owner_id * p.owner_rows + destination;
     auto& target         = p.targets[target_id];
-    if (target.row != none) throw std::invalid_argument("PLE destination already requested");
+    if (target.row != none) {
+        std::fprintf(stderr,
+                     "PLE-DBG duplicate destination: owner=%u dest=%u prior_row=%u owners=%zu "
+                     "owner_rows=%zu\n",
+                     owner_id, destination, target.row, p.owners.size(), p.owner_rows);
+        throw std::invalid_argument("PLE destination already requested");
+    }
     ++p.stats.rows;
     auto id = p.row_index.find(mix(row_id), [&](auto i) { return p.rows[i].id == row_id; });
     if (id == none) {
