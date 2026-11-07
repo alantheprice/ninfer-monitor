@@ -861,6 +861,44 @@ void HttpServer::handle_usage(httplib::Response& res) const {
           {"decode_tok_per_s", window_decode_tps},
           {"prefill_tokens_last_window", window_prefill_tokens},
           {"decode_tokens_last_window", window_decode_tokens}}},
+        {"speculative",
+         [&] {
+              const auto rounds   = stats.speculative_rounds;
+              const auto drafted  = stats.speculative_draft_tokens;
+              const auto accepted = stats.speculative_accepted_tokens;
+              auto per_pos = nlohmann::json::array();
+              for (std::size_t i = 0; i < stats.speculative_attempted_per_position.size(); ++i) {
+                  const auto attempted =
+                      stats.speculative_attempted_per_position.at(i);
+                  const auto pos_accepted =
+                      i < stats.speculative_accepted_per_position.size()
+                          ? stats.speculative_accepted_per_position.at(i)
+                          : 0;
+                  per_pos.push_back(
+                      {{"position", i},
+                       {"attempted", attempted},
+                       {"accepted", pos_accepted},
+                       {"acceptance_pct",
+                        attempted != 0 ? 100.0 * static_cast<double>(pos_accepted) /
+                                             static_cast<double>(attempted)
+                                       : 0.0}});
+              }
+              return nlohmann::json{
+                  {"enabled", !stats.speculative_attempted_per_position.empty()},
+                  {"rounds", rounds},
+                  {"draft_tokens", drafted},
+                  {"accepted_tokens", accepted},
+                  {"accepted_pct",
+                   drafted != 0 ? 100.0 * static_cast<double>(accepted) /
+                                      static_cast<double>(drafted)
+                                : 0.0},
+                  {"mean_accepted_per_round",
+                   rounds != 0 ? static_cast<double>(accepted) / static_cast<double>(rounds)
+                               : 0.0},
+                  {"committed_draft_tokens", stats.speculative_committed_draft_tokens},
+                  {"fallback_steps", stats.speculative_fallback_steps},
+                  {"per_position", std::move(per_pos)}};
+          }()},
         {"requests",
          {{"total", stats.requests.completed + stats.requests.failed},
           {"completed", stats.requests.completed},
