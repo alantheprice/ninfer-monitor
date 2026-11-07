@@ -445,11 +445,13 @@ public:
     void publish(Session& session, OwnerToken token, Handle handle) {
         if (!session.valid_checkpoint(handle)) { return; }
         const auto summary = session.checkpoint_metadata(handle);
-        if (!enabled_ || !token) {
+        if (!enabled_) {
             release_unreferenced(session, handle);
             return;
         }
         if (summary.role == CheckpointRole::SharedPrefix) {
+            // A SharedPrefix registration outlives any single owner, so it is valid with or
+            // without a token; ownerless publishes arrive from the NVMe archive import.
             for (auto& entry : shared_) {
                 if (entry.handle == handle) return;
                 const auto prior = session.checkpoint_metadata(entry.handle);

@@ -77,6 +77,7 @@ struct PoolImport {
     std::uint32_t frontier = 0;
     context::ContextDemandId device{};
     context::ContextDemandId host{};
+    context::HistoryId history{};
 };
 
 } // namespace detail
@@ -160,18 +161,19 @@ std::optional<CheckpointHandle> Session::archive_import(const RequestBasePlan& b
             const auto main_pages = context::kv_pages_for_frontier(main_frontier);
             detail::PoolImport main_plan{.pool = 0, .kind = 0, .pages = main_pages,
                                          .frontier = main_frontier};
-            main_plan.device = demand.add_history(0, main_pages, context::ContextMemory::Device);
+            main_plan.device = demand.add_history(0, p.directory.pool(0).histories().binding_demand(
+                                          nullptr, 0, main_frontier, {}));
             main_plan.host = demand.add_history(0, main_pages, context::ContextMemory::Host);
             pool_plans.push_back(main_plan);
             if (mtp) {
                 const auto backend_pages = context::kv_pages_for_frontier(backend_frontier);
-                detail::PoolImport backend_plan{.pool = 1, .kind = 1, .pages = backend_pages,
-                                                .frontier = backend_frontier};
-                backend_plan.device =
-                    demand.add_history(1, backend_pages, context::ContextMemory::Device);
-                backend_plan.host =
-                    demand.add_history(1, backend_pages, context::ContextMemory::Host);
-                pool_plans.push_back(backend_plan);
+                        detail::PoolImport backend_plan{.pool = 1, .kind = 1, .pages = backend_pages,
+                                        .frontier = backend_frontier};
+        backend_plan.device =
+            demand.add_history(1, p.directory.pool(1).histories().binding_demand(
+                                      nullptr, 0, backend_frontier, {}));
+        backend_plan.host =
+            demand.add_history(1, backend_pages, context::ContextMemory::Host);pool_plans.push_back(backend_plan);
             }
         }
         auto state_device_demand = context::StateDemand{};
@@ -189,6 +191,9 @@ std::optional<CheckpointHandle> Session::archive_import(const RequestBasePlan& b
 
         context::ContextTransaction migration(p.directory);
         auto& targets = *reserved.reservation;
+        // commit_history/prepare_write/deactivate all require the Reserved stage, so every
+        // history action below rides `migration` before prepare_actions(); nothing is queued
+        // after preparation (2026-11-06 stale-history terminate).
 
         // --- State image via the donor pattern: device-born shell, a D2H transfer to it as
         // the Host record allocation, archived bytes written into those records, publish
@@ -197,8 +202,12 @@ std::optional<CheckpointHandle> Session::archive_import(const RequestBasePlan& b
         auto& states = p.directory.states();
         const auto shell = states.reserve_destination(targets.take(state_device_id), 0);
         if (!shell) throw std::invalid_argument("import state device reservation failed");
-        // ReservedDestination -> ActiveMutable (freeze() requires the promoted role).
+        // Donor-pattern order: the shell must be CheckpointImmutable BEFORE the D2H donor
+        // transfer (reserve_device_to_host rejects ActiveMutable), so promote + freeze on the
+        // empty device-born shell first; the Host replica is filled by memcpy below, and the
+        // donor device replica is dropped after publish.
         states.complete_initialization(*shell);
+        states.freeze(*shell);
         auto transfer = states.reserve_device_to_host(*shell, targets.take(state_host_id));
         if (!transfer) throw std::invalid_argument("import state host reservation failed");
         {
@@ -220,62 +229,122 @@ std::optional<CheckpointHandle> Session::archive_import(const RequestBasePlan& b
                         bytes);
         }
         transfer->publish(true);
-        // The D2H transfer has landed its Host replica; promote the image to
-        // CheckpointImmutable before the device donor replica is dropped (freeze requires
-        // no pending replica; after publish there is none).
-        states.freeze(*shell);
+        // Host replica landed; the shell is already CheckpointImmutable (frozen pre-transfer),
+        // so just drop the device donor replica.
         if (!states.drop_device_replica(*shell))
             throw std::invalid_argument("import state donor drop failed");
 
-        // --- Pages, pool by pool: device-born working set bound on the fresh-history path,
-        // grown to the archived page count through the ordinary write preparation, Host
-        // replicas filled from the contiguous per-kind archive span, device replicas dropped.
+        // --- Pages, pool by pool: device-born working set bound on the fresh-history path
+        // through the import transaction (publish() runs publish_restores + prepare_mapping,
+        // the commit() preconditions), then Host replicas filled from the contiguous
+        // per-kind archive span, device replicas dropped.
         std::vector<context::HistoryPrefix> prefixes;
-        for (const auto& plan : pool_plans) {
+        std::vector<std::vector<context::RecordReservation>> host_record_sets;
+        const auto part_bytes_for = [&](const context::PageDirectory& pages) {
+            return pages.layout().parts.empty() ? std::size_t{0}
+                                                : pages.layout().parts.front().record.bytes;
+        };
+        for (std::size_t index = 0; index < pool_plans.size(); ++index) {
+            auto& plan = pool_plans[index];
             auto& pool = p.directory.pool(plan.pool);
             auto& histories = pool.histories();
-            auto& pages = pool.pages();
             auto binding = histories.prepare_binding(nullptr, 0, plan.frontier, 0,
                                                      targets.take(plan.device), false, {});
             const auto history = binding.history();
-            auto owner = binding.commit();
-            histories.prepare_write(owner, 0, plan.frontier, migration);
+            migration.add_binding(plan.pool, std::move(binding));
+            // Split the Host page records per rank now; materialize after publish.
             auto host_records = targets.take(plan.host);
+            std::vector<context::RecordReservation> per_rank;
+            per_rank.reserve(pool.pages().layout().parts.size());
+            for (std::size_t i = 0; i < pool.pages().layout().parts.size(); ++i)
+                per_rank.push_back(host_records.split(static_cast<std::uint32_t>(plan.pages)));
+            host_record_sets.push_back(std::move(per_rank));
             const auto staged_pages = prefetch->pages(plan.kind);
-            const auto part_bytes = pages.layout().parts.empty()
-                                        ? std::size_t{0}
-                                        : pages.layout().parts.front().record.bytes;
+            const auto part_bytes = part_bytes_for(pool.pages());
             const auto frontier_pages = context::kv_pages_for_frontier(plan.frontier);
             if (plan.pages != frontier_pages ||
                 staged_pages.size() < std::size_t{part_bytes} * frontier_pages)
                 throw std::invalid_argument("archived page count differs from the frontier");
+        }
+
+        // --- Publish the transaction: restores + mappings land, bindings become committable
+        migration.prepare_actions();
+        migration.mark_submitted();
+        migration.adopt();
+        migration.mark_completed();
+        migration.publish();
+
+        // --- Fill Host page replicas from the archived spans and shed device donors. The
+        // mappings exist now (logical_page resolves). settle carries the writers + the
+        // deactivation; one transaction per pool, published inside the loop.
+        for (std::size_t index = 0; index < pool_plans.size(); ++index) {
+            const auto& plan = pool_plans[index];
+            auto& pool = p.directory.pool(plan.pool);
+            auto& histories = pool.histories();
+            auto& pages = pool.pages();
+            context::ContextTransaction settle(p.directory);
+            // Post-publish commit: the binding now has published restores + prepared mapping
+            // + its row; commit() hands back the owned history with the row attached.
+            auto owner = migration.binding(plan.pool)->commit();
+            const auto history_id = owner.handle();
+            // Acquire writers on every page and commit the frontier: prepare_write ->
+            // commit_frontier raises the per-page coverage to the archived shape. The
+            // deactivation below then releases the writers, so the page-fill D2H read that
+            // follows sees clean replicas (read_device rejects a live writer).
+            histories.prepare_write(owner, 0, plan.frontier, settle);
+            settle.commit_history(histories, history_id, plan.frontier, plan.frontier);
+            settle.prepare_actions();
+            settle.mark_submitted();
+            settle.adopt();
+            settle.mark_completed();
+            settle.publish();
+            // Prefix first: retain_prefix requires the committed frontier. Then deactivate
+            // on a SECOND transaction (settle is already Published): releases writers +
+            // active references while the transaction retains the pages for the prefix.
+            prefixes.push_back(histories.retain_prefix(history_id, plan.frontier));
+            {
+                context::ContextTransaction retire(p.directory);
+                histories.deactivate(history_id, retire);
+                retire.prepare_actions();
+                retire.mark_submitted();
+                retire.adopt();
+                retire.mark_completed();
+                retire.publish();
+            }
+            const auto staged_pages = prefetch->pages(plan.kind);
+            const auto part_bytes = part_bytes_for(pages);
+            const auto frontier_pages = context::kv_pages_for_frontier(plan.frontier);
             for (std::uint32_t i = 0; i < frontier_pages; ++i) {
-                const auto page = histories.logical_page(history, i);
-                for (const auto& part : pages.layout().parts) {
-                    auto backup = pages.prepare_host_replica(
-                        page, part.rank, host_records.materialize(part.rank));
-                    const auto span = pages.host_binding(page, part.rank);
-                    if (span.bytes != part_bytes)
+                const auto page = histories.logical_page(history_id, i);
+                auto& per_rank = host_record_sets[index];
+                for (std::size_t r = 0; r < pages.layout().parts.size(); ++r) {
+                    const auto& part = pages.layout().parts[r];
+                    auto lease = per_rank.at(r).materialize(part.rank);
+                    const auto destination = lease.binding();
+                    if (destination.bytes != part_bytes)
                         throw std::invalid_argument("page record size differs from the layout");
-                    if (span.offset < 0 ||
-                        static_cast<std::size_t>(span.offset) + part_bytes >
+                    if (destination.offset < 0 ||
+                        static_cast<std::size_t>(destination.offset) + part_bytes >
                             p.archive_host_arena_mut.bytes)
                         throw std::invalid_argument("page host record is outside the arena");
-                    std::memcpy(p.archive_host_arena_mut.data + span.offset,
+                    auto backup = pages.prepare_host_replica(page, part.rank, std::move(lease));
+                    if (destination.bytes != part_bytes)
+                        throw std::invalid_argument("page record size differs from the layout");
+                    if (destination.offset < 0 ||
+                        static_cast<std::size_t>(destination.offset) + part_bytes >
+                            p.archive_host_arena_mut.bytes)
+                        throw std::invalid_argument("page host record is outside the arena");
+                    std::memcpy(p.archive_host_arena_mut.data + destination.offset,
                                 staged_pages.data() + std::size_t{i} * part_bytes, part_bytes);
-                    // publish() validates the device coverage the write preparation set up;
-                    // afterwards the empty device replica is droppable (writer released by
-                    // the deactivate below, no readers exist during import).
+                    // Host bytes staged; the published backup leaves the device replica
+                    // intact, and the drop below removes it (no readers during import).
                     backup.publish();
                     if (!pages.drop_device_replica(page, part.rank))
                         throw std::invalid_argument("import page donor drop failed");
                 }
             }
-            prefixes.push_back(histories.retain_prefix(history, plan.frontier));
-            histories.deactivate(history, migration);
         }
-
-        // --- Publish the checkpoint and hand it to the cache like a captured one ---
+        // The prefixes reference the (now host-resident, deactivated) histories.
         auto continuation = context::Continuation{.image = *shell, .metadata = metadata};
         auto snapshot_identity = std::make_shared<detail::Identity>();
         snapshot_identity->tokens = std::move(parsed.tokens);
@@ -289,10 +358,6 @@ std::optional<CheckpointHandle> Session::archive_import(const RequestBasePlan& b
                  states, std::move(continuation), std::move(prefixes),
                  std::move(snapshot_identity)),
              static_cast<runtime::CheckpointRole>(role_raw)});
-        migration.prepare_actions();
-        migration.mark_submitted();
-        migration.mark_completed();
-        migration.publish();
         p.import_memo.at(candidate->manifest) = handle;
         static const bool trace = [] {
             const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
