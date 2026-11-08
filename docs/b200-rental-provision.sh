@@ -6,7 +6,7 @@ set -euo pipefail
 
 NINFER_GIT="https://github.com/alantheprice/ninfer-monitor"
 NINFER_BRANCH="port/fleet-features"
-NINFER_COMMIT="311f9408"          # b200 target + plan doc; update if the branch moves
+: "${NINFER_COMMIT:?export NINFER_COMMIT=<head sha> — passed by the operator at pod create}"
 B2_BUCKET="${B2_BUCKET:-t1-45-bg}"          # export before running, or edit here
 B2_PREFIX="${B2_PREFIX:-models/flash-next-ninfer}"  # remote path holding the artifact directory
 ART_DIR="/srv/ninfer-artifact"
@@ -66,12 +66,12 @@ echo "artifact container OK: entry=$ENTRY"
 echo "== [5/6] engine source + build"
 mkdir -p "$ENGINE_DIR" && cd "$ENGINE_DIR"
 # Preferred: source tarball staged on B2 (private repo — no clone credentials on the pod).
-rclone copy "b2b:${B2_BUCKET}/src/ninfer-port-${NINFER_COMMIT}.tar.gz" /tmp/srctar \
+rclone copy "b2b:${B2_BUCKET}/src/ninfer-port-current.tar.gz" /tmp/srctar \
   --transfers 2 || true
-if [ -f /tmp/srctar/ninfer-port-${NINFER_COMMIT}.tar.gz ]; then
-  mkdir -p src && tar xzf /tmp/srctar/ninfer-port-${NINFER_COMMIT}.tar.gz -C src
+if [ -f /tmp/srctar/ninfer-port-current.tar.gz ]; then
+  mkdir -p src && tar xzf /tmp/srctar/ninfer-port-current.tar.gz -C src
 else
-  echo "FATAL: source tarball src/ninfer-port-${NINFER_COMMIT}.tar.gz missing from bucket"
+  echo "FATAL: source tarball src/ninfer-port-current.tar.gz missing from bucket"
   exit 1
 fi
 cd src && git rev-parse HEAD 2>/dev/null | grep -q "${NINFER_COMMIT}" \
