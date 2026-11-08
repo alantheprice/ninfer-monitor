@@ -8,6 +8,10 @@
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/indexing.h"
 
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
 namespace ninfer::models::qwen4_exp::execution {
 
 TextRun::TextRun(const Parameters& p, TextExecution execution, BatchView batch, StateUpdate update,
@@ -150,6 +154,24 @@ void TextRun::combine(std::uint32_t i) {
     if (execution_.parallel) execution_.parallel->sum(roots_.output, cuda_);
     const auto& config = parameters_.profile->config.text;
     if (i + 1 == config.ple.layer) {
+        if (debug::enabled("NINFER_LAYER_DEBUG") && i < 2) {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_.stream()));
+            debug::Sample out, inj, res;
+            debug::sample_tensor(roots_.output, 0, out);
+            debug::sample_tensor(roots_.residual, 0, res);
+            debug::print("pre_hccombine_block", i, batch_.tokens, out);
+            debug::print("pre_hccombine_residual", i, batch_.tokens, res);
+            const auto* inj_ptr = static_cast<const float*>(roots_.injection.data);
+            const auto n = roots_.injection.ne[0] * roots_.injection.ne[1];
+            std::vector<float> host(static_cast<std::size_t>(n));
+            cudaMemcpy(host.data(), inj_ptr, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            std::uint32_t bad = 0;
+            for (auto v : host) bad += !std::isfinite(v);
+            std::fprintf(stderr, "LAYERDBG pre_hccombine_injection layer=%u n=%d nonfinite=%u "
+                                 "first=%.6g %.6g %.6g %.6g\n",
+                         i, n, bad, host[0], host.size() > 1 ? host[1] : 0.f,
+                         host.size() > 2 ? host[2] : 0.f, host.size() > 3 ? host[3] : 0.f);
+        }
         ops::hc_combine(roots_.residual, roots_.output, roots_.injection, roots_.residual, cuda_);
     } else {
         const auto& norm = i + 1 < config.layers.size()
