@@ -107,6 +107,8 @@ public:
     void prepare_mtp();
     void prepare_main();
     void prepare_device_ple(const execution::BatchView&);
+    // Env-gated diagnostic: dumps the PLE tail, ids, and embedding for batch row 0.
+    void probe_ple(const char* placement, const execution::BatchView&);
     [[nodiscard]] Tensor device_embedding(std::int32_t tokens, std::int32_t batch);
     void after_main();
     void prepare_decision();

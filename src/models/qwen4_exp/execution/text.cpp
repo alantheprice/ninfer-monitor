@@ -1,4 +1,5 @@
 #include "models/qwen4_exp/execution/text.h"
+#include "models/qwen4_exp/execution/debug_probe.h"
 #include "models/qwen4_exp/execution/gdn.h"
 #include "models/qwen4_exp/execution/qsa.h"
 #include "models/qwen4_exp/execution/ple.h"
@@ -29,12 +30,16 @@ void TextRun::stem(std::optional<models::vision::EmbeddingView> visual) {
     const auto& p = parameters_.text;
     ops::embedding(batch_.ids.view({batch_.tokens * batch_.batch}), p.embedding, roots_.input,
                    cuda_);
+    if (debug::enabled("NINFER_LAYER_DEBUG") && batch_.tokens == 1)
+        probe_activation("embedding", 0);
     if (visual)
         for (const auto& slice : visual->slices)
             ops::scatter(slice.features, slice.columns, roots_.input, cuda_);
     ops::hc_expand_norm(roots_.input, p.layers.front().attention_hc.norm,
                         parameters_.profile->config.text.norm_epsilon, roots_.residual,
                         roots_.normalized, cuda_);
+    if (debug::enabled("NINFER_LAYER_DEBUG") && batch_.tokens == 1)
+        probe_activation("expand_norm", 0);
 }
 
 bool TextRun::advance_layer(std::uint32_t i) {
@@ -46,6 +51,8 @@ bool TextRun::advance_layer(std::uint32_t i) {
     } else {
         if (execution_.experts && !execution_.experts->try_before_layer(p.moe.bank)) return false;
         mixer(i);
+        if (debug::enabled("NINFER_LAYER_DEBUG") && i == 0 && batch_.tokens == 1)
+            probe_activation("mixer", i);
         if (execution_.experts) {
             if (!execution_.experts->start(p.moe.bank, roots_.input, roots_.output,
                                            execution_.workspace, {})) {
@@ -54,9 +61,26 @@ bool TextRun::advance_layer(std::uint32_t i) {
             }
         } else
             resident_moe(i);
+        if (debug::enabled("NINFER_LAYER_DEBUG") && i == 0 && batch_.tokens == 1)
+            probe_activation("moe", i);
     }
     combine(i);
+    if (debug::enabled("NINFER_LAYER_DEBUG") && batch_.tokens == 1) probe_activation("combine", i);
     return true;
+}
+
+// Diagnostic only: synchronizes the compute stream and dumps the residual/normalized head and
+// tail for batch row 0. Gated by NINFER_LAYER_DEBUG and capped so a decode loop cannot flood.
+void TextRun::probe_activation(const char* stage, std::uint32_t layer) {
+    static std::uint32_t budget = 0;
+    if (budget >= 512) return;
+    ++budget;
+    CUDA_CHECK(cudaStreamSynchronize(cuda_.stream()));
+    debug::Sample residual, normalized;
+    debug::sample_tensor(roots_.residual, 0, residual);
+    debug::sample_tensor(roots_.normalized, 0, normalized);
+    debug::print(stage, layer, batch_.tokens, residual);
+    if (normalized.nan || normalized.inf) debug::print("norm", layer, batch_.tokens, normalized);
 }
 
 void TextRun::mixer(std::uint32_t i) {
@@ -158,9 +182,21 @@ void TextRun::finish(TextOutputs output, Tensor logits) {
     auto sample = output.sample.view(
         {dimension(parameters_.profile->config.text.hidden), batch_.tokens * batch_.batch});
     ops::hc_mix(roots_.normalized, p.final_hc.mix, execution_.workspace, sample, cuda_);
+    if (debug::enabled("NINFER_LAYER_DEBUG") && batch_.tokens == 1) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_.stream()));
+        debug::Sample hidden;
+        debug::sample_tensor(sample, 0, hidden);
+        debug::print("final_sample", parameters_.text.layers.size(), batch_.tokens, hidden);
+    }
     if (logits.data) {
         logits = logits.view({logits.ne[0], batch_.tokens * batch_.batch});
         project_head(sample, p.head, logits, execution_.workspace, cuda_);
+        if (debug::enabled("NINFER_LAYER_DEBUG") && batch_.tokens == 1) {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_.stream()));
+            debug::Sample head;
+            debug::sample_tensor(logits, 0, head);
+            debug::print("logits", parameters_.text.layers.size(), batch_.tokens, head);
+        }
     }
 }
 

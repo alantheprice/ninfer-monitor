@@ -39,6 +39,9 @@ public:
     void combine(std::uint32_t layer);
     void finish(TextOutputs, Tensor logits = {});
 
+    // Env-gated diagnostic: dumps residual/normalized for batch row 0 at a layer boundary.
+    void probe_activation(const char* stage, std::uint32_t layer);
+
     [[nodiscard]] Tensor& block_output() { return roots_.output; }
 
     void set_visible_tokens(std::uint32_t maximum) { batch_.max_visible_tokens = maximum; }

@@ -1,9 +1,11 @@
 #include "models/qwen4_exp/program/ple_pipeline.h"
+#include "models/qwen4_exp/execution/debug_probe.h"
 #include "models/qwen4_exp/program/resources.h"
 #include "core/nvtx.h"
 #include "core/transfer.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <string>
 #include <thread>
 
@@ -97,6 +99,19 @@ std::optional<ple::Ticket> PlePipeline::prepare(std::uint32_t tokens,
     if (w) throw std::logic_error("PLE producer reused a live window");
     prepared.ticket = *ticket;
     w.emplace(std::move(prepared));
+    if (execution::debug::enabled("NINFER_PLE_DEBUG")) {
+        static std::uint32_t budget = 0;
+        if (budget < 32) {
+            ++budget;
+            const auto& row = w->rows.front();
+            std::fprintf(stderr,
+                         "PLEDBG host tokens=%u rows=%zu known=%u valid=%u frontier=%llu "
+                         "raw_tail=[%d %d] ids=[%d %d %d %d]\n",
+                         tokens, w->rows.size(), w->known[0], w->valid[0],
+                         static_cast<unsigned long long>(row.frontier), row.raw_tail[0],
+                         row.raw_tail[1], w->ids[0], w->ids[1], w->ids[2], w->ids[3]);
+        }
+    }
     return ticket;
 }
 

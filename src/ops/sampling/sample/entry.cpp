@@ -3,9 +3,45 @@
 #include "ops/sampling/sample/plan.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cuda_runtime.h>
 #include <stdexcept>
 
 namespace ninfer::ops {
+namespace {
+// Diagnostic only: classifies the first decode-step logits. Gated by NINFER_LOGIT_DEBUG.
+void probe_logits(const Tensor& logits, std::int32_t token_domain, cudaStream_t stream) {
+    static const bool on = [] {
+        const char* v = getenv("NINFER_LOGIT_DEBUG");
+        return v && *v;
+    }();
+    static std::uint32_t budget = 0;
+    if (!on || budget >= 8) return;
+    ++budget;
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        std::fprintf(stderr, "LOGITDBG sync failed\n");
+        return;
+    }
+    constexpr int kWords = 8;
+    std::uint16_t head[kWords]{}, tail[kWords]{};
+    const auto* base = static_cast<const std::uint16_t*>(logits.data);
+    const auto rows  = logits.ne[0];
+    cudaMemcpy(head, base, kWords * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(tail, base + (rows - kWords) * (logits.nb[0] / 2), kWords * sizeof(std::uint16_t),
+               cudaMemcpyDeviceToHost);
+    std::uint32_t nan = 0;
+    for (int i = 0; i < kWords; ++i) {
+        nan += (head[i] & 0x7f80u) == 0x7f80u && (head[i] & 0x007fu);
+        nan += (tail[i] & 0x7f80u) == 0x7f80u && (tail[i] & 0x007fu);
+    }
+    std::fprintf(stderr, "LOGITDBG rows=%d B=%d domain=%d head=", rows, logits.ne[1], token_domain);
+    for (int i = 0; i < kWords; ++i) std::fprintf(stderr, "%04x ", head[i]);
+    std::fprintf(stderr, "tail=");
+    for (int i = 0; i < kWords; ++i) std::fprintf(stderr, "%04x ", tail[i]);
+    std::fprintf(stderr, "nan_in_sample=%u\n", nan);
+}
+} // namespace
 
 std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::int32_t min_lanes,
                                               std::int32_t max_lanes) {
@@ -57,6 +93,7 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
 
     auto scratch_scope       = workspace.scope();
     const auto plan          = sample_detail::select_plan(token_domain, logits.ne[1]);
+    probe_logits(logits, token_domain, stream);
     const std::size_t bytes  = plan.workspace.bytes;
     const MemorySpan scratch = bytes == 0 ? MemorySpan{} : workspace.alloc_bytes(bytes);
     sample_detail::launch(logits, out, token_domain, configs, logical_positions, purpose, plan,
