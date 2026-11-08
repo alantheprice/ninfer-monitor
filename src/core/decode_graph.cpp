@@ -48,6 +48,7 @@ void discard_capture(cudaStream_t stream) noexcept {
 
 } // namespace
 
+#include <cuda_runtime_api.h>
 #if !defined(CUDART_VERSION) || CUDART_VERSION < 12080
 #define ninfer_stream_capture_info cudaStreamGetCaptureInfo_v3
 // CUDA 12.x also lacks the edge-data parameter on dependency updates; route both
