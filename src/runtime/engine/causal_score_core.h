@@ -2,11 +2,14 @@
 
 #include "ninfer/types.h"
 #include "runtime/engine/context_capacity.h"
+#include "runtime/engine/engine_core.h"
 #include "runtime/executor/measurement.h"
 #include "runtime/observability/snapshot.h"
 
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <future>
 #include <memory>
@@ -182,6 +185,12 @@ private:
                 failed_ = true;
             }
             request.completion.set_exception(error);
+            // A failed executor poisons every later launch (lost CUDA context), so the core
+            // cannot recover in-process. Exit and let the supervisor restart the engine.
+            if (instance_.executor->failed()) {
+                std::fflush(stderr);
+                std::_Exit(kWorkerFailureExitCode);
+            }
         }
     }
 
@@ -270,6 +279,12 @@ private:
                 try {
                     job->promise.set_exception(error);
                 } catch (...) {}
+                // Once execution has started, the executor may be poisoned for the life of
+                // the process. Exit and let the supervisor restart the engine.
+                if (execution_started || instance_.executor->failed()) {
+                    std::fflush(stderr);
+                    std::_Exit(kWorkerFailureExitCode);
+                }
             }
         }
     }

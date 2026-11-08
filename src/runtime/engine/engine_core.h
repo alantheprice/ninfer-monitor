@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <future>
@@ -37,6 +38,10 @@
 #include <vector>
 
 namespace ninfer::runtime {
+
+// Worker failure is unrecoverable in-process, so the engine exits with this status and
+// relies on its supervisor to restart it.
+inline constexpr int kWorkerFailureExitCode = 70;
 
 template <class Instance>
 class EngineCore {

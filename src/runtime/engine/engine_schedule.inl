@@ -1190,7 +1190,12 @@ void EngineCore<Instance>::worker_loop() noexcept {
         } catch (...) {
             log_worker_failure(std::current_exception());
             fail_all(std::current_exception());
-            return;
+            // A dead worker cannot be restarted in-process: the failure may be a lost CUDA
+            // context (launch timeout, Xid, OOM) that poisons every later launch. Latching
+            // failed_ leaves the HTTP layer answering 503 forever with no way out, so exit
+            // and let the supervisor restart the whole engine instead.
+            std::fflush(stderr);
+            std::_Exit(kWorkerFailureExitCode);
         }
         if (outstanding) {
             const auto exposed = active_exposure_set();
