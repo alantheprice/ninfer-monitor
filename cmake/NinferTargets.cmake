@@ -25,6 +25,8 @@ if(CUDAToolkit_VERSION VERSION_LESS 12.9)
   # clean at -O2 (device allocator strategy differs; math identical).
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-O2>)
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-O2>)
+  # The reclaim ICE hits plain C++ TUs too (session/reclaim.cpp is a .cpp).
+  add_compile_options(-O2)
 endif()
 
 function(ninfer_cuda_non_rdc_archive target)
