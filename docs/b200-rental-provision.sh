@@ -7,8 +7,8 @@ set -euo pipefail
 NINFER_GIT="https://github.com/alantheprice/ninfer-monitor"
 NINFER_BRANCH="port/fleet-features"
 NINFER_COMMIT="13cbb7a9"          # b200 target + plan doc; update if the branch moves
-B2_BUCKET="${B2_BUCKET:-ninfer-artifacts}"   # export before running, or edit here
-B2_PREFIX="${B2_PREFIX:-flash-next}"
+B2_BUCKET="${B2_BUCKET:-t1-45-bg}"          # export before running, or edit here
+B2_PREFIX="${B2_PREFIX:-models}"            # remote path prefix holding the artifact
 ART_DIR="/srv/ninfer-artifact"
 ENGINE_DIR="/srv/ninfer"
 # Build happens on the rental box: CUDA toolkit install is ~2 min via network repo and
@@ -45,8 +45,13 @@ export PATH="$CUDA_DIR/bin:$PATH"
 echo "== [4/6] artifact download (Backblaze B2, resumed, verified)"
 mkdir -p "$ART_DIR" && cd "$ART_DIR"
 rclone version >/dev/null 2>&1 || { curl -s https://rclone.org/install.sh | bash; }
-# auth: either env B2_ACCOUNT_ID/B2_APPLICATION_KEY or `rclone config create b2 b2 ...` beforehand
-rclone copy "b2:${B2_BUCKET}/${B2_PREFIX}" "$ART_DIR" \
+# auth: B2_DOWNLOAD_KEY_ID / B2_DOWNLOAD_KEY exported in the environment (written from
+# ws6000's .env by the operator — never committed). S3-compatible endpoint, same as upload.
+: "${B2_DOWNLOAD_KEY:?need B2_DOWNLOAD_KEY}"; : "${B2_DOWNLOAD_KEY_ID:?need B2_DOWNLOAD_KEY_ID}"
+rclone config create b2b s3 provider Other \
+  access_key_id "$B2_DOWNLOAD_KEY_ID" secret_access_key "$B2_DOWNLOAD_KEY" \
+  endpoint "https://${B2_ENDPOINT:-s3.us-east-005.backblazeb2.com}" >/dev/null
+rclone copy "b2b:${B2_BUCKET}/${B2_PREFIX}" "$ART_DIR" \
   --transfers 8 --checkers 16 --b2-chunk-size 250M --progress --fast-list
 sha256sum -c sha256-manifest.txt
 
