@@ -48,11 +48,17 @@ void discard_capture(cudaStream_t stream) noexcept {
 
 } // namespace
 
+#if !defined(CUDART_VERSION) || CUDART_VERSION < 12080
+#define ninfer_stream_capture_info cudaStreamGetCaptureInfo_v3
+#else
+#define ninfer_stream_capture_info cudaStreamGetCaptureInfo
+#endif
+
 void DecodeGraphSection::capture(cudaStream_t stream, const std::function<void()>& body) {
     cudaStreamCaptureStatus status;
     cudaGraph_t graph = nullptr;
     check_graph(
-        cudaStreamGetCaptureInfo(stream, &status, nullptr, &graph, nullptr, nullptr, nullptr),
+        ninfer_stream_capture_info(stream, &status, nullptr, &graph, nullptr, nullptr, nullptr),
         "cudaStreamGetCaptureInfo");
     if (status != cudaStreamCaptureStatusActive)
         throw std::logic_error("a graph section requires an active parent capture");
@@ -120,7 +126,7 @@ DecodeGraphChild DecodeGraphDefinition::append_to(cudaStream_t stream) const {
     const cudaGraphNode_t* dependencies = nullptr;
     std::size_t count                   = 0;
     check_graph(
-        cudaStreamGetCaptureInfo(stream, &status, nullptr, &parent, &dependencies, nullptr, &count),
+        ninfer_stream_capture_info(stream, &status, nullptr, &parent, &dependencies, nullptr, &count),
         "cudaStreamGetCaptureInfo");
     if (!ready() || status != cudaStreamCaptureStatusActive)
         throw std::logic_error("appending a child requires a definition and active capture");
