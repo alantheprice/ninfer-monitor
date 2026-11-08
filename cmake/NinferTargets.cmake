@@ -14,6 +14,14 @@ function(ninfer_cuda_library target)
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
 
+# CUDA 12.x ptxas -O3 promotes large register arrays to static shared memory past
+# the 48KB per-kernel cap on sm_100a (nvlink rejects the result). Cap the device
+# optimizer at O2 for 12.x; -O2/-O3 differ only in allocation strategy here, not
+# in generated math. 13.x keeps its default O3.
+if(CUDAToolkit_VERSION VERSION_LESS 12.9)
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-O2>)
+endif()
+
 function(ninfer_cuda_non_rdc_archive target)
   set_target_properties(${target} PROPERTIES
     POSITION_INDEPENDENT_CODE ON
