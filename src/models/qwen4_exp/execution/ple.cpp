@@ -1,3 +1,4 @@
+#include "models/qwen4_exp/execution/debug_probe.h"
 #include "models/qwen4_exp/execution/ple.h"
 #include "models/qwen4_exp/execution/workspace.h"
 
@@ -10,6 +11,18 @@ void ple(const Tensor& embedding, const TextConfig& c, const PleParameters& p,
          CudaExecutionView cuda) {
     const auto h = dimension(c.hidden), streams = dimension(c.hc.streams);
     const auto channels = dimension(c.residual_width());
+    if (debug::enabled("NINFER_PLE_DEBUG")) {
+        static std::uint32_t budget = 0;
+        if (budget < 16) {
+            ++budget;
+            CUDA_CHECK(cudaStreamSynchronize(cuda.stream()));
+            debug::Sample emb, res;
+            debug::sample_tensor(embedding, 0, emb);
+            debug::sample_tensor(residual, 0, res);
+            debug::print("ple_in_embedding", c.ple.layer, batch.tokens, emb);
+            debug::print("ple_in_residual", c.ple.layer, batch.tokens, res);
+        }
+    }
     auto scope          = arena.scope();
     const auto t = batch.tokens, b = batch.batch, m = t * b;
     auto buffers = workspace::ple(arena, c, m, !records.values.data);
