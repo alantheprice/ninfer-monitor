@@ -51,7 +51,7 @@ bool TextRun::advance_layer(std::uint32_t i) {
     } else {
         if (execution_.experts && !execution_.experts->try_before_layer(p.moe.bank)) return false;
         mixer(i);
-        if (debug::enabled("NINFER_LAYER_DEBUG") && i == 0 && batch_.tokens == 1)
+        if (debug::enabled("NINFER_LAYER_DEBUG") && i < 3 && batch_.tokens == 1)
             probe_activation("mixer", i);
         if (execution_.experts) {
             if (!execution_.experts->start(p.moe.bank, roots_.input, roots_.output,
@@ -61,7 +61,7 @@ bool TextRun::advance_layer(std::uint32_t i) {
             }
         } else
             resident_moe(i);
-        if (debug::enabled("NINFER_LAYER_DEBUG") && i == 0 && batch_.tokens == 1)
+        if (debug::enabled("NINFER_LAYER_DEBUG") && i < 3 && batch_.tokens == 1)
             probe_activation("moe", i);
     }
     combine(i);
