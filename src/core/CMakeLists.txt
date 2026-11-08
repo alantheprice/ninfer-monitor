@@ -5,7 +5,7 @@ add_library(ninfer_cpu SHARED
 ninfer_internal_includes(ninfer_cpu)
 target_link_libraries(ninfer_cpu PRIVATE PkgConfig::HWLOC Threads::Threads)
 
-if(NINFER_TARGET STREQUAL "rtx5090" OR NINFER_TARGET STREQUAL "b200")
+if(NINFER_TARGET STREQUAL "rtx5090" OR NINFER_TARGET STREQUAL "b200" OR NINFER_TARGET STREQUAL "h200")
   add_library(ninfer_cpu_executor SHARED cpu/executor.cpp cpu/x86.cpp)
   ninfer_internal_includes(ninfer_cpu_executor)
   target_link_libraries(ninfer_cpu_executor PUBLIC ninfer_cpu)

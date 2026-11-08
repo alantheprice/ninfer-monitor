@@ -57,6 +57,41 @@ static_assert(alignof(Nvfp4QuantizedK16) == 8);
 
 __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+    // sm_90a and other pre-Blackwell targets have no e2m1 cvt instruction: software
+    // round-to-nearest-even with satfinite semantics, encoding |v| to {0,.5,1,1.5,2,3,4,6}.
+    // (Mirrors cuda_fp4.hpp's software path; raw asm below is kept for >= 1000 verbatim.)
+    const auto encode = [](float v) -> unsigned {
+        const float a = ::fabsf(v);
+        unsigned q;
+        if (a < 0.25F) { q = 0; }
+        else if (a < 0.75F) { q = 1; }
+        else if (a < 1.25F) { q = 2; }
+        else if (a < 1.75F) { q = 3; }
+        else if (a < 2.5F) { q = 4; }
+        else if (a < 3.5F) { q = 5; }
+        else if (a < 5.0F) { q = 6; }
+        else { q = 7; }
+        // tie-to-even at exact midpoints
+        const float mids[7] = {0.25F, 0.75F, 1.25F, 1.75F, 2.5F, 3.5F, 5.0F};
+        const unsigned lows[7] = {0, 1, 2, 3, 4, 5, 6};
+        for (int i = 0; i < 7; ++i) {
+            if (a == mids[i] && (lows[i] & 1U) != 0U) { q = lows[i]; }
+        }
+        return (v < 0.0F ? 8U : 0U) | q;
+    };
+    unsigned packed[8];
+    packed[0] = encode(values[0].y) << 4 | encode(values[0].x);
+    packed[1] = encode(values[1].y) << 4 | encode(values[1].x);
+    packed[2] = encode(values[2].y) << 4 | encode(values[2].x);
+    packed[3] = encode(values[3].y) << 4 | encode(values[3].x);
+    packed[4] = encode(values[4].y) << 4 | encode(values[4].x);
+    packed[5] = encode(values[5].y) << 4 | encode(values[5].x);
+    packed[6] = encode(values[6].y) << 4 | encode(values[6].x);
+    packed[7] = encode(values[7].y) << 4 | encode(values[7].x);
+    codes_lo = packed[0] | packed[1] << 8 | packed[2] << 16 | packed[3] << 24;
+    codes_hi = packed[4] | packed[5] << 8 | packed[6] << 16 | packed[7] << 24;
+#else
     asm volatile("{\n"
                  ".reg .b8 b0;\n"
                  ".reg .b8 b1;\n"
@@ -82,6 +117,7 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
                    "f"(values[2].x), "f"(values[2].y), "f"(values[3].x), "f"(values[3].y),
                    "f"(values[4].x), "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
                    "f"(values[6].x), "f"(values[6].y), "f"(values[7].x), "f"(values[7].y));
+#endif
 }
 
 // Calibrated activation profile, shared by BF16 inputs and FP32 MMA epilogues.

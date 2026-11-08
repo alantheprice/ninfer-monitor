@@ -21,7 +21,8 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-#if defined(NINFER_TARGET_B200) && NINFER_TARGET_B200
+#if (defined(NINFER_TARGET_B200) && NINFER_TARGET_B200) || \
+    (defined(NINFER_TARGET_H200) && NINFER_TARGET_H200)
 inline constexpr std::uint32_t kMaximumConcurrency = 128;
 #else
 inline constexpr std::uint32_t kMaximumConcurrency = 16;

@@ -64,8 +64,11 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
 // E4M3 dot product and keep the callers' existing row scales in FP32 after the MMA. No
 // operand repacking is needed. On datacenter Blackwell (sm_100a) the block-scale PTX is
 // not part of the target ISA; fall back to the plain FP8 MMA (functional, reduced
-// accumulate rate) until a tcgen05 path lands for that target.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1200)
+// accumulate rate) until a tcgen05 path lands for that target. Hopper (sm_90a) also has
+// no block-scale MMA (the feature postdates it) but its plain e4m3 m16n8k32 MMA is
+// native and full-rate (HMMA.16816.F32, ptxas-probed on CUDA 13.0.2), so the same
+// plain form + UE8M0 fold serves it.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 1200)
 __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                              unsigned b0, unsigned b1) {
@@ -145,18 +148,23 @@ __device__ __forceinline__ void mma_tf32(float& c0, float& c1, float& c2, float&
 
 // FP4 dot-product MMA. The kind::mxf4nvf4 block-scale form is sm_120a-family PTX:
 // datacenter Blackwell (sm_100a) has no warp-level FP4 MMA and no e2m1 hardware cvt
-// (tcgen05-only). On sm_100a every consumer must route through
-// nvfp4_mma_via_bf16() (dequant-to-bf16 + plain bf16 MMA) instead; the mma_nvfp4_e4m3
-// wrapper below keeps that choice in one place.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1200)
+// (tcgen05-only). Hopper (sm_90a) has neither either (ptxas-probed on CUDA 13.0.2:
+// mxf4nvf4/block_scale, tcgen05 and cvt..e2m1x2 are all rejected on sm_90a). On
+// sm_90a and sm_100a every consumer must route through nvfp4_mma_via_bf16-style
+// emulation (dequant-to-f16 + plain bf16 MMA) instead; the mma_nvfp4_e4m3 wrapper
+// below keeps that choice in one place.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 1200)
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-// sm_100a: no warp-level FP4 MMA
-// fp4 type conversions decode e2m1 in software. Dequantize each 16-element fragment to
-// FP16, convert to bf16, and accumulate with the plain bf16 MMA — the same numeric
-// contract as the block-scale form (UE4M3 scales folded at the fragment boundary into
-// FP32 accumulators). Replaced by a tcgen05 path for this target later.
+// sm_90a / sm_100a: no warp-level FP4 MMA and no e2m1 hardware cvt. The fragment
+// words carry pre-dequantized f16x2 pairs (producers stage them via
+// nvfp4_dequant_f16x16 / cvt.rn.f16x2.e2m1x2 before ldmatrix), so decode the e2m1
+// payload in software from those f16 pairs: dequantize to FP16, convert to bf16, and
+// accumulate with the plain bf16 MMA — the same numeric contract as the block-scale
+// form (UE4M3 scales folded at the fragment boundary into FP32 accumulators). The
+// plain bf16 and e4m3 MMA forms used here are legal on sm_90a (HMMA.16816.F32[.BF16]
+// in SASS) and sm_100a alike. Replaced by a tcgen05 path for these targets later.
 __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, float& c3,
                                                unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                                unsigned b0, unsigned b1, unsigned sfa,
@@ -188,6 +196,8 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, 
         b_bf[w] = *reinterpret_cast<const unsigned*>(&t);
     }
     mma_bf16(c0, c1, c2, c3, a_bf[0], a_bf[1], a_bf[2], a_bf[3], b_bf[0], b_bf[1]);
+    // UE4M3 scale fold: software e4m3 -> half -> float via the fp8 header (no e2m1 or
+    // block-scale hardware needed; the e4m3 unpack is native on sm_90a).
     const float fa = __half2float(__half{__nv_fp8_e4m3{static_cast<unsigned char>(sfa)}});
     const float fb = __half2float(__half{__nv_fp8_e4m3{static_cast<unsigned char>(sfb)}});
     const float s  = fa * fb;

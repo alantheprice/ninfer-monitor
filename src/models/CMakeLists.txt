@@ -77,7 +77,7 @@ ninfer_internal_includes(ninfer_model_execution)
 target_link_libraries(ninfer_model_execution
   PUBLIC ninfer_model_loading ninfer_model_control ninfer_ops ninfer_runtime_support)
 
-if(NINFER_TARGET STREQUAL "rtx5090" OR NINFER_TARGET STREQUAL "b200")
+if(NINFER_TARGET STREQUAL "rtx5090" OR NINFER_TARGET STREQUAL "b200" OR NINFER_TARGET STREQUAL "h200")
   target_link_libraries(ninfer_model_execution PRIVATE ninfer_cpu_executor)
   target_sources(ninfer_model_execution PRIVATE
     common/moe/offload/plan.cpp
