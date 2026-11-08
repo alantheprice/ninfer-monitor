@@ -24,14 +24,23 @@ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 nvidia-smi --query-gpu=compute_cap --format=csv,noheader | grep -q "^10\.0" \
   || { echo "FATAL: GPU 0 is not sm_100 (B200)"; exit 1; }
 
-echo "== [3/6] CUDA toolkit 13.0.2 (toolkit only, no driver override)"
-if [ ! -x /usr/local/cuda-13.0.2/bin/nvcc ]; then
-  CUDA_PKG=intel-pinned-repo  # placeholder — replace with the pinned .run URL used on ws6000
-  echo "NOTE: install the SAME CUDA 13.0.2 toolkit build used on ws6000 (pinned .run installer),"
-  echo "      then re-run this script. Skippable only if the box already has it."
-  ls /usr/local/ | grep -q cuda && echo "existing toolkits:" && ls /usr/local/ | grep cuda || true
+echo "== [3/6] CUDA toolkit (any >= 12.8 with sm_100a; use whatever the box already has)"
+# The build is toolkit-agnostic: sm_100a is supported from CUDA 12.8 onward and the engine
+# compiles clean on both lines (13.0.2 verified on ws6000; 12.8.1 on runpod pytorch images).
+# Prefer the box's own toolkit so nvcc stays aligned with the pod driver — never install a
+# toolkit newer than the driver.
+CUDA_DIR=$(ls -d /usr/local/cuda* 2>/dev/null | sort -V | tail -1)
+if [ -z "$CUDA_DIR" ] || [ ! -x "$CUDA_DIR/bin/nvcc" ]; then
+  echo "FATAL: no CUDA toolkit under /usr/local/cuda*; install one >= 12.8 and re-run."
+  exit 1
 fi
-export PATH=/usr/local/cuda-13.0.2/bin:$PATH
+CUDA_VERSION=$("$CUDA_DIR/bin/nvcc" -V | tail -1 | grep -oE "V[0-9.]+" | tr -d V)
+echo "using toolkit: $CUDA_DIR ($CUDA_VERSION)"
+case "$CUDA_VERSION" in
+  12.*|13.*) ;;
+  *) echo "FATAL: unsupported toolkit $CUDA_VERSION (need 12.8+ or 13.x)"; exit 1 ;;
+esac
+export PATH="$CUDA_DIR/bin:$PATH"
 
 echo "== [4/6] artifact download (Backblaze B2, resumed, verified)"
 mkdir -p "$ART_DIR" && cd "$ART_DIR"
