@@ -195,12 +195,12 @@ void CudaCopyBatch::submit(CudaExecutionView execution) const {
     std::size_t numAttrs = 1;
 #if !defined(CUDART_VERSION) || CUDART_VERSION < 12090
     CUDA_CHECK(::cudaMemcpyBatchAsync(reinterpret_cast<void**>(destinations_.data()),
-                                      reinterpret_cast<void**>(const_cast<void**>(sources_.data())),
+                                      const_cast<void**>(sources_.data()),
                                       sizes_.data(), count_, &attributes, &first, numAttrs, &first,
                                       execution.stream()));
 #else
     CUDA_CHECK(::cudaMemcpyBatchAsync(reinterpret_cast<void* const*>(destinations_.data()),
-                                      reinterpret_cast<const void* const*>(sources_.data()),
+                                      sources_.data(),
                                       sizes_.data(), count_, &attributes, &first, numAttrs,
                                       execution.stream()));
 #endif
@@ -241,12 +241,12 @@ void CudaHostCopyBatch::submit(CudaExecutionView execution) const {
     std::size_t numAttrs = 1;
 #if !defined(CUDART_VERSION) || CUDART_VERSION < 12090
     check_copy(::cudaMemcpyBatchAsync(reinterpret_cast<void**>(destinations_.data()),
-                                      reinterpret_cast<void**>(const_cast<void**>(sources_.data())),
+                                      const_cast<void**>(sources_.data()),
                                       sizes_.data(), count_, &attributes, &first, numAttrs, &first,
                                       execution.stream()));
 #else
     check_copy(::cudaMemcpyBatchAsync(reinterpret_cast<void* const*>(destinations_.data()),
-                                      reinterpret_cast<const void* const*>(sources_.data()),
+                                      sources_.data(),
                                       sizes_.data(), count_, &attributes, &first, numAttrs,
                                       execution.stream()));
 #endif
