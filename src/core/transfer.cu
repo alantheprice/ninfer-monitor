@@ -193,15 +193,15 @@ void CudaCopyBatch::submit(CudaExecutionView execution) const {
 #endif
     std::size_t first    = 0;
     std::size_t numAttrs = 1;
+    std::size_t total    = count_;
+    void** dsts          = const_cast<void**>(destinations_.data());
+    void** srcs          = const_cast<void**>(sources_.data());
+    auto* szs            = const_cast<std::size_t*>(sizes_.data());
 #if !defined(CUDART_VERSION) || CUDART_VERSION < 12090
-    CUDA_CHECK(::cudaMemcpyBatchAsync(const_cast<void**>(destinations_.data()),
-                                      const_cast<void**>(sources_.data()),
-                                      sizes_.data(), count_, &attributes, &first, numAttrs, &first,
+    CUDA_CHECK(::cudaMemcpyBatchAsync(dsts, srcs, szs, total, &attributes, &first, numAttrs, &first,
                                       execution.stream()));
 #else
-    CUDA_CHECK(::cudaMemcpyBatchAsync(destinations_.data(),
-                                      sources_.data(),
-                                      sizes_.data(), count_, &attributes, &first, numAttrs,
+    CUDA_CHECK(::cudaMemcpyBatchAsync(dsts, srcs, szs, total, &attributes, &first, numAttrs,
                                       execution.stream()));
 #endif
 }
@@ -239,15 +239,15 @@ void CudaHostCopyBatch::submit(CudaExecutionView execution) const {
 #endif
     std::size_t first    = 0;
     std::size_t numAttrs = 1;
+    std::size_t total    = count_;
+    void** dsts          = const_cast<void**>(destinations_.data());
+    void** srcs          = const_cast<void**>(sources_.data());
+    auto* szs            = const_cast<std::size_t*>(sizes_.data());
 #if !defined(CUDART_VERSION) || CUDART_VERSION < 12090
-    check_copy(::cudaMemcpyBatchAsync(const_cast<void**>(destinations_.data()),
-                                      const_cast<void**>(sources_.data()),
-                                      sizes_.data(), count_, &attributes, &first, numAttrs, &first,
+    check_copy(::cudaMemcpyBatchAsync(dsts, srcs, szs, total, &attributes, &first, numAttrs, &first,
                                       execution.stream()));
 #else
-    check_copy(::cudaMemcpyBatchAsync(destinations_.data(),
-                                      sources_.data(),
-                                      sizes_.data(), count_, &attributes, &first, numAttrs,
+    check_copy(::cudaMemcpyBatchAsync(dsts, srcs, szs, total, &attributes, &first, numAttrs,
                                       execution.stream()));
 #endif
 }
