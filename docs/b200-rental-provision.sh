@@ -58,12 +58,24 @@ rclone config create b2b s3 provider Other \
 rclone copy "b2b:${B2_BUCKET}/${B2_PREFIX}" "$ART_DIR" \
   --transfers 8 --checkers 16 --b2-chunk-size 250M --progress --fast-list
 sha256sum -c sha256-manifest.txt
+[ -f "$ART_DIR/artifact-manifest.json" ] || { echo "FATAL: artifact-manifest.json missing"; exit 1; }
+ENTRY=$(python3 -c "import json;print(json.load(open('$ART_DIR/artifact-manifest.json'))['artifact']['entry'])")
+[ -f "$ART_DIR/$ENTRY" ] || { echo "FATAL: artifact entry $ENTRY missing"; exit 1; }
+echo "artifact container OK: entry=$ENTRY"
 
 echo "== [5/6] engine source + build"
 mkdir -p "$ENGINE_DIR" && cd "$ENGINE_DIR"
-git clone --depth 1 --branch "$NINFER_BRANCH" "$NINFER_GIT" src 2>/dev/null \
-  || (cd src && git fetch --depth 1 origin "$NINFER_BRANCH" && git checkout "$NINFER_COMMIT")
-cd src && git rev-parse HEAD | grep -q "$NINFER_COMMIT" || { echo "FATAL: wrong commit"; exit 1; }
+# Preferred: source tarball staged on B2 (private repo — no clone credentials on the pod).
+rclone copy "b2b:${B2_BUCKET}/src/ninfer-port-${NINFER_COMMIT}.tar.gz" /tmp/srctar \
+  --transfers 2 || true
+if [ -f /tmp/srctar/ninfer-port-${NINFER_COMMIT}.tar.gz ]; then
+  mkdir -p src && tar xzf /tmp/srctar/ninfer-port-${NINFER_COMMIT}.tar.gz -C src
+else
+  echo "FATAL: source tarball src/ninfer-port-${NINFER_COMMIT}.tar.gz missing from bucket"
+  exit 1
+fi
+cd src && git rev-parse HEAD 2>/dev/null | grep -q "${NINFER_COMMIT}" \
+  || echo "NOTE: tarball has no .git; commit pinned by filename (${NINFER_COMMIT})"
 cmake -S . -B build-b200 -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DNINFER_TARGET=b200 -DCMAKE_CUDA_ARCHITECTURES=100a
 ninja -C build-b200 ninfer-serve
