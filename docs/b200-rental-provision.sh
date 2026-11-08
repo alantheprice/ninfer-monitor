@@ -45,9 +45,13 @@ export PATH="$CUDA_DIR/bin:$PATH"
 echo "== [4/6] artifact download (Backblaze B2, resumed, verified)"
 mkdir -p "$ART_DIR" && cd "$ART_DIR"
 rclone version >/dev/null 2>&1 || { curl -s https://rclone.org/install.sh | bash; }
-# auth: B2_DOWNLOAD_KEY_ID / B2_DOWNLOAD_KEY exported in the environment (written from
-# ws6000's .env by the operator — never committed). S3-compatible endpoint, same as upload.
-: "${B2_DOWNLOAD_KEY:?need B2_DOWNLOAD_KEY}"; : "${B2_DOWNLOAD_KEY_ID:?need B2_DOWNLOAD_KEY_ID}"
+# auth: B2_DOWNLOAD_KEY / B2_DOWNLOAD_KEY_ID exported in the environment, or one
+# positional argument "keyid:key" (parsed here, never echoed back).
+if [ -n "$1" ] && [ -z "$B2_DOWNLOAD_KEY" ]; then
+  B2_DOWNLOAD_KEY_ID="${1%%:*}"; B2_DOWNLOAD_KEY="${1#*:}"
+fi
+: "${B2_DOWNLOAD_KEY:?need B2_DOWNLOAD_KEY (env, or pass keyid:key as argument 1)}"
+: "${B2_DOWNLOAD_KEY_ID:?need B2_DOWNLOAD_KEY_ID (env, or pass keyid:key as argument 1)}"
 rclone config create b2b s3 provider Other \
   access_key_id "$B2_DOWNLOAD_KEY_ID" secret_access_key "$B2_DOWNLOAD_KEY" \
   endpoint "https://${B2_ENDPOINT:-s3.us-east-005.backblazeb2.com}" >/dev/null
