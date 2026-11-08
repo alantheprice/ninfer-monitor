@@ -1,0 +1,59 @@
+{
+ "model": "qwen3.8-flash-next",
+ "engine_commit": "13cbb7a9 (port/fleet-features)",
+ "artifact_id": "57cf9cd010e3475fac9481e8fc66fc0f",
+ "captured": "2026-11-07",
+ "temperature": 0.0,
+ "reasoning_effort": "none",
+ "protocol": "3x-exact agreement screen; MTP draft race makes single-shot goldens unstable \u2014 see b200-refdiff.py header",
+ "cases": [
+  {
+   "id": "refdiff-000",
+   "prompt": "Write a dense, precise technical paragraph about cache coherence protocols. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Cache coherence protocols, primarily implemented via directory-based or snooping-based architectures, enforce a single-writer-multiple-reader invariant by tracking line states (e.g., Modified, Exclusive, Shared, Invalid) and propagating invalidation or update messages",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-004",
+   "prompt": "Write a dense, precise technical paragraph about PCIe Gen5 signaling. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "PCIe Gen5 utilizes 32 GT/s PAM4 (Pulse Amplitude Modulation with 4 levels) signaling to double the data rate of Gen4 while maintaining the same 16 GHz Nyquist frequency, thereby preserving",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-011",
+   "prompt": "Write a dense, precise technical paragraph about distributed consensus quorums. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Distributed consensus quorums enforce data consistency by requiring a strict majority (typically $N/2 + 1$) of nodes to acknowledge a write operation before it is considered committed, thereby guaranteeing that any subsequent read operation intersects with",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-020",
+   "prompt": "Write a dense, precise technical paragraph about hash table probing schemes. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Hash table probing schemes resolve collisions by systematically searching for an empty slot within the underlying array, with linear probing offering cache-friendly sequential access but suffering from primary clustering, while quadratic probing and double hashing mitigate this by altering the step size based on the",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-021",
+   "prompt": "Write a dense, precise technical paragraph about interrupt affinity tuning. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Interrupt affinity tuning optimizes system latency and throughput by binding specific hardware interrupts to designated CPU cores via the `/proc/irq/<irq_number>/smp_affinity` interface, thereby minimizing cross-core cache coherency traffic and reducing interrupt handling",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-026",
+   "prompt": "Write a dense, precise technical paragraph about column store encodings. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Column store encodings optimize analytical query performance by compressing homogeneous data types within vertical segments, leveraging techniques like dictionary encoding, run-length encoding, and delta encoding to minimize I/O and CPU cycles during scan operations. A critical constraint is the high",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-027",
+   "prompt": "Write a dense, precise technical paragraph about database journaling modes. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Database journaling, primarily implemented via Write-Ahead Logging (WAL), ensures atomicity and durability by sequentially recording intent-to-modify operations in a persistent log before applying changes to the main data files, thereby guaranteeing crash recovery through redo",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-028",
+   "prompt": "Write a dense, precise technical paragraph about branch predictor design. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Modern branch predictors rely on dynamic history-based correlation, typically implemented via hybrid architectures like the TAGE (Tagged Geometric History Length) predictor, which utilizes multiple tagged tables indexed by varying lengths of global branch history to capture complex control flow dependencies",
+   "finish": "length"
+  }
+ ]
+}
