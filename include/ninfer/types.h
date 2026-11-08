@@ -21,7 +21,11 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-inline constexpr std::uint32_t kMaximumConcurrency               = 16;
+#if defined(NINFER_TARGET_B200) && NINFER_TARGET_B200
+inline constexpr std::uint32_t kMaximumConcurrency = 128;
+#else
+inline constexpr std::uint32_t kMaximumConcurrency = 16;
+#endif
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.

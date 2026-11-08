@@ -27,6 +27,8 @@ using common::nvfp4_activation_scale;
 using common::quantize_nvfp4_activation_pair;
 using common::nvfp4_dequant_f16x16;
 
+
+
 template <int Columns, bool Gate, int Stages = 2, int KStep = 128, int Eviction = 0,
           int Intermediate = kIntermediate>
 struct Schedule {

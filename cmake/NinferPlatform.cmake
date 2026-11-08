@@ -1,5 +1,5 @@
 set(NINFER_TARGET rtx5090 CACHE STRING "NInfer execution target")
-set_property(CACHE NINFER_TARGET PROPERTY STRINGS rtx5090 dgx_spark)
+set_property(CACHE NINFER_TARGET PROPERTY STRINGS rtx5090 dgx_spark b200)
 
 if(DEFINED NINFER_CONFIGURED_TARGET AND
    NOT NINFER_CONFIGURED_TARGET STREQUAL NINFER_TARGET)
@@ -10,6 +10,7 @@ endif()
 
 set(NINFER_TARGET_RTX5090 0)
 set(NINFER_TARGET_SPARK 0)
+set(NINFER_TARGET_B200 0)
 if(NINFER_TARGET STREQUAL "rtx5090")
   set(NINFER_TARGET_RTX5090 1)
   set(NINFER_CUDA_ARCHITECTURE 120a)
@@ -18,6 +19,10 @@ elseif(NINFER_TARGET STREQUAL "dgx_spark")
   set(NINFER_TARGET_SPARK 1)
   set(NINFER_CUDA_ARCHITECTURE 121a)
   set(NINFER_PROCESSOR_PATTERN "^(aarch64|arm64|ARM64)$")
+elseif(NINFER_TARGET STREQUAL "b200")
+  set(NINFER_TARGET_B200 1)
+  set(NINFER_CUDA_ARCHITECTURE 100a)
+  set(NINFER_PROCESSOR_PATTERN "^(x86_64|amd64|AMD64)$")
 else()
   message(FATAL_ERROR "Unknown NINFER_TARGET '${NINFER_TARGET}'")
 endif()
@@ -47,5 +52,8 @@ function(ninfer_validate_platform)
   set(NINFER_CONFIGURED_TARGET ${NINFER_TARGET} CACHE INTERNAL "Configured NInfer target")
   configure_file(${PROJECT_SOURCE_DIR}/src/core/platform.h.in
     ${PROJECT_BINARY_DIR}/generated/core/platform.h @ONLY)
+  # The lane ceiling in <ninfer/types.h> keys off this define; a plain compile definition
+  # keeps the public headers standalone (they must not include the generated header).
+  add_compile_definitions(NINFER_TARGET_B200=${NINFER_TARGET_B200})
   message(STATUS "NInfer target: ${NINFER_TARGET} (${CMAKE_SYSTEM_PROCESSOR}, sm_${NINFER_CUDA_ARCHITECTURE})")
 endfunction()
