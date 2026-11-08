@@ -409,6 +409,7 @@ int rotation_of(const AVStream* stream) {
     if (tag != nullptr) {
         rotation = static_cast<int>(std::nearbyint(std::strtod(tag->value, nullptr)));
     }
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 0, 100)
     const AVPacketSideData* side =
         av_packet_side_data_get(stream->codecpar->coded_side_data,
                                 stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
@@ -416,6 +417,16 @@ int rotation_of(const AVStream* stream) {
         rotation = static_cast<int>(std::nearbyint(
             -av_display_rotation_get(reinterpret_cast<const std::int32_t*>(side->data))));
     }
+#else
+    // FFmpeg < 6.0 keeps no codecpar side-data list; rotation metadata only in
+    // stream->metadata (handled above) or the display matrix attached at demux.
+    const std::int32_t* display =
+        reinterpret_cast<const std::int32_t*>(av_stream_get_side_data(
+            const_cast<AVStream*>(stream), AV_PKT_DATA_DISPLAYMATRIX, nullptr));
+    if (display != nullptr) {
+        rotation = static_cast<int>(std::nearbyint(-av_display_rotation_get(display)));
+    }
+#endif
     rotation %= 360;
     if (rotation < 0) { rotation += 360; }
     if (rotation == 89 || rotation == 91) { rotation = 90; }
