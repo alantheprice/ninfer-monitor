@@ -183,9 +183,15 @@ void CudaCopyBatch::submit(CudaExecutionView execution) const {
         return;
     }
     CudaDeviceScope scope(device_);
+#if !defined(CUDART_VERSION) || CUDART_VERSION < 12090
+    // srcAccessOrder arrived with the 12.9+ attributes layout; older runtimes take
+    // default (zeroed) attributes.
+    cudaMemcpyAttributes attributes{};
+#else
     cudaMemcpyAttributes attributes{};
     attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    std::size_t first         = 0;
+#endif
+    std::size_t first = 0;
     CUDA_CHECK(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), count_,
                                     &attributes, &first, 1, execution.stream()));
 }
@@ -215,9 +221,13 @@ void CudaHostCopyBatch::submit(CudaExecutionView execution) const {
     }
     if (!count_) { return; }
     CudaDeviceScope scope(device_);
+#if !defined(CUDART_VERSION) || CUDART_VERSION < 12090
+    cudaMemcpyAttributes attributes{};
+#else
     cudaMemcpyAttributes attributes{};
     attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    std::size_t first         = 0;
+#endif
+    std::size_t first = 0;
     check_copy(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), count_,
                                     &attributes, &first, 1, execution.stream()));
 }

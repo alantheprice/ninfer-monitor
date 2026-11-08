@@ -46,12 +46,28 @@ ReadOnlyFile::ReadOnlyFile(const std::filesystem::path& path, ReadMode mode) : p
         view_.bytes = static_cast<std::uint64_t>(status.st_size);
         if (mode == ReadMode::Direct) {
             struct statx alignment {};
-
+// glibc < 2.36 headers predate STATX_DIOALIGN and the stx_dio_* fields; probe
+// without the flag and take the engine's 4 KiB defaults.
+#ifndef STATX_DIOALIGN
+#define STATX_DIOALIGN 0x20000000U
+#define NINFER_STATX_HAS_DIO_FIELDS 0
+#else
+#define NINFER_STATX_HAS_DIO_FIELDS 1
+#endif
+#if NINFER_STATX_HAS_DIO_FIELDS
             const bool reported = ::statx(view_.descriptor, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC,
                                           STATX_DIOALIGN, &alignment) == 0 &&
                                   (alignment.stx_mask & STATX_DIOALIGN);
             view_.memory_alignment = reported ? alignment.stx_dio_mem_align : 4096;
             view_.offset_alignment = reported ? alignment.stx_dio_offset_align : 4096;
+#else
+            const bool reported = ::statx(view_.descriptor, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC,
+                                          0, &alignment) == 0;
+            (void)alignment;
+            (void)reported;
+            view_.memory_alignment = 4096;
+            view_.offset_alignment = 4096;
+#endif
             if (!std::has_single_bit(view_.memory_alignment) ||
                 !std::has_single_bit(view_.offset_alignment))
                 fail(path, "unsupported direct I/O alignment", EOPNOTSUPP);
