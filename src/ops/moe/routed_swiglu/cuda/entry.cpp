@@ -2,6 +2,7 @@
 #include "core/platform.h"
 #include "ops/moe/kernels/cuda/block_scaled/clamped/workspace.h"
 #include "ninfer/ops/moe.h"
+#include "ops/moe/determinism.h"
 #include "ops/moe/operands.h"
 #include "ops/moe/routed_swiglu/cuda/dispatch.h"
 #include "ops/moe/routed_swiglu/cuda/contribution.h"
@@ -65,7 +66,12 @@ std::size_t capacity(const RoutedSwiGLUProfile& profile, const SwiGLUProfile* sh
     return detail::interval_capacity(
         first, last, shape.allocation_boundaries, shape.slice_tokens(subset), [&](int tokens) {
             WorkspaceLayoutBuilder layout;
-            (void)allocate(layout, shape.select(profile.ffn, tokens, shared_intermediate), tokens,
+            auto selected = shape.select(profile.ffn, tokens, shared_intermediate);
+            if (moe_deterministic()) {
+                selected.block_scaled.atomic_output = false;
+                selected.clamped.atomic_output      = false;
+            }
+            (void)allocate(layout, selected, tokens,
                            subset, shared_intermediate,
                            profile.ffn.gate_up_type == QType::Q8_G32_FP16, partial_output);
             return layout.peak_bytes(1);
@@ -120,7 +126,11 @@ void execute(const Tensor& x, const RoutedSwiGLUProfile& profile, const CudaSwiG
             term = ScaledSwiGLUTerm{shared->weights, shared->coefficients.slice(0, offset, count)};
         }
         auto scope      = scratch.scope();
-        const auto plan = shape.select(profile.ffn, count, shared_intermediate);
+        auto plan = shape.select(profile.ffn, count, shared_intermediate);
+        if (moe_deterministic()) {
+            plan.block_scaled.atomic_output = false;
+            plan.clamped.atomic_output      = false;
+        }
         auto buffers =
             allocate(scratch, plan, count, subset.kind, shared_intermediate,
                      profile.ffn.gate_up_type == QType::Q8_G32_FP16, valid_tokens != nullptr);

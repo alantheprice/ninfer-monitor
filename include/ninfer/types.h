@@ -194,6 +194,9 @@ struct EngineOptions {
     bool enable_vision                     = false;
     std::size_t vision_memory_budget_bytes = 1ULL << 30;
     bool use_cuda_graph                    = true;
+    // Force order-deterministic MoE expert combine (contributions + ordered fold instead of
+    // fp32 atomicAdd). Slower prefill; required for reproducible greedy evals/goldens.
+    bool deterministic                     = false;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

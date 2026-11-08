@@ -1,5 +1,7 @@
 #include "serve/generation_service.h"
 
+#include "ops/moe/determinism.h"
+
 #include "product/media_acquire/acquire.h"
 #include "serve/translate.h"
 
@@ -352,6 +354,7 @@ GenerationService::GenerationService(product::ServeOptions options,
     }
     auto engine_options             = options_.launch.engine;
     engine_options.startup_observer = std::move(startup_observer);
+    ops::moe_deterministic()        = engine_options.deterministic;
     engine_                         = std::make_unique<ninfer::Engine>(std::move(engine_options));
     request_capacity_               = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.launch.engine.max_concurrency) +

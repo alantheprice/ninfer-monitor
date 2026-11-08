@@ -395,6 +395,9 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         case Field::CudaGraph:
             engine.use_cuda_graph = boolean();
             break;
+        case Field::Deterministic:
+            engine.deterministic = boolean();
+            break;
         case Field::MaxConcurrency:
             engine.max_concurrency = u32();
             break;

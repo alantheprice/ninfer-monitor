@@ -1,58 +1,195 @@
 {
  "model": "qwen3.8-flash-next",
- "engine_commit": "13cbb7a9 (port/fleet-features)",
+ "engine_commit": "deterministic build @ port/fleet-features",
  "artifact_id": "57cf9cd010e3475fac9481e8fc66fc0f",
  "captured": "2026-11-07",
- "temperature": 0.0,
- "reasoning_effort": "none",
- "protocol": "3x-exact agreement screen; MTP draft race makes single-shot goldens unstable \u2014 see b200-refdiff.py header",
+ "protocol": {
+  "temperature": 0.0,
+  "reasoning_effort": "none",
+  "spec": "none",
+  "deterministic": true,
+  "max_tokens": 48,
+  "serial": true
+ },
  "cases": [
   {
    "id": "refdiff-000",
    "prompt": "Write a dense, precise technical paragraph about cache coherence protocols. Cover the primary mechanism, one concrete constraint, and one common misconception.",
-   "completion": "Cache coherence protocols, primarily implemented via directory-based or snooping-based architectures, enforce a single-writer-multiple-reader invariant by tracking line states (e.g., Modified, Exclusive, Shared, Invalid) and propagating invalidation or update messages",
+   "completion": "Cache coherence protocols, primarily implemented via directory-based or snooping-based schemes, enforce a single-writer, multiple-reader invariant by tracking line states (e.g., Modified, Exclusive, Shared, Invalid) to ensure that all processors observe a consistent",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-001",
+   "prompt": "Write a dense, precise technical paragraph about NUMA scheduling. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Non-Uniform Memory Access (NUMA) scheduling optimizes performance by minimizing cross-node memory latency through affinity-based task placement, where the kernel\u2019s scheduler preferentially migrates processes to the CPU node hosting their allocated physical memory pages. A critical",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-002",
+   "prompt": "Write a dense, precise technical paragraph about GPU memory hierarchy. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "The GPU memory hierarchy operates on a strict latency-bandwidth tradeoff, prioritizing massive parallel throughput over low-latency access by leveraging a deep, multi-level cache structure (L1/L2) backed by high-bandwidth HBM or G",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-003",
+   "prompt": "Write a dense, precise technical paragraph about DRAM refresh. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "DRAM refresh operates by periodically reading and rewriting the charge state of each memory cell to counteract leakage-induced data loss, a process mandated by the finite retention time of the storage capacitor. A critical hardware constraint is the maximum refresh interval, typically ",
    "finish": "length"
   },
   {
    "id": "refdiff-004",
    "prompt": "Write a dense, precise technical paragraph about PCIe Gen5 signaling. Cover the primary mechanism, one concrete constraint, and one common misconception.",
-   "completion": "PCIe Gen5 utilizes 32 GT/s PAM4 (Pulse Amplitude Modulation with 4 levels) signaling to double the data rate of Gen4 while maintaining the same 16 GHz Nyquist frequency, thereby preserving",
+   "completion": "PCIe Gen5 employs 32 GT/s PAM-4 (Pulse Amplitude Modulation with 4 levels) signaling to double the data rate of Gen4\u2019s NRZ scheme while maintaining the same 16 GHz Ny",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-005",
+   "prompt": "Write a dense, precise technical paragraph about tensor core microarchitecture. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Tensor cores execute mixed-precision matrix multiply-accumulate (MMA) operations via a dedicated systolic array architecture that pipelines data movement and computation to maximize arithmetic intensity, fundamentally diverging from the scalar SIMD paradigm of standard CUDA cores by processing $",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-006",
+   "prompt": "Write a dense, precise technical paragraph about kernel scheduler tick rates. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "The kernel scheduler\u2019s temporal granularity is governed by the periodic timer interrupt, historically fixed at 100 Hz (10 ms) but increasingly dynamic via high-resolution timers (hrtimers) and NO_HZ_FULL configurations to minimize idle",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-007",
+   "prompt": "Write a dense, precise technical paragraph about flash translation layers. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Flash Translation Layers (FTLs) serve as the critical abstraction layer between logical block addressing (LBA) and physical NAND flash pages, primarily employing dynamic address mapping to decouple logical writes from physical erase blocks, thereby enabling out-of-place",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-008",
+   "prompt": "Write a dense, precise technical paragraph about HBM stack thermal limits. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "High Bandwidth Memory (HBM) thermal management is primarily governed by the vertical stacking of DRAM dies, where heat generated in the core logic and memory arrays must traverse multiple thin silicon layers and microbumps to reach the package lid,",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-009",
+   "prompt": "Write a dense, precise technical paragraph about instruction set extensions for ML. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Modern ML instruction set extensions, such as Intel\u2019s Advanced Matrix Extensions (AMX) or ARM\u2019s Scalable Matrix Extension (SME), primarily operate by offloading dense linear algebra operations to dedicated on-die tile registers and matrix engines,",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-010",
+   "prompt": "Write a dense, precise technical paragraph about memory-mapped file I/O. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Memory-mapped file I/O operates by establishing a direct virtual address space mapping between a file\u2019s disk blocks and a process\u2019s virtual memory, allowing the operating system\u2019s page cache to manage data transfer transparently via demand paging rather than explicit `",
    "finish": "length"
   },
   {
    "id": "refdiff-011",
    "prompt": "Write a dense, precise technical paragraph about distributed consensus quorums. Cover the primary mechanism, one concrete constraint, and one common misconception.",
-   "completion": "Distributed consensus quorums enforce data consistency by requiring a strict majority (typically $N/2 + 1$) of nodes to acknowledge a write operation before it is considered committed, thereby guaranteeing that any subsequent read operation intersects with",
+   "completion": "Distributed consensus quorums enforce data consistency by requiring that any two sets of nodes authorized to perform conflicting operations must intersect, thereby guaranteeing that at least one node in the intersection retains the most recent committed state. This mechanism relies on the",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-012",
+   "prompt": "Write a dense, precise technical paragraph about vLLM style batch schedulers. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "vLLM\u2019s continuous batching scheduler operates by dynamically managing a global KV cache pool via PagedAttention, decoupling logical sequence length from physical memory allocation to enable fine-grained, token-level scheduling rather than static request-level batching. The",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-013",
+   "prompt": "Write a dense, precise technical paragraph about KV cache eviction policies. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "KV cache eviction policies mitigate the quadratic memory growth of autoregressive transformers by selectively discarding key-value pairs from the attention context, primarily leveraging heuristics like attention score magnitude or recency to identify low-utility tokens for removal. A critical",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-014",
+   "prompt": "Write a dense, precise technical paragraph about speculative decoding schemes. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Speculative decoding accelerates autoregressive generation by employing a lightweight draft model to propose a sequence of $k$ candidate tokens, which the larger target model then verifies in a single parallel forward pass via rejection sampling, thereby amortizing the high latency",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-015",
+   "prompt": "Write a dense, precise technical paragraph about quantization scale calibration. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Quantization scale calibration fundamentally operates by minimizing the Mean Squared Error (MSE) between the original floating-point activations and their low-bit integer approximations, typically through an iterative search for the optimal clipping threshold that balances quantization noise against outlier",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-016",
+   "prompt": "Write a dense, precise technical paragraph about video codec motion estimation. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Motion estimation (ME) fundamentally operates by partitioning frames into macroblocks and searching for the best-matching block in a reference frame to minimize a distortion metric, typically Sum of Absolute Differences (SAD) or Sum of Squared Differences (",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-017",
+   "prompt": "Write a dense, precise technical paragraph about compiler loop vectorization. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Loop vectorization transforms scalar control flow into SIMD operations by identifying independent iterations and mapping them to wide registers, fundamentally relying on the compiler\u2019s ability to prove the absence of loop-carried data dependencies through rigorous dependence analysis. A critical constraint governing this",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-018",
+   "prompt": "Write a dense, precise technical paragraph about network congestion control. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Network congestion control primarily operates through additive-increase/multiplicative-decrease (AIMD) algorithms, such as TCP Reno or CUBIC, which dynamically adjust the congestion window size to probe for available bandwidth while avoiding saturation. A critical constraint",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-019",
+   "prompt": "Write a dense, precise technical paragraph about SSD wear leveling. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "SSD wear leveling operates by dynamically mapping logical block addresses (LBAs) to physical NAND flash pages via a Flash Translation Layer (FTL), ensuring that write/erase cycles are distributed evenly across all memory blocks to prevent premature failure of specific",
    "finish": "length"
   },
   {
    "id": "refdiff-020",
    "prompt": "Write a dense, precise technical paragraph about hash table probing schemes. Cover the primary mechanism, one concrete constraint, and one common misconception.",
-   "completion": "Hash table probing schemes resolve collisions by systematically searching for an empty slot within the underlying array, with linear probing offering cache-friendly sequential access but suffering from primary clustering, while quadratic probing and double hashing mitigate this by altering the step size based on the",
+   "completion": "Hash table probing schemes resolve collisions by systematically scanning the underlying array for an empty slot, with linear probing offering cache-friendly sequential access but suffering from primary clustering, while quadratic probing and double hashing mitigate this by altering the step size based on the probe",
    "finish": "length"
   },
   {
    "id": "refdiff-021",
    "prompt": "Write a dense, precise technical paragraph about interrupt affinity tuning. Cover the primary mechanism, one concrete constraint, and one common misconception.",
-   "completion": "Interrupt affinity tuning optimizes system latency and throughput by binding specific hardware interrupts to designated CPU cores via the `/proc/irq/<irq_number>/smp_affinity` interface, thereby minimizing cross-core cache coherency traffic and reducing interrupt handling",
+   "completion": "Interrupt affinity tuning optimizes system latency and throughput by binding specific hardware interrupts to designated CPU cores via the `/proc/irq/<irq_number>/smp_affinity` mask, thereby minimizing cross-CPU cache coherency traffic and reducing interrupt",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-022",
+   "prompt": "Write a dense, precise technical paragraph about H.26x rate control. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "H.26x rate control fundamentally operates as a closed-loop feedback system that dynamically adjusts the quantization parameter (QP) to map the encoder\u2019s rate-distortion (R-D) characteristics to a target bitrate, typically employing a linear or",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-023",
+   "prompt": "Write a dense, precise technical paragraph about protobuf wire formats. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Protocol Buffers encode data using a compact, self-describing binary format where each field is serialized as a key-value pair consisting of a varint-encoded tag (combining the field number and wire type) followed by the payload, which varies",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-024",
+   "prompt": "Write a dense, precise technical paragraph about time-series compaction. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Time-series compaction primarily operates by merging overlapping or adjacent Sorted String Tables (SSTables) into larger, contiguous blocks to reduce read amplification and reclaim space occupied by tombstones and obsolete versions. A critical constraint in this process is the",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-025",
+   "prompt": "Write a dense, precise technical paragraph about raft log compaction. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Raft log compaction, primarily implemented via snapshotting, mitigates unbounded storage growth by truncating committed log entries older than a configurable threshold and persisting the resulting state machine state as a monolithic snapshot. A critical operational constraint is",
    "finish": "length"
   },
   {
    "id": "refdiff-026",
    "prompt": "Write a dense, precise technical paragraph about column store encodings. Cover the primary mechanism, one concrete constraint, and one common misconception.",
-   "completion": "Column store encodings optimize analytical query performance by compressing homogeneous data types within vertical segments, leveraging techniques like dictionary encoding, run-length encoding, and delta encoding to minimize I/O and CPU cycles during scan operations. A critical constraint is the high",
+   "completion": "Column store encodings optimize storage and query performance by applying column-specific compression algorithms\u2014such as Run-Length Encoding (RLE), Dictionary Encoding, or Frame of Reference (FOR)\u2014to vertically partitioned data, thereby maximizing intra-column data locality and",
    "finish": "length"
   },
   {
    "id": "refdiff-027",
    "prompt": "Write a dense, precise technical paragraph about database journaling modes. Cover the primary mechanism, one concrete constraint, and one common misconception.",
-   "completion": "Database journaling, primarily implemented via Write-Ahead Logging (WAL), ensures atomicity and durability by sequentially recording intent-to-modify operations in a persistent log before applying changes to the main data files, thereby guaranteeing crash recovery through redo",
+   "completion": "Database journaling modes, particularly in systems like SQLite, operate by writing transactional changes to a persistent write-ahead log (WAL) or rollback journal before committing them to the primary database file, thereby ensuring atomicity and durability through crash recovery",
    "finish": "length"
   },
   {
    "id": "refdiff-028",
    "prompt": "Write a dense, precise technical paragraph about branch predictor design. Cover the primary mechanism, one concrete constraint, and one common misconception.",
-   "completion": "Modern branch predictors rely on dynamic history-based correlation, typically implemented via hybrid architectures like the TAGE (Tagged Geometric History Length) predictor, which utilizes multiple tagged tables indexed by varying lengths of global branch history to capture complex control flow dependencies",
+   "completion": "Modern branch predictors rely on dynamic history-based correlation, typically implemented via hybrid architectures like the TAGE (Tagged Geometric History Length) predictor, which utilizes multiple tagged tables indexed by varying lengths of global branch history to capture complex control dependencies.",
+   "finish": "length"
+  },
+  {
+   "id": "refdiff-029",
+   "prompt": "Write a dense, precise technical paragraph about page cache writeback. Cover the primary mechanism, one concrete constraint, and one common misconception.",
+   "completion": "Page cache writeback operates as an asynchronous, deferred I/O mechanism where the kernel marks dirty pages in the page cache and schedules them for persistence to backing storage via the `writeback` thread, decoupling application write latency from disk I",
    "finish": "length"
   }
  ]

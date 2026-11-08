@@ -2,6 +2,7 @@
 #include "ninfer/ops/moe.h"
 #include "ops/moe/kernels/cuda/block_scaled/workspace.h"
 #include "ops/moe/kernels/cuda/groupwise_int/workspace.h"
+#include "ops/moe/determinism.h"
 #include "ops/moe/operands.h"
 #include "ops/moe/topk_softmax_swiglu_moe/dispatch.h"
 #include "ops/moe/workspace.h"
@@ -66,8 +67,9 @@ std::size_t topk_softmax_swiglu_moe_workspace_capacity_bytes(const MoeProfile& p
     return detail::interval_capacity(
         first, last, shape.allocation_boundaries, shape.slice_tokens(subset), [&](int tokens) {
             WorkspaceLayoutBuilder layout;
-            (void)allocate(layout, shape.select(tokens, profile.shared.intermediate, subset),
-                           tokens, profile, subset);
+            auto plan = shape.select(tokens, profile.shared.intermediate, subset);
+            if (moe_deterministic()) { plan.block_scaled.atomic_output = false; }
+            (void)allocate(layout, plan, tokens, profile, subset);
             return layout.peak_bytes(1);
         });
 }
@@ -98,7 +100,8 @@ void topk_softmax_swiglu_moe(const Tensor& x, const MoeProfile& profile, const M
     for (std::int64_t start = 0; start < tokens; start += slice) {
         const int offset   = static_cast<int>(start);
         const int count    = std::min(tokens - offset, slice);
-        const auto plan    = shape.select(count, profile.shared.intermediate, subset.kind);
+        auto plan          = shape.select(count, profile.shared.intermediate, subset.kind);
+        if (moe_deterministic()) { plan.block_scaled.atomic_output = false; }
         const auto input   = x.slice(1, offset, count);
         auto output        = destination.slice(1, offset, count);
         auto scope         = scratch.scope();

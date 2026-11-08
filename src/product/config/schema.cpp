@@ -31,6 +31,9 @@ constexpr FieldSpec kFields[] = {
      Scope::Common, ConfigurationUnit::Bytes},
     {Field::PrefillChunk, "engine.prefill_chunk", "--prefill-chunk", "", "N|default",
      "Positive multiple of 128; default is resolved by the model.", Scope::Common},
+    {Field::Deterministic, "engine.deterministic", "--deterministic", "--no-deterministic", "",
+     "Order-deterministic MoE combine; slower prefill, reproducible greedy output.",
+     Scope::Common},
     {Field::CudaGraph, "engine.cuda_graph", "--cuda-graph", "--no-cuda-graph", "",
      "Enable CUDA Graph execution."},
     {Field::GpuTiming, "observability.gpu_timing", "--gpu-timing", "--no-gpu-timing", "",
@@ -331,6 +334,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     switch (field) {
     case Field::Vision:
     case Field::GpuTiming:
+    case Field::Deterministic:
     case Field::CudaGraph:
     case Field::PrefixReuse:
     case Field::Thinking:

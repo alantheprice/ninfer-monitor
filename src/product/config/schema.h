@@ -19,6 +19,7 @@ enum class Field {
     MemoryHeadroom,
     PrefillChunk,
     CudaGraph,
+    Deterministic,
     GpuTiming,
     MaxConcurrency,
     MaxPendingRequests,

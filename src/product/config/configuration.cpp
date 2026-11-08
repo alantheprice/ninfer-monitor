@@ -136,6 +136,9 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
         case Field::CudaGraph:
             value = e.use_cuda_graph;
             break;
+        case Field::Deterministic:
+            value = e.deterministic;
+            break;
         case Field::MaxConcurrency:
             value = std::uint64_t{e.max_concurrency};
             break;
