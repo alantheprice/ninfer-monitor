@@ -49,7 +49,10 @@ void discard_capture(cudaStream_t stream) noexcept {
 } // namespace
 
 #include <cuda_runtime_api.h>
-#if !defined(CUDART_VERSION) || CUDART_VERSION < 12080
+// CUDA 12.x exposes the 7-arg capture-info query only as _v3 and keeps the
+// 4-arg dependency update; CUDA 13 folded the 7-arg form into the unversioned
+// name and added the edgeData parameter. Gate on the major line.
+#if !defined(CUDART_VERSION) || CUDART_VERSION < 13000
 #define ninfer_stream_capture_info cudaStreamGetCaptureInfo_v3
 // CUDA 12.x also lacks the edge-data parameter on dependency updates; route both
 // through the version gate so the 13.x call shape compiles on 12.x toolchains.
