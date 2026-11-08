@@ -50,8 +50,14 @@ void discard_capture(cudaStream_t stream) noexcept {
 
 #if !defined(CUDART_VERSION) || CUDART_VERSION < 12080
 #define ninfer_stream_capture_info cudaStreamGetCaptureInfo_v3
+// CUDA 12.x also lacks the edge-data parameter on dependency updates; route both
+// through the version gate so the 13.x call shape compiles on 12.x toolchains.
+#define ninfer_stream_update_deps(stream, node, count, flags) \
+    cudaStreamUpdateCaptureDependencies(stream, node, count, flags)
 #else
 #define ninfer_stream_capture_info cudaStreamGetCaptureInfo
+#define ninfer_stream_update_deps(stream, node, count, flags) \
+    cudaStreamUpdateCaptureDependencies(stream, node, nullptr, count, flags)
 #endif
 
 void DecodeGraphSection::capture(cudaStream_t stream, const std::function<void()>& body) {
@@ -133,8 +139,7 @@ DecodeGraphChild DecodeGraphDefinition::append_to(cudaStream_t stream) const {
     DecodeGraphChild child;
     check_graph(cudaGraphAddChildGraphNode(&child.node, parent, dependencies, count, graph_),
                 "cudaGraphAddChildGraphNode");
-    check_graph(cudaStreamUpdateCaptureDependencies(stream, &child.node, nullptr, 1,
-                                                    cudaStreamSetCaptureDependencies),
+    check_graph(ninfer_stream_update_deps(stream, &child.node, 1, cudaStreamSetCaptureDependencies),
                 "cudaStreamUpdateCaptureDependencies");
     return child;
 }
