@@ -19,7 +19,12 @@ endfunction()
 # optimizer at O2 for 12.x; -O2/-O3 differ only in allocation strategy here, not
 # in generated math. 13.x keeps its default O3.
 if(CUDAToolkit_VERSION VERSION_LESS 12.9)
+  # 12.x toolchain guards: ptxas -O3 promotes large register arrays past the
+  # 48KB static shared cap on sm_100a (nvlink rejects), and nvcc's gcc-11 host
+  # backend ICEs on the heavy context/reclaim templates at -O3. Both compile
+  # clean at -O2 (device allocator strategy differs; math identical).
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-O2>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-O2>)
 endif()
 
 function(ninfer_cuda_non_rdc_archive target)
