@@ -115,6 +115,21 @@ std::optional<ple::Ticket> PlePipeline::prepare(std::uint32_t tokens,
     return ticket;
 }
 
+// Diagnostic only: dumps the sealed window at the point its embedding is consumed.
+void PlePipeline::probe_consume(ple::Ticket ticket) {
+    static std::uint32_t budget = 0;
+    if (budget >= 32) return;
+    ++budget;
+    const auto& w = window(ticket);
+    const auto& row = w.rows.front();
+    std::fprintf(stderr,
+                 "PLEDBG consume tokens=%u known=%u valid=%u sealed=%d uploaded=%d "
+                 "frontier=%llu raw_tail=[%d %d] ids=[%d %d %d %d]\n",
+                 w.tokens, w.known[0], w.valid[0], int(w.sealed), int(w.uploaded),
+                 static_cast<unsigned long long>(row.frontier), row.raw_tail[0], row.raw_tail[1],
+                 w.ids[0], w.ids[1], w.ids[2], w.ids[3]);
+}
+
 std::optional<ple::Ticket> PlePipeline::try_begin(runtime::ExecutionTicket owner,
                                                   std::uint32_t tokens,
                                                   std::span<const ple::InputRow> rows) {
@@ -317,6 +332,7 @@ std::optional<ple::DeviceEmbedding> PlePipeline::try_consume(ple::Ticket ticket)
     if (w.cancelled || w.acquired || !w.owner)
         throw std::logic_error("invalid PLE window consumption");
     if (!w.uploaded) return {};
+    if (execution::debug::enabled("NINFER_PLE_DEBUG")) probe_consume(ticket);
     auto value = resources_.ple_upload->acquire(ticket, cuda_);
     w.acquired = true;
     return value;

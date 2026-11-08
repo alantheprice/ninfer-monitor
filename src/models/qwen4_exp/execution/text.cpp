@@ -181,6 +181,16 @@ void TextRun::finish(TextOutputs output, Tensor logits) {
                          {roots_.residual.data, roots_.residual.bytes(), cuda_.device()}, cuda_);
     auto sample = output.sample.view(
         {dimension(parameters_.profile->config.text.hidden), batch_.tokens * batch_.batch});
+    if (debug::enabled("NINFER_LAYER_DEBUG") && batch_.tokens == 1) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_.stream()));
+        debug::Sample pre_normalized, pre_residual;
+        debug::sample_tensor(roots_.normalized, 0, pre_normalized);
+        debug::sample_tensor(roots_.residual, 0, pre_residual);
+        debug::print("pre_hcmix_normalized", parameters_.text.layers.size(), batch_.tokens,
+                     pre_normalized);
+        debug::print("pre_hcmix_residual", parameters_.text.layers.size(), batch_.tokens,
+                     pre_residual);
+    }
     ops::hc_mix(roots_.normalized, p.final_hc.mix, execution_.workspace, sample, cuda_);
     if (debug::enabled("NINFER_LAYER_DEBUG") && batch_.tokens == 1) {
         CUDA_CHECK(cudaStreamSynchronize(cuda_.stream()));

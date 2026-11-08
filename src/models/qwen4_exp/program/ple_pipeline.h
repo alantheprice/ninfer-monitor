@@ -76,6 +76,8 @@ private:
                                                 std::uint32_t batch);
     void abandon_consumer(Window&);
     void cancel(Window&);
+    // Env-gated diagnostic: dumps a sealed window at the point its embedding is consumed.
+    void probe_consume(ple::Ticket);
     Resources& resources_;
     CudaExecutionView cuda_;
     std::array<std::optional<Window>, 2> windows_;
