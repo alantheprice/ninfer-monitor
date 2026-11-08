@@ -141,8 +141,21 @@ void TextRun::finish_mixer(std::uint32_t i) {
 
 void TextRun::resident_moe(std::uint32_t i) {
     const auto& p = parameters_.text.layers[i].moe;
+    const bool probe = debug::enabled("NINFER_MOE_DEBUG") && i < 2;
+    if (probe) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_.stream()));
+        debug::Sample in;
+        debug::sample_tensor(roots_.input, 0, in);
+        debug::print("moe_in", i, batch_.tokens, in);
+    }
     moe::execute(roots_.input, p, p.resident, ops::MoeEpilogue::Write, roots_.output,
                  execution_.workspace, cuda_);
+    if (probe) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_.stream()));
+        debug::Sample out;
+        debug::sample_tensor(roots_.output, 0, out);
+        debug::print("moe_out", i, batch_.tokens, out);
+    }
 }
 
 void TextRun::gpu_moe(const moe::GpuCall& call) {
