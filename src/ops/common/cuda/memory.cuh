@@ -78,10 +78,15 @@ __device__ __forceinline__ unsigned swizzle_xor_address(unsigned base, unsigned 
 }
 
 // Storage and launch must select the same static/dynamic representation.
+// Static threshold is 32 KiB, not the full 48 KiB default cap: nvlink (CUDA 12.8,
+// sm_100a) mis-attributes static shared arrays across objects when several large
+// static arrays from different TUs are device-linked together, inflating one
+// kernel's total past 48 KiB (group_small + shared_storage<46080> = 0xce80).
+// Keeping big buffers dynamic avoids the cross-object .nv.shared merge entirely.
 template <int Bytes>
 __device__ __forceinline__ unsigned char* shared_storage() {
     static_assert(Bytes > 0 && Bytes <= 99 * 1024);
-    if constexpr (Bytes > 48 * 1024) {
+    if constexpr (Bytes > 32 * 1024) {
         extern __shared__ __align__(16) unsigned char dynamic_storage[];
         return dynamic_storage;
     } else {

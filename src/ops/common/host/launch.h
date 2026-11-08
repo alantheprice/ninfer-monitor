@@ -11,10 +11,12 @@ namespace ninfer::ops::common {
 // AlwaysDynamic is for kernels that declare extern shared storage at every size.
 // Their static shared storage also counts against the default limit, so explicitly
 // admit the requested dynamic capacity even when it alone fits within 48 KiB.
+// Static/dynamic threshold must match shared_storage() (32 KiB): buffers above it
+// are extern __shared__ and need the opt-in attribute even below 48 KiB.
 template <int Bytes, auto Kernel, bool AlwaysDynamic = false>
 int prepare_shared() {
     static_assert(Bytes >= 0 && Bytes <= 99 * 1024);
-    if constexpr (Bytes > 48 * 1024 || (AlwaysDynamic && Bytes > 0)) {
+    if constexpr (Bytes > 32 * 1024 || (AlwaysDynamic && Bytes > 0)) {
         static const cudaError_t status =
             cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Bytes);
         CUDA_CHECK(status);
