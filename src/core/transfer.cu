@@ -191,9 +191,15 @@ void CudaCopyBatch::submit(CudaExecutionView execution) const {
     cudaMemcpyAttributes attributes{};
     attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
 #endif
-    std::size_t first = 0;
+    std::size_t first    = 0;
+    std::size_t numAttrs = 1;
+#if !defined(CUDART_VERSION) || CUDART_VERSION < 12090
     CUDA_CHECK(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), count_,
-                                    &attributes, &first, 1, execution.stream()));
+                                    &attributes, &first, numAttrs, &first, execution.stream()));
+#else
+    CUDA_CHECK(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), count_,
+                                    &attributes, &first, numAttrs, execution.stream()));
+#endif
 }
 
 CudaHostCopyBatch::CudaHostCopyBatch(Device device, std::size_t capacity)
@@ -227,9 +233,15 @@ void CudaHostCopyBatch::submit(CudaExecutionView execution) const {
     cudaMemcpyAttributes attributes{};
     attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
 #endif
-    std::size_t first = 0;
+    std::size_t first    = 0;
+    std::size_t numAttrs = 1;
+#if !defined(CUDART_VERSION) || CUDART_VERSION < 12090
     check_copy(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), count_,
-                                    &attributes, &first, 1, execution.stream()));
+                                    &attributes, &first, numAttrs, &first, execution.stream()));
+#else
+    check_copy(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), count_,
+                                    &attributes, &first, numAttrs, execution.stream()));
+#endif
 }
 
 } // namespace ninfer
