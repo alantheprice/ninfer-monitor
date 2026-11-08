@@ -6,7 +6,7 @@ set -euo pipefail
 
 NINFER_GIT="https://github.com/alantheprice/ninfer-monitor"
 NINFER_BRANCH="port/fleet-features"
-NINFER_COMMIT="13cbb7a9"          # b200 target + plan doc; update if the branch moves
+NINFER_COMMIT="8a8509cf"          # b200 target + plan doc; update if the branch moves
 B2_BUCKET="${B2_BUCKET:-t1-45-bg}"          # export before running, or edit here
 B2_PREFIX="${B2_PREFIX:-models/flash-next-ninfer}"  # remote path holding the artifact directory
 ART_DIR="/srv/ninfer-artifact"
