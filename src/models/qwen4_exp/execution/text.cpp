@@ -54,10 +54,19 @@ bool TextRun::advance_layer(std::uint32_t i) {
         waiting_moe_ = false;
     } else {
         if (execution_.experts && !execution_.experts->try_before_layer(p.moe.bank)) return false;
+        if (debug::enabled("NINFER_MOE_DEBUG") && i < 2) {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_.stream()));
+            debug::Sample n, r, inp;
+            debug::sample_tensor(roots_.normalized, 0, n);
+            debug::sample_tensor(roots_.residual, 0, r);
+            debug::sample_tensor(roots_.input, 0, inp);
+            debug::print("pre_mixer_norm", i, batch_.tokens, n);
+            debug::print("pre_mixer_resid", i, batch_.tokens, r);
+            debug::print("pre_mixer_input", i, batch_.tokens, inp);
+        }
         mixer(i);
         if (debug::enabled("NINFER_LAYER_DEBUG") && i < 3 && batch_.tokens == 1)
-            probe_activation("mixer", i);
-        if (execution_.experts) {
+            probe_activation("mixer", i);        if (execution_.experts) {
             if (!execution_.experts->start(p.moe.bank, roots_.input, roots_.output,
                                            execution_.workspace, {})) {
                 waiting_moe_ = true;
