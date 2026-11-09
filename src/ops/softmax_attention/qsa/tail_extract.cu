@@ -122,7 +122,7 @@ void qsa_tail_extract(const ConstQsaTailStateView& before, const QsaRawRecordRea
                       const Tensor& accepted, QsaTailStateView after, CudaExecutionView execution) {
     const detail::qsa::ViewValidation v{"qsa_tail_extract", execution.device()};
     const int batch = accepted.ne[0], capacity = records.raw_keys.ne[1];
-    v.require(batch >= 1 && batch <= 16, "batch extent");
+    v.require(batch >= 1 && batch <= 32, "batch extent");
     v.metadata(accepted, batch, "accepted columns");
     v.metadata(records.base_positions, batch, "record base positions");
     v.metadata(records.valid_columns, batch, "record valid columns");

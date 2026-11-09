@@ -83,7 +83,7 @@ void metadata(const Tensor& t, int batch, const char* label, Device device) {
     contiguous(t, DType::I32, {batch}, 4, label, device);
 }
 
-void validate_batch_extent(int batch) { require(batch >= 1 && batch <= 16, "batch extent"); }
+void validate_batch_extent(int batch) { require(batch >= 1 && batch <= 32, "batch extent"); }
 
 } // namespace
 

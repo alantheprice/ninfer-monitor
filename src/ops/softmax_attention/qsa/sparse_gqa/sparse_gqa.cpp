@@ -16,7 +16,7 @@ void profile(KvCacheStorage storage, int query_heads, int kv_heads, int lo, int 
             storage == KvCacheStorage::Int8Group64 || storage == KvCacheStorage::Nvfp4Group16 ||
             storage == KvCacheStorage::Fp8KeyNvfp4Value,
         "cache storage");
-    v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 16, "T/B interval");
+    v.require(lo > 0 && hi >= lo && batch >= 1 && batch <= 32, "T/B interval");
     v.require(multiprocessor_count > 0, "SM count");
 }
 } // namespace

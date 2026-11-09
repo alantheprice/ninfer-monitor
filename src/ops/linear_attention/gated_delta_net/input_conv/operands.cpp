@@ -96,7 +96,7 @@ void validate_interval(std::int32_t first, std::int32_t last) {
 void validate_batch_interval(Publication publication, std::int32_t batch, std::int32_t first,
                              std::int32_t last) {
     validate_interval(first, last);
-    if (batch < 1 || batch > 16 || (batch > 1 && last > 16) ||
+    if (batch < 1 || batch > 32 || (batch > 1 && last > 16) ||
         (publication == Publication::Record && (first < 2 || last > 16)))
         throw std::invalid_argument("GDN convolution: unsupported batch/token interval");
 }
