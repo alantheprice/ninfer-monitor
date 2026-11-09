@@ -27,13 +27,25 @@ using common::nvfp4_activation_scale;
 using common::quantize_nvfp4_activation_pair;
 using common::nvfp4_dequant_f16x16;
 
+// mma.cuh's NVFP4 MMA is a software path for arch < 1200 and reads f16x2 fragments;
+// sm_120a+ has hardware e2m1 MMA that consumes raw codes. The tile layout depends on this.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 1200)
+#define NINFER_SOFTWARE_NVFP4_MMA 1
+#else
+#define NINFER_SOFTWARE_NVFP4_MMA 0
+#endif
+
 
 
 template <int Columns, bool Gate, int Stages = 2, int KStep = 128, int Eviction = 0,
           int Intermediate = kIntermediate>
 struct Schedule {
     static constexpr int columns      = Columns;
-    static constexpr int stages       = Stages;
+    // The widened f16x2 tile is 4x the raw-code stride, so a 128-column double-buffered
+    // tile would need ~132 KiB of shared memory. Below sm_120a the MMA is a software path
+    // that must read widened fragments, so drop to a single stage there to fit the cap.
+    static constexpr int stages =
+        (Stages > 1 && Columns >= 64 && NINFER_SOFTWARE_NVFP4_MMA) ? 1 : Stages;
     static constexpr int k_step       = KStep;
     static constexpr int eviction     = Eviction;
     static constexpr int threads      = Columns >= 64 ? 256 : 128;
@@ -47,11 +59,29 @@ struct Schedule {
 
 template <class S>
 struct TileStorage {
-    alignas(16) std::uint8_t weight[S::stages][128 * (S::k_step / 2)];
-    alignas(16) std::uint8_t input[S::stages][S::columns * (S::k_step / 2)];
+    // Widened-tile layout: codes staged as raw e2m1 are widened in place to f16x2
+    // after the cp.async wait (mma.cuh's software NVFP4 MMA reads f16x2 fragments).
+    // Rows therefore carry f16 words (2 B/code) instead of nibbles, so weight/input
+    // rows are 4x the raw-code stride and ldmatrix addresses scale accordingly.
+    alignas(16) unsigned weight[S::stages][128 * (S::k_step / 2)];
+    alignas(16) unsigned input[S::stages][S::columns * (S::k_step / 2)];
     alignas(16) unsigned weight_scales[S::stages][128 * (S::k_step / 64)];
     alignas(16) unsigned input_scales[S::stages][S::columns * (S::k_step / 64)];
     int sources[S::columns];
+
+    __device__ __forceinline__ unsigned* weight_row(int stage, int row) {
+        return weight[stage] + row * (S::k_step / 2);
+    }
+    __device__ __forceinline__ unsigned* input_row(int stage, int row) {
+        return input[stage] + row * (S::k_step / 2);
+    }
+    // Raw-code sub-tile: the first quarter of each widened row.
+    __device__ __forceinline__ std::uint8_t* weight_raw(int stage, int row) {
+        return reinterpret_cast<std::uint8_t*>(weight_row(stage, row));
+    }
+    __device__ __forceinline__ std::uint8_t* input_raw(int stage, int row) {
+        return reinterpret_cast<std::uint8_t*>(input_row(stage, row));
+    }
 };
 
 __device__ __forceinline__ int swizzle(int row, int byte) { return byte ^ ((row & 3) << 4); }
@@ -80,27 +110,28 @@ stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0, Matrix weight,
         const int row = task / (S::k_step / 32), segment = task % (S::k_step / 32);
         const int wr     = row0 + (Gate ? (row < 64 ? row : row - 64 + S::intermediate) : row);
         const bool valid = S::k % S::k_step == 0 || kt * S::k_step + segment * 32 < S::k;
+        // Stage into the raw-code sub-tile (first quarter of each widened row).
         if constexpr (S::eviction & 4) {
             if (cache_policy & 1)
                 common::cp_async_cache_hint<Cache::cg>(
-                    tile.weight[stage] + row * (S::k_step / 2) + swizzle(row, segment * 16),
+                    tile.weight[stage] + row * (S::k_step / 8) + swizzle(row, segment * 16),
                     weight.codes + std::int64_t(wr) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, stream);
             else
                 common::cp_async_cache_hint<Cache::ca>(
-                    tile.weight[stage] + row * (S::k_step / 2) + swizzle(row, segment * 16),
+                    tile.weight[stage] + row * (S::k_step / 8) + swizzle(row, segment * 16),
                     weight.codes + std::int64_t(wr) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, stream);
         } else if (cache_policy & 1)
-            cp_async_zfill<16, Cache::cg>(tile.weight[stage] + row * (S::k_step / 2) +
+            cp_async_zfill<16, Cache::cg>(tile.weight[stage] + row * (S::k_step / 8) +
                                               swizzle(row, segment * 16),
                                           weight.codes + std::int64_t(wr) * (S::k / 2) +
                                               (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                                           valid ? 16 : 0);
         else
-            cp_async_zfill<16>(tile.weight[stage] + row * (S::k_step / 2) +
+            cp_async_zfill<16>(tile.weight[stage] + row * (S::k_step / 8) +
                                    swizzle(row, segment * 16),
                                weight.codes + std::int64_t(wr) * (S::k / 2) +
                                    (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
@@ -128,24 +159,24 @@ stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0, Matrix weight,
         if constexpr (S::eviction & 8) {
             if (cache_policy & 2)
                 common::cp_async_cache_hint<Cache::cg>(
-                    tile.input[stage] + row * (S::k_step / 2) + swizzle(row, segment * 16),
+                    tile.input[stage] + row * (S::k_step / 8) + swizzle(row, segment * 16),
                     x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, retained);
             else
                 common::cp_async_cache_hint<Cache::ca>(
-                    tile.input[stage] + row * (S::k_step / 2) + swizzle(row, segment * 16),
+                    tile.input[stage] + row * (S::k_step / 8) + swizzle(row, segment * 16),
                     x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, retained);
         } else if (cache_policy & 2)
-            cp_async_zfill<16, Cache::cg>(tile.input[stage] + row * (S::k_step / 2) +
+            cp_async_zfill<16, Cache::cg>(tile.input[stage] + row * (S::k_step / 8) +
                                               swizzle(row, segment * 16),
                                           x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                                               (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                                           valid ? 16 : 0);
         else
-            cp_async_zfill<16>(tile.input[stage] + row * (S::k_step / 2) +
+            cp_async_zfill<16>(tile.input[stage] + row * (S::k_step / 8) +
                                    swizzle(row, segment * 16),
                                x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                                    (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
@@ -163,6 +194,42 @@ stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0, Matrix weight,
                           valid ? 8 : 0);
     }
     cp_commit();
+}
+
+// Widening worker layout: one warp owns one row; kHidden + columns rows need four
+// backward passes over 32 warps. Backward iteration keeps each destination row clear
+// of rows the same warp still has to read, so no second buffer is needed.
+template <class S>
+__device__ __forceinline__ void widen_stage_codes(TileStorage<S>& tile, int stage) {
+    const int warp  = threadIdx.x >> 5;
+    const int krows = 128 + S::columns;
+#pragma unroll 1
+    for (int pass = (krows + 31) / 32; pass-- > 0;) {
+        const int row = pass * 32 + warp;
+        if (row >= krows) continue;
+        const bool is_weight = row < 128;
+        const int tile_row   = is_weight ? row : row - 128;
+        auto* widened        = is_weight ? tile.weight_row(stage, tile_row)
+                                         : tile.input_row(stage, tile_row);
+        const auto* raw      = reinterpret_cast<const std::uint8_t*>(widened);
+#pragma unroll
+        for (int g = 0; g < S::k_step / 64; ++g) {
+            const std::uint8_t scale = is_weight
+                                           ? reinterpret_cast<const std::uint8_t*>(
+                                                 tile.weight_scales[stage])[tile_row * 16 + g]
+                                           : reinterpret_cast<const std::uint8_t*>(
+                                                 tile.input_scales[stage])[tile_row * (S::k_step / 16) + g];
+            const auto decoded       = nvfp4_dequant_f16x16(raw + g * 32, scale);
+            widened[g * 4 + 0] = decoded.lo.x;
+            widened[g * 4 + 1] = decoded.lo.y;
+            widened[g * 4 + 2] = decoded.lo.z;
+            widened[g * 4 + 3] = decoded.lo.w;
+            widened[g * 4 + 4] = decoded.hi.x;
+            widened[g * 4 + 5] = decoded.hi.y;
+            widened[g * 4 + 6] = decoded.hi.z;
+            widened[g * 4 + 7] = decoded.hi.w;
+        }
+    }
 }
 
 template <int Intermediate>
@@ -215,6 +282,13 @@ contract_tile(TileStorage<S>& tile, int row0, Matrix weight, const std::uint8_t*
         const int stage = kt % S::stages;
         cp_wait<S::stages - 1>();
         __syncthreads();
+        // mma.cuh's NVFP4 MMA is a software path below sm_120a and reads f16x2 fragments,
+        // but stage_inputs copies raw e2m1 codes. Widen in place here, after the async
+        // copy has landed and before ldmatrix reads the tile.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 1200)
+        widen_stage_codes<S>(tile, stage);
+        __syncthreads();
+#endif
 #pragma unroll
         for (int ki = 0; ki < S::k_step / 64; ++ki) {
             if constexpr (S::k % S::k_step != 0)
