@@ -37,3 +37,19 @@ TWO defects to solve, not one:
 Recommendation: implement option 4 on a worktree, GPU-probe the scale-row question with
 a single-expert single-group kernel, refdiff vs tests/goldens/h200-refdiff-pack.json
 (secured, 30 cases, 100% self-consistency baseline), then throughput.
+
+## H200 validation results (2026-11-09, pod qlmbft2xsaqyoz, GPU-verified)
+
+- 45f3f933's widening builds on sm_90a and serves correctly: coherent greedy output,
+  clean 1024-token generation finish=stop, 17x23->391. No crash, no corruption.
+- Measured on H200 (128-tok streams, greedy): C=1 long-gen 88-98 tok/s across runs
+  (98.0 first, 87.6 repeat — real run variance), short answers ~100 tok/s,
+  C=2 ~110-122, C=4 ~153, C=8 aggregate 170-173 tok/s. Vector-unblock baseline was
+  C=1 88 / C=8 152, so the MMA path adds ~0-11% C=1 (within variance) and ~+13% C=8.
+- MMA-path replay vs the vector-unblock h200 goldens: exact=1/30, prefix12 5/30 (17%)
+  — expected: different accumulation numerics. Recapture goldens on the MMA build
+  before using them as a regression gate.
+- Do NOT expect the 45f3f933 approach to close more of the B200 gap: the single-stage
+  schedule + software bf16 MMA on 4x-widened tiles is inherently modest. The measured
+  numbers confirm: the remaining C=8 gap to B200 (173 vs 641) is batching/scheduler
+  and Hopper-native kernel tuning, per the README optimization list.
