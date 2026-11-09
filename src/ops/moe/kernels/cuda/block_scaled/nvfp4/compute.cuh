@@ -8,6 +8,8 @@
 #include "ops/common/cuda/memory.cuh"
 #include "ops/common/numeric/math.cuh"
 #include "ops/common/quant/nvfp4.cuh"
+#include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail::moe_cuda::block_scaled::nvfp4 {
 using common::load_vec;
@@ -55,6 +57,9 @@ struct Schedule {
     static constexpr int k            = Gate ? kHidden : Intermediate;
     static constexpr int intermediate = Intermediate;
     static constexpr int min_blocks   = Columns == 128 ? 2 : Columns == 64 ? 3 : 1;
+    // A raw 16-byte segment advances k_step/8 cells once rows hold widened f16x2 words,
+    // and k_step/2 cells while rows still hold raw e2m1 codes.
+    static constexpr int stage_cell_divisor = NINFER_SOFTWARE_NVFP4_MMA ? 8 : 2;
 };
 
 template <class S>
@@ -63,16 +68,19 @@ struct TileStorage {
     // after the cp.async wait (mma.cuh's software NVFP4 MMA reads f16x2 fragments).
     // Rows therefore carry f16 words (2 B/code) instead of nibbles, so weight/input
     // rows are 4x the raw-code stride and ldmatrix addresses scale accordingly.
-    alignas(16) unsigned weight[S::stages][128 * (S::k_step / 2)];
-    alignas(16) unsigned input[S::stages][S::columns * (S::k_step / 2)];
+    // Native sm_120a MMA consumes the raw e2m1 codes directly, so it keeps the
+    // nibble layout: same row expression, one quarter the bytes.
+    using cell = std::conditional_t<NINFER_SOFTWARE_NVFP4_MMA, unsigned, std::uint8_t>;
+    alignas(16) cell weight[S::stages][128 * (S::k_step / 2)];
+    alignas(16) cell input[S::stages][S::columns * (S::k_step / 2)];
     alignas(16) unsigned weight_scales[S::stages][128 * (S::k_step / 64)];
     alignas(16) unsigned input_scales[S::stages][S::columns * (S::k_step / 64)];
     int sources[S::columns];
 
-    __device__ __forceinline__ unsigned* weight_row(int stage, int row) {
+    __device__ __forceinline__ cell* weight_row(int stage, int row) {
         return weight[stage] + row * (S::k_step / 2);
     }
-    __device__ __forceinline__ unsigned* input_row(int stage, int row) {
+    __device__ __forceinline__ cell* input_row(int stage, int row) {
         return input[stage] + row * (S::k_step / 2);
     }
     // Raw-code sub-tile: the first quarter of each widened row.
@@ -114,24 +122,24 @@ stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0, Matrix weight,
         if constexpr (S::eviction & 4) {
             if (cache_policy & 1)
                 common::cp_async_cache_hint<Cache::cg>(
-                    tile.weight[stage] + row * (S::k_step / 8) + swizzle(row, segment * 16),
+                    tile.weight[stage] + row * (S::k_step / S::stage_cell_divisor) + swizzle(row, segment * 16),
                     weight.codes + std::int64_t(wr) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, stream);
             else
                 common::cp_async_cache_hint<Cache::ca>(
-                    tile.weight[stage] + row * (S::k_step / 8) + swizzle(row, segment * 16),
+                    tile.weight[stage] + row * (S::k_step / S::stage_cell_divisor) + swizzle(row, segment * 16),
                     weight.codes + std::int64_t(wr) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, stream);
         } else if (cache_policy & 1)
-            cp_async_zfill<16, Cache::cg>(tile.weight[stage] + row * (S::k_step / 8) +
+            cp_async_zfill<16, Cache::cg>(tile.weight[stage] + row * (S::k_step / S::stage_cell_divisor) +
                                               swizzle(row, segment * 16),
                                           weight.codes + std::int64_t(wr) * (S::k / 2) +
                                               (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                                           valid ? 16 : 0);
         else
-            cp_async_zfill<16>(tile.weight[stage] + row * (S::k_step / 8) +
+            cp_async_zfill<16>(tile.weight[stage] + row * (S::k_step / S::stage_cell_divisor) +
                                    swizzle(row, segment * 16),
                                weight.codes + std::int64_t(wr) * (S::k / 2) +
                                    (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
@@ -159,24 +167,24 @@ stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0, Matrix weight,
         if constexpr (S::eviction & 8) {
             if (cache_policy & 2)
                 common::cp_async_cache_hint<Cache::cg>(
-                    tile.input[stage] + row * (S::k_step / 8) + swizzle(row, segment * 16),
+                    tile.input[stage] + row * (S::k_step / S::stage_cell_divisor) + swizzle(row, segment * 16),
                     x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, retained);
             else
                 common::cp_async_cache_hint<Cache::ca>(
-                    tile.input[stage] + row * (S::k_step / 8) + swizzle(row, segment * 16),
+                    tile.input[stage] + row * (S::k_step / S::stage_cell_divisor) + swizzle(row, segment * 16),
                     x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                         (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                     valid ? 16 : 0, retained);
         } else if (cache_policy & 2)
-            cp_async_zfill<16, Cache::cg>(tile.input[stage] + row * (S::k_step / 8) +
+            cp_async_zfill<16, Cache::cg>(tile.input[stage] + row * (S::k_step / S::stage_cell_divisor) +
                                               swizzle(row, segment * 16),
                                           x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                                               (valid ? kt * (S::k_step / 2) + segment * 16 : 0),
                                           valid ? 16 : 0);
         else
-            cp_async_zfill<16>(tile.input[stage] + row * (S::k_step / 8) +
+            cp_async_zfill<16>(tile.input[stage] + row * (S::k_step / S::stage_cell_divisor) +
                                    swizzle(row, segment * 16),
                                x + std::int64_t(source >= 0 ? source : 0) * (S::k / 2) +
                                    (valid ? kt * (S::k_step / 2) + segment * 16 : 0),

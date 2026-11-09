@@ -85,7 +85,10 @@ __device__ __forceinline__ unsigned swizzle_xor_address(unsigned base, unsigned 
 // Keeping big buffers dynamic avoids the cross-object .nv.shared merge entirely.
 template <int Bytes>
 __device__ __forceinline__ unsigned char* shared_storage() {
-    static_assert(Bytes > 0 && Bytes <= 99 * 1024);
+    // sm_120 and sm_100a both expose ~227 KiB of dynamic shared memory, so the
+    // cap only needs to stay under the hardware limit; the launch is responsible
+    // for passing the size and raising cudaFuncAttributeMaxDynamicSharedMemorySize.
+    static_assert(Bytes > 0 && Bytes <= 200 * 1024);
     if constexpr (Bytes > 32 * 1024) {
         extern __shared__ __align__(16) unsigned char dynamic_storage[];
         return dynamic_storage;

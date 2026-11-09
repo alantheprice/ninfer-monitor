@@ -33,7 +33,18 @@ void launch_mma(const Tensor& x, const CudaSwiGLUExperts& experts, const ExpertR
     const int max_jobs    = (kTopK * x.ne[1] / job_columns + kExperts) * subtiles;
     const int blocks      = std::min(max_jobs * (rows / S::rows),
                                      execution.multiprocessor_count() * plan.queued_ctas_per_sm);
-    grouped_mma<Columns, Gate, Atomic><<<blocks, S::threads, 0, execution.stream()>>>(
+    // A widened TileStorage exceeds the 32 KiB static threshold in
+    // common::shared_storage, so the kernel reads extern __shared__; the launch
+    // must pass the matching dynamic size and raise the attribute past the
+    // 48 KiB default.
+    constexpr int bytes = sizeof(TileStorage<S>) > 32 * 1024 ? sizeof(TileStorage<S>) : 0;
+    if constexpr (bytes > 48 * 1024) {
+        static const auto status = cudaFuncSetAttribute(
+            reinterpret_cast<const void*>(grouped_mma<Columns, Gate, Atomic>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+        CUDA_CHECK(status);
+    }
+    grouped_mma<Columns, Gate, Atomic><<<blocks, S::threads, bytes, execution.stream()>>>(
         Gate ? s.input_codes : s.product_codes,
         static_cast<const std::uint8_t*>(Gate ? s.input_scales : s.product_scales),
         Gate ? experts.bank.gate_up : experts.bank.down,
