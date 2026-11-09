@@ -196,30 +196,28 @@ stage_inputs(TileStorage<S>& tile, int stage, int kt, int row0, Matrix weight,
     cp_commit();
 }
 
-// Widening worker layout: one warp owns one row; kHidden + columns rows need four
-// backward passes over 32 warps. Backward iteration keeps each destination row clear
-// of rows the same warp still has to read, so no second buffer is needed.
+// Widening worker layout: one thread owns one row at a time (any thread count), and the
+// row's 16-code groups are widened in DESCENDING order: the in-place write lands at 2x the
+// raw-code stride, so descending keeps every raw byte intact until the group that consumes
+// it has already been decoded. Rows are independent, so no cross-thread ordering exists.
 template <class S>
 __device__ __forceinline__ void widen_stage_codes(TileStorage<S>& tile, int stage) {
-    const int warp  = threadIdx.x >> 5;
-    const int krows = 128 + S::columns;
-#pragma unroll 1
-    for (int pass = (krows + 31) / 32; pass-- > 0;) {
-        const int row = pass * 32 + warp;
-        if (row >= krows) continue;
+    const int krows  = 128 + S::columns;
+    constexpr int groups = S::k_step / 16;
+    for (int row = threadIdx.x; row < krows; row += S::threads) {
         const bool is_weight = row < 128;
         const int tile_row   = is_weight ? row : row - 128;
         auto* widened        = is_weight ? tile.weight_row(stage, tile_row)
                                          : tile.input_row(stage, tile_row);
         const auto* raw      = reinterpret_cast<const std::uint8_t*>(widened);
+        const auto* scales   = is_weight
+             ? reinterpret_cast<const std::uint8_t*>(tile.weight_scales[stage]) +
+                   tile_row * groups
+             : reinterpret_cast<const std::uint8_t*>(tile.input_scales[stage]) +
+                   tile_row * groups;
 #pragma unroll
-        for (int g = 0; g < S::k_step / 64; ++g) {
-            const std::uint8_t scale = is_weight
-                                           ? reinterpret_cast<const std::uint8_t*>(
-                                                 tile.weight_scales[stage])[tile_row * 16 + g]
-                                           : reinterpret_cast<const std::uint8_t*>(
-                                                 tile.input_scales[stage])[tile_row * (S::k_step / 16) + g];
-            const auto decoded       = nvfp4_dequant_f16x16(raw + g * 32, scale);
+        for (int g = groups; g-- > 0;) {
+            const auto decoded = nvfp4_dequant_f16x16(raw + g * 8, scales[g]);
             widened[g * 4 + 0] = decoded.lo.x;
             widened[g * 4 + 1] = decoded.lo.y;
             widened[g * 4 + 2] = decoded.lo.z;

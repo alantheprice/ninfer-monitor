@@ -9,7 +9,7 @@ Plan select_plan(int tokens, int, ExpertSubsetKind) {
     plan.block_scaled   = {.format                = QType::NVFP4,
                            .gate_columns          = tokens >= 3584 ? 128 : columns,
                            .down_columns          = columns,
-                           .vector                = tokens == 1,
+                           .vector                = true,
                            .atomic_output         = tokens >= 128,
                            .single_block_grouping = tokens <= 64,
                            .shared_algorithm      = tokens < 8
