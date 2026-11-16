@@ -27,7 +27,7 @@ namespace {
 constexpr std::int32_t kHeadDim             = 256;
 constexpr float kExpectedScale              = 0.0625f;
 constexpr std::int32_t kMaximumVerifyTokens = 16;
-constexpr std::int32_t kMaximumBatchSize    = 8;
+constexpr std::int32_t kMaximumBatchSize    = 16;
 
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
