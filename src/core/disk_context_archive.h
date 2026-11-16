@@ -257,6 +257,13 @@ private:
     void scan();
     void refill_budget_locked();
 
+    // Highest manifest id present on disk. Called under the cross-process file lock so a peer's
+    // committed manifests are visible before this process allocates the next id.
+    [[nodiscard]] std::uint64_t max_manifest_id_on_disk() const;
+    // Re-derives stored_bytes_ from the directory. Each process only observes its own writes
+    // between rescans, so the shared capacity drifts unless it is re-measured periodically.
+    void recompute_usage_locked();
+
     [[nodiscard]] std::filesystem::path manifest_path(std::uint64_t id) const;
     [[nodiscard]] std::filesystem::path page_path(std::size_t kind, const ArchiveKey& key) const;
     [[nodiscard]] std::uint64_t page_file_bytes(std::size_t kind) const;
@@ -284,6 +291,12 @@ private:
     std::deque<std::shared_ptr<Prefetch>> read_queue_;
 
     bool stopping_ = false;
+    // Cross-process guard for directory mutations. Lock order is file lock then mutex_; never the
+    // reverse. Held only at the top-level mutation entry points (scan, write_job).
+    int lock_fd_ = -1;
+    // Each process only observes its own writes between rescans, so the shared directory would
+    // drift toward twice the capacity without a periodic re-measure.
+    std::chrono::steady_clock::time_point last_usage_recompute_{};
     std::thread writer_;
     std::thread reader_;
 };

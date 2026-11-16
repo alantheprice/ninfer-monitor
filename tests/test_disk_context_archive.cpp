@@ -1,5 +1,8 @@
 #include "core/disk_context_archive.h"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -126,6 +129,56 @@ std::size_t count_files(const std::filesystem::path& root, const std::string& ex
         if (entry.is_regular_file() && entry.path().extension() == extension) { ++count; }
     }
     return count;
+}
+
+// Several processes sharing one directory must not lose or duplicate entries. Each worker
+// allocates manifest ids and sweeps orphans concurrently with its peers, which is exactly the
+// window where an unguarded allocator collides and an unguarded sweep deletes a peer's pages.
+void test_shared_directory_across_processes() {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("ninfer-disk-archive-shared-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    std::vector<std::byte> staging(64U << 20);
+    constexpr int kWorkers           = 4;
+    constexpr int kSavesPerWorker    = 6;
+    constexpr std::uint32_t kFrontier = 512;
+    const auto seed_for = [](int worker, int save) {
+        return static_cast<std::uint64_t>(worker) * 1000U + static_cast<std::uint64_t>(save) + 1U;
+    };
+
+    std::vector<pid_t> workers;
+    for (int worker = 0; worker < kWorkers; ++worker) {
+        const pid_t pid = ::fork();
+        require(pid >= 0, "fork failed");
+        if (pid == 0) {
+            int code = 0;
+            try {
+                DiskContextArchive archive(options(root, 64ULL << 20), staging);
+                for (int save = 0; save < kSavesPerWorker; ++save) {
+                    fill_and_commit(archive, Lineage{.seed = seed_for(worker, save)}, kFrontier);
+                }
+            } catch (...) {
+                code = 1;
+            }
+            ::_exit(code);
+        }
+        workers.push_back(pid);
+    }
+    for (const pid_t pid : workers) {
+        int status = 0;
+        require(::waitpid(pid, &status, 0) == pid, "worker did not exit");
+        require(WIFEXITED(status) && WEXITSTATUS(status) == 0, "worker failed");
+    }
+
+    DiskContextArchive archive(options(root, 64ULL << 20), staging);
+    require(archive.stats().manifests == static_cast<std::size_t>(kWorkers * kSavesPerWorker),
+            "shared directory lost or duplicated manifests");
+    for (int worker = 0; worker < kWorkers; ++worker) {
+        for (int save = 0; save < kSavesPerWorker; ++save) {
+            verify_prefetch(archive, Lineage{.seed = seed_for(worker, save)}, kFrontier);
+        }
+    }
+    std::filesystem::remove_all(root);
 }
 
 } // namespace
@@ -337,6 +390,7 @@ int main() {
             archive.flush();
             verify_prefetch(archive, a, 300);
         }
+        test_shared_directory_across_processes();
         std::filesystem::remove_all(root);
         std::cout << "disk context archive tests passed\n";
         return 0;

@@ -1,6 +1,7 @@
 #include "core/disk_context_archive.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -20,6 +21,35 @@ namespace {
 
 constexpr std::uint64_t kPrime1 = 0x9E3779B185EBCA87ULL;
 constexpr std::uint64_t kPrime2 = 0xC2B2AE3D27D4EB4FULL;
+
+// Exclusive advisory lock over the archive directory. Two engines may share one directory so a
+// checkpoint written by either is restorable by both; without this, concurrent manifest id
+// allocation collides and the startup scan deletes pages a peer is about to reference.
+class ScopedFileLock {
+public:
+    explicit ScopedFileLock(int fd) : fd_(fd) {
+        if (fd_ < 0) { return; }
+        while (::flock(fd_, LOCK_EX) != 0) {
+            if (errno != EINTR) {
+                fd_ = -1;
+                return;
+            }
+        }
+        locked_ = true;
+    }
+
+    ~ScopedFileLock() {
+        if (locked_) { ::flock(fd_, LOCK_UN); }
+    }
+
+    ScopedFileLock(const ScopedFileLock&)            = delete;
+    ScopedFileLock& operator=(const ScopedFileLock&) = delete;
+
+private:
+    int fd_       = -1;
+    bool locked_  = false;
+};
+
 constexpr std::uint64_t kPrime3 = 0x165667B19E3779F9ULL;
 constexpr std::uint64_t kPrime4 = 0x85EBCA77C2B2AE63ULL;
 constexpr std::uint64_t kPrime5 = 0x27D4EB2F165667C5ULL;
@@ -398,6 +428,8 @@ DiskContextArchive::DiskContextArchive(DiskArchiveOptions options, std::span<std
                                                 ("k" + std::to_string(kind)) / name.data());
         }
     }
+    lock_fd_ = ::open((options_.directory / ".archive.lock").c_str(),
+                      O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     scan();
     budget_refilled_ = std::chrono::steady_clock::now();
     budget_bytes_    = static_cast<double>(options_.write_bytes_per_second) *
@@ -415,6 +447,7 @@ DiskContextArchive::~DiskContextArchive() {
     reader_cv_.notify_all();
     if (writer_.joinable()) { writer_.join(); }
     if (reader_.joinable()) { reader_.join(); }
+    if (lock_fd_ >= 0) { ::close(lock_fd_); }
 }
 
 std::filesystem::path DiskContextArchive::manifest_path(std::uint64_t id) const {
@@ -431,7 +464,35 @@ std::uint64_t DiskContextArchive::page_file_bytes(std::size_t kind) const {
     return sizeof(PageHeader) + options_.page_bytes[kind];
 }
 
+std::uint64_t DiskContextArchive::max_manifest_id_on_disk() const {
+    std::uint64_t max_id = 0;
+    std::error_code error;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(options_.directory / "manifests", error)) {
+        if (error) { break; }
+        if (entry.path().extension() != ".ckpt") { continue; }
+        const std::string stem = entry.path().stem().string();
+        if (stem.size() != 16) { continue; }
+        if (const auto value = parse_hex16(stem)) { max_id = std::max(max_id, *value); }
+    }
+    return max_id;
+}
+
+void DiskContextArchive::recompute_usage_locked() {
+    std::uint64_t total = 0;
+    std::error_code error;
+    for (auto it = std::filesystem::recursive_directory_iterator(options_.directory, error);
+         !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+        if (!it->is_regular_file(error)) { continue; }
+        total += static_cast<std::uint64_t>(it->file_size(error));
+    }
+    stored_bytes_ = total;
+}
+
 void DiskContextArchive::scan() {
+    // Exclusive across processes: the orphan sweep below must not run while a peer is between
+    // writing a page and committing the manifest that references it.
+    ScopedFileLock file_lock(lock_fd_);
     std::error_code error;
     for (auto it = std::filesystem::recursive_directory_iterator(options_.directory, error);
          !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
@@ -689,8 +750,19 @@ void DiskContextArchive::writer_loop() {
 }
 
 void DiskContextArchive::write_job(SaveJob& job) {
-    const SaveRequest& save = job.request_;
-    bool ok                 = true;
+    // Exclusive across processes so manifest id allocation cannot collide with a peer's commit.
+    ScopedFileLock file_lock(lock_fd_);
+    const std::uint64_t disk_max_id = max_manifest_id_on_disk();
+    {
+        std::scoped_lock lock(mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_usage_recompute_ > std::chrono::seconds(60)) {
+            recompute_usage_locked();
+            last_usage_recompute_ = now;
+        }
+    }
+    const SaveRequest& save         = job.request_;
+    bool ok                         = true;
     std::vector<std::filesystem::path> touched;
     for (std::size_t kind = 0; kind < kArchivePageKinds && ok; ++kind) {
         for (std::size_t index = 0; index < job.missing_[kind].size() && ok; ++index) {
@@ -729,7 +801,8 @@ void DiskContextArchive::write_job(SaveJob& job) {
                 ok              = ok && page != pages_[kind].end() && page->second.durable;
             }
         }
-        id = next_id_++;
+        next_id_ = std::max(next_id_, disk_max_id + 1);
+        id       = next_id_++;
     }
 
     std::vector<ArchiveKey> keys;
