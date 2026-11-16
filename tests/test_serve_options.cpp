@@ -78,7 +78,7 @@ void test_resources_and_units() {
                                                {"--pending-timeout", "0.1ms"},
                                                {"--pending-timeout", "4294967296ms"},
                                                {"--media-live-capacity", "0B"},
-                                               {"--max-concurrency", "9"},
+                                               {"--max-concurrency", "17"},
                                                {"--checkpoint-interval", "0"},
                                                {"--port", "65536"},
                                                {"--top-k", "21"},

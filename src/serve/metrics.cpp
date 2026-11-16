@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <dlfcn.h>
 #include <iomanip>
 #include <locale>
 #include <sstream>
@@ -35,6 +37,112 @@ std::string escape_label(std::string_view value) {
     }
     return out;
 }
+
+// GPU telemetry through NVML, loaded lazily and once. Every field is optional so a missing
+// symbol, an absent library or an unsupported device omits that metric rather than reporting
+// a fabricated zero. The ordinal is the rank's CUDA device, which matches the NVML index
+// because the engine runs with CUDA_DEVICE_ORDER=PCI_BUS_ID.
+struct GpuTelemetry {
+    bool utilization                = false;
+    unsigned int gpu_percent        = 0;
+    unsigned int memory_percent     = 0;
+    bool temperature                = false;
+    unsigned int temperature_celsius = 0;
+    bool power                      = false;
+    unsigned int power_milliwatts   = 0;
+    bool power_limit                = false;
+    unsigned int power_limit_milliwatts = 0;
+    bool sm_clock                   = false;
+    unsigned int sm_clock_mhz       = 0;
+};
+
+class GpuTelemetrySampler {
+public:
+    static const GpuTelemetrySampler& instance() {
+        static const GpuTelemetrySampler sampler;
+        return sampler;
+    }
+
+    GpuTelemetry sample(unsigned int ordinal) const {
+        GpuTelemetry out;
+        if (!ready_) return out;
+        void* device = nullptr;
+        if (handle_(ordinal, &device) != 0 || device == nullptr) return out;
+        if (utilization_ != nullptr) {
+            struct Rates {
+                unsigned int gpu;
+                unsigned int memory;
+            } rates{};
+            if (utilization_(device, &rates) == 0) {
+                out.utilization    = true;
+                out.gpu_percent    = rates.gpu;
+                out.memory_percent = rates.memory;
+            }
+        }
+        if (temperature_ != nullptr) {
+            unsigned int value = 0;
+            if (temperature_(device, 0 /* NVML_TEMPERATURE_GPU */, &value) == 0) {
+                out.temperature         = true;
+                out.temperature_celsius = value;
+            }
+        }
+        if (power_ != nullptr) {
+            unsigned int value = 0;
+            if (power_(device, &value) == 0) {
+                out.power            = true;
+                out.power_milliwatts = value;
+            }
+        }
+        if (power_limit_ != nullptr) {
+            unsigned int value = 0;
+            if (power_limit_(device, &value) == 0) {
+                out.power_limit            = true;
+                out.power_limit_milliwatts = value;
+            }
+        }
+        if (clock_ != nullptr) {
+            unsigned int value = 0;
+            if (clock_(device, 1 /* NVML_CLOCK_SM */, &value) == 0) {
+                out.sm_clock     = true;
+                out.sm_clock_mhz = value;
+            }
+        }
+        return out;
+    }
+
+private:
+    using HandleFn      = int (*)(unsigned int, void**);
+    using UtilizationFn = int (*)(void*, void*);
+    using TemperatureFn = int (*)(void*, unsigned int, unsigned int*);
+    using UnsignedFn    = int (*)(void*, unsigned int*);
+    using ClockFn       = int (*)(void*, unsigned int, unsigned int*);
+
+    GpuTelemetrySampler() {
+        void* library = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+        if (library == nullptr) return;
+        const auto init =
+            reinterpret_cast<int (*)()>(dlsym(library, "nvmlInit_v2"));
+        handle_ = reinterpret_cast<HandleFn>(dlsym(library, "nvmlDeviceGetHandleByIndex_v2"));
+        utilization_ =
+            reinterpret_cast<UtilizationFn>(dlsym(library, "nvmlDeviceGetUtilizationRates"));
+        temperature_ =
+            reinterpret_cast<TemperatureFn>(dlsym(library, "nvmlDeviceGetTemperature"));
+        power_       = reinterpret_cast<UnsignedFn>(dlsym(library, "nvmlDeviceGetPowerUsage"));
+        power_limit_ = reinterpret_cast<UnsignedFn>(
+            dlsym(library, "nvmlDeviceGetPowerManagementLimit"));
+        clock_ = reinterpret_cast<ClockFn>(dlsym(library, "nvmlDeviceGetClockInfo"));
+        if (init == nullptr || handle_ == nullptr || init() != 0) return;
+        ready_ = true;
+    }
+
+    HandleFn handle_            = nullptr;
+    UtilizationFn utilization_  = nullptr;
+    TemperatureFn temperature_  = nullptr;
+    UnsignedFn power_           = nullptr;
+    UnsignedFn power_limit_     = nullptr;
+    ClockFn clock_              = nullptr;
+    bool ready_                 = false;
+};
 
 } // namespace
 
@@ -257,6 +365,13 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
     header("memory_headroom_bytes", "gauge", "Planning headroom available to startup allocations.");
     header("memory_host_reservation_bytes", "gauge", "Required Host capacity after startup.");
     header("cuda_memory_free_bytes", "gauge", "Sampled CUDA free memory, not process-owned bytes.");
+    header("gpu_utilization_percent", "gauge", "Sampled GPU SM utilization, 0-100.");
+    header("gpu_memory_utilization_percent", "gauge",
+           "Sampled GPU memory-controller utilization, 0-100.");
+    header("gpu_temperature_celsius", "gauge", "Sampled GPU die temperature.");
+    header("gpu_power_watts", "gauge", "Sampled GPU board power draw.");
+    header("gpu_power_limit_watts", "gauge", "Configured GPU power management limit.");
+    header("gpu_sm_clock_mhz", "gauge", "Sampled GPU SM clock.");
     header("system_memory_available_bytes", "gauge", "Linux MemAvailable, once per node.");
     header("resource_sample_age_seconds", "gauge",
            "Time since the coordinator received this resource sample.");
@@ -400,6 +515,17 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
                     << p.system_available_bytes << '\n';
             }
         }
+        const auto telemetry =
+            GpuTelemetrySampler::instance().sample(static_cast<unsigned int>(rank.rank));
+        if (telemetry.utilization) {
+            emit("gpu_utilization_percent", telemetry.gpu_percent);
+            emit("gpu_memory_utilization_percent", telemetry.memory_percent);
+        }
+        if (telemetry.temperature) emit("gpu_temperature_celsius", telemetry.temperature_celsius);
+        if (telemetry.power) emit("gpu_power_watts", telemetry.power_milliwatts * 1e-3);
+        if (telemetry.power_limit)
+            emit("gpu_power_limit_watts", telemetry.power_limit_milliwatts * 1e-3);
+        if (telemetry.sm_clock) emit("gpu_sm_clock_mhz", telemetry.sm_clock_mhz);
         if (rank.memory.ple) {
             emit("ple_read_bytes_total", rank.memory.ple->read_bytes);
             emit("ple_upload_bytes_total", rank.memory.ple->uploaded_bytes);
