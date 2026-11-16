@@ -5,7 +5,7 @@ namespace {
 Plan select_plan(const SwiGLUProfile&, int tokens, int) {
     Plan plan;
     plan.implementation = Implementation::BlockScaled;
-    const int columns   = tokens <= 16 ? 8 : tokens <= 128 ? 32 : 64;
+    const int columns   = tokens <= 16 ? 8 : tokens <= 32 ? 32 : 64;
     plan.block_scaled   = {.format                = QType::NVFP4,
                            .gate_columns          = tokens >= 3584 ? 128 : columns,
                            .down_columns          = columns,
