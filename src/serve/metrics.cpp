@@ -43,17 +43,24 @@ std::string escape_label(std::string_view value) {
 // a fabricated zero. The ordinal is the rank's CUDA device, which matches the NVML index
 // because the engine runs with CUDA_DEVICE_ORDER=PCI_BUS_ID.
 struct GpuTelemetry {
-    bool utilization                = false;
-    unsigned int gpu_percent        = 0;
-    unsigned int memory_percent     = 0;
-    bool temperature                = false;
-    unsigned int temperature_celsius = 0;
-    bool power                      = false;
-    unsigned int power_milliwatts   = 0;
-    bool power_limit                = false;
-    unsigned int power_limit_milliwatts = 0;
-    bool sm_clock                   = false;
-    unsigned int sm_clock_mhz       = 0;
+    bool utilization                     = false;
+    unsigned int gpu_percent             = 0;
+    unsigned int memory_percent          = 0;
+    bool memory                          = false;
+    unsigned long long memory_total_bytes = 0;
+    unsigned long long memory_free_bytes  = 0;
+    unsigned long long memory_used_bytes  = 0;
+    bool temperature                     = false;
+    unsigned int temperature_celsius     = 0;
+    bool power                           = false;
+    unsigned int power_milliwatts        = 0;
+    bool power_limit                     = false;
+    unsigned int power_limit_milliwatts  = 0;
+    bool sm_clock                        = false;
+    unsigned int sm_clock_mhz            = 0;
+    bool fan_speed                       = false;
+    unsigned int fan_speed_percent       = 0;
+    std::string name;
 };
 
 class GpuTelemetrySampler {
@@ -77,6 +84,19 @@ public:
                 out.utilization    = true;
                 out.gpu_percent    = rates.gpu;
                 out.memory_percent = rates.memory;
+            }
+        }
+        if (memory_ != nullptr) {
+            struct Info {
+                unsigned long long total;
+                unsigned long long free;
+                unsigned long long used;
+            } info{};
+            if (memory_(device, &info) == 0) {
+                out.memory             = true;
+                out.memory_total_bytes = info.total;
+                out.memory_free_bytes  = info.free;
+                out.memory_used_bytes  = info.used;
             }
         }
         if (temperature_ != nullptr) {
@@ -107,15 +127,28 @@ public:
                 out.sm_clock_mhz = value;
             }
         }
+        if (fan_speed_ != nullptr) {
+            unsigned int value = 0;
+            if (fan_speed_(device, &value) == 0) {
+                out.fan_speed         = true;
+                out.fan_speed_percent = value;
+            }
+        }
+        if (name_ != nullptr) {
+            char buffer[96]{}; // NVML_DEVICE_NAME_V2_BUFFER_SIZE
+            if (name_(device, buffer, sizeof(buffer)) == 0) out.name = buffer;
+        }
         return out;
     }
 
 private:
     using HandleFn      = int (*)(unsigned int, void**);
     using UtilizationFn = int (*)(void*, void*);
+    using MemoryFn      = int (*)(void*, void*);
     using TemperatureFn = int (*)(void*, unsigned int, unsigned int*);
     using UnsignedFn    = int (*)(void*, unsigned int*);
     using ClockFn       = int (*)(void*, unsigned int, unsigned int*);
+    using NameFn        = int (*)(void*, char*, unsigned int);
 
     GpuTelemetrySampler() {
         void* library = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
@@ -125,22 +158,28 @@ private:
         handle_ = reinterpret_cast<HandleFn>(dlsym(library, "nvmlDeviceGetHandleByIndex_v2"));
         utilization_ =
             reinterpret_cast<UtilizationFn>(dlsym(library, "nvmlDeviceGetUtilizationRates"));
+        memory_ = reinterpret_cast<MemoryFn>(dlsym(library, "nvmlDeviceGetMemoryInfo"));
         temperature_ =
             reinterpret_cast<TemperatureFn>(dlsym(library, "nvmlDeviceGetTemperature"));
         power_       = reinterpret_cast<UnsignedFn>(dlsym(library, "nvmlDeviceGetPowerUsage"));
         power_limit_ = reinterpret_cast<UnsignedFn>(
             dlsym(library, "nvmlDeviceGetPowerManagementLimit"));
         clock_ = reinterpret_cast<ClockFn>(dlsym(library, "nvmlDeviceGetClockInfo"));
+        fan_speed_ = reinterpret_cast<UnsignedFn>(dlsym(library, "nvmlDeviceGetFanSpeed"));
+        name_      = reinterpret_cast<NameFn>(dlsym(library, "nvmlDeviceGetName"));
         if (init == nullptr || handle_ == nullptr || init() != 0) return;
         ready_ = true;
     }
 
     HandleFn handle_            = nullptr;
     UtilizationFn utilization_  = nullptr;
+    MemoryFn memory_            = nullptr;
     TemperatureFn temperature_  = nullptr;
     UnsignedFn power_           = nullptr;
     UnsignedFn power_limit_     = nullptr;
     ClockFn clock_              = nullptr;
+    UnsignedFn fan_speed_       = nullptr;
+    NameFn name_                = nullptr;
     bool ready_                 = false;
 };
 
@@ -372,6 +411,11 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
     header("gpu_power_watts", "gauge", "Sampled GPU board power draw.");
     header("gpu_power_limit_watts", "gauge", "Configured GPU power management limit.");
     header("gpu_sm_clock_mhz", "gauge", "Sampled GPU SM clock.");
+    header("gpu_memory_total_bytes", "gauge", "Sampled GPU total memory.");
+    header("gpu_memory_used_bytes", "gauge", "Sampled GPU memory in use.");
+    header("gpu_memory_free_bytes", "gauge", "Sampled GPU free memory.");
+    header("gpu_fan_speed_percent", "gauge", "Sampled GPU fan speed, 0-100.");
+    header("gpu_info", "gauge", "Resident GPU identity; always 1.");
     header("system_memory_available_bytes", "gauge", "Linux MemAvailable, once per node.");
     header("resource_sample_age_seconds", "gauge",
            "Time since the coordinator received this resource sample.");
@@ -526,6 +570,15 @@ std::string Metrics::render(const EngineSnapshot& snapshot, const ServiceSnapsho
         if (telemetry.power_limit)
             emit("gpu_power_limit_watts", telemetry.power_limit_milliwatts * 1e-3);
         if (telemetry.sm_clock) emit("gpu_sm_clock_mhz", telemetry.sm_clock_mhz);
+        if (telemetry.memory) {
+            emit("gpu_memory_total_bytes", telemetry.memory_total_bytes);
+            emit("gpu_memory_used_bytes", telemetry.memory_used_bytes);
+            emit("gpu_memory_free_bytes", telemetry.memory_free_bytes);
+        }
+        if (telemetry.fan_speed) emit("gpu_fan_speed_percent", telemetry.fan_speed_percent);
+        if (!telemetry.name.empty())
+            out << "ninfer_gpu_info{" << labels << ",name=\"" << escape_label(telemetry.name)
+                << "\"} 1\n";
         if (rank.memory.ple) {
             emit("ple_read_bytes_total", rank.memory.ple->read_bytes);
             emit("ple_upload_bytes_total", rank.memory.ple->uploaded_bytes);
