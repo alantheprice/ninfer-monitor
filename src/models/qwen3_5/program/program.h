@@ -36,6 +36,8 @@ public:
     // The pinned Host context arena, address-stable for the process lifetime. The session's
     // context archive resolves Host record bindings against this base.
     [[nodiscard]] ninfer::ConstMemorySpan host_context_span() const;
+    // Same arena, mutable: the context archive writes Host record bytes through it.
+    [[nodiscard]] ninfer::MemorySpan host_context_span_mut();
 
 private:
     explicit RankProgram(std::unique_ptr<detail::RankProgramImpl>);

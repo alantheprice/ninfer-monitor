@@ -47,6 +47,7 @@ public:
     // seam before the engine starts serving (see engine startup attach block).
     [[nodiscard]] bool archive_enabled() const noexcept;
     void attach_archive_host_arena(ninfer::ConstMemorySpan arena);
+    void attach_archive_host_arena_mut(ninfer::MemorySpan arena);
 
 private:
     explicit PreparedSession(std::unique_ptr<detail::SessionImpl>);
@@ -83,6 +84,7 @@ private:
     std::shared_ptr<detail::RequestBasePlanImpl> impl_;
 
     friend class detail::SessionImpl;
+    friend class Session;
 };
 
 using CheckpointHandle = context::CheckpointHandle;
@@ -460,6 +462,10 @@ public:
     // Attached once after startup by the owning rank program; the Host context arena turns
     // archive staging bindings into CPU addresses.
     void attach_archive_host_arena(ninfer::ConstMemorySpan arena);
+    void attach_archive_host_arena_mut(ninfer::MemorySpan arena);
+    // NVMe checkpoint import: builds a Host-resident checkpoint from an archived manifest so the
+    // next admission decision binds it instead of re-prefilling the prompt.
+    [[nodiscard]] std::optional<CheckpointHandle> archive_import(const RequestBasePlan& base);
 private:
     std::unique_ptr<detail::SessionImpl> impl_;
 };

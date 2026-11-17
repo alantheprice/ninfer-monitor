@@ -668,6 +668,13 @@ RowLease HistoryDirectory::acquire_row(std::int32_t index) {
         *this, {pages_->pool_id(), static_cast<std::uint32_t>(index), row_generations_[index]});
 }
 
+std::optional<std::int32_t> HistoryDirectory::free_row() const noexcept {
+    for (std::size_t i = 0; i < row_active_.size(); ++i) {
+        if (!row_active_[i]) return static_cast<std::int32_t>(i);
+    }
+    return std::nullopt;
+}
+
 void HistoryDirectory::release_row(TableRow row) noexcept {
     if (!valid(row)) std::terminate();
     trim_mapping(row, 0);

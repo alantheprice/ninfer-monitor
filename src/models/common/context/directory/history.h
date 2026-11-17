@@ -238,6 +238,9 @@ public:
     }
 
     [[nodiscard]] std::uint32_t capacity() const noexcept;
+    // First execution row not currently held. The context archive import needs a row without
+    // owning a sequence, and row 0 is often taken by a concurrent request.
+    [[nodiscard]] std::optional<std::int32_t> free_row() const noexcept;
     [[nodiscard]] std::uint32_t occupied() const noexcept;
     [[nodiscard]] bool owned(HistoryId history) const;
     [[nodiscard]] bool active(HistoryId history) const;

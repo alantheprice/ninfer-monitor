@@ -1,0 +1,371 @@
+#include "models/qwen3_5/session/internal.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
+
+namespace ninfer::models::qwen3_5 {
+namespace detail {
+
+// Mirrors kStateSentinel in checkpoints_archive.cpp ("NINFER!1").
+constexpr std::uint64_t kImportStateSentinel = 0x4E494E4645522131ULL;
+
+// Identity image layout (checkpoints_archive.cpp:archive_entry):
+// [u32 positions bytes][positions image][u32 digests bytes][digests image]
+// [u64 ledger tokens][TokenId x tokens]
+struct ArchivedIdentity {
+    std::vector<TokenId> ledger;
+    qwen::ResidentPrefixIdentity positions;
+    qwen::PrefixShortlistDigests digests;
+};
+
+ArchivedIdentity parse_identity(std::span<const std::byte> bytes) {
+    if (bytes.size() < 24) throw std::invalid_argument("archived identity is truncated");
+    ArchivedIdentity out;
+    std::size_t cursor = 0;
+    const auto need = [&](std::size_t count) {
+        if (cursor + count > bytes.size())
+            throw std::invalid_argument("archived identity is truncated");
+    };
+    const auto read_u32 = [&] {
+        need(4);
+        std::uint32_t value = 0;
+        for (std::size_t i = 0; i < 4; ++i)
+            value |= static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(bytes[cursor + i]))
+                     << (8U * i);
+        cursor += 4;
+        return value;
+    };
+    const auto read_u64 = [&] {
+        need(8);
+        std::uint64_t value = 0;
+        for (std::size_t i = 0; i < 8; ++i)
+            value |= static_cast<std::uint64_t>(std::to_integer<std::uint8_t>(bytes[cursor + i]))
+                     << (8U * i);
+        cursor += 8;
+        return value;
+    };
+    const auto positions_bytes = read_u32();
+    need(positions_bytes);
+    out.positions.assign_image(bytes.subspan(cursor, positions_bytes));
+    cursor += positions_bytes;
+    const auto digests_bytes = read_u32();
+    need(digests_bytes);
+    out.digests.assign_image(bytes.subspan(cursor, digests_bytes));
+    cursor += digests_bytes;
+    const auto count = read_u64();
+    if (count > (std::uint64_t{1} << 30) || count * sizeof(std::uint32_t) > bytes.size() - cursor)
+        throw std::invalid_argument("archived identity token count overflows the image");
+    out.ledger.resize(static_cast<std::size_t>(count));
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto token = read_u32();
+        out.ledger[i] = static_cast<TokenId>(static_cast<std::int32_t>(token));
+    }
+    if (cursor != bytes.size()) throw std::invalid_argument("archived identity has trailing bytes");
+    return out;
+}
+
+struct PoolImport {
+    std::uint16_t pool = 0;
+    std::size_t kind = 0;
+    std::uint32_t pages = 0;
+    std::uint32_t frontier = 0;
+    context::ContextDemandId device{};
+    context::ContextDemandId host{};
+    context::HistoryId history{};
+};
+
+} // namespace detail
+
+// NVMe checkpoint import: builds a Host-resident checkpoint (host-only KV pages + host-only
+// state image) from an archived manifest, so the next admission decision binds it and the
+// ordinary materialization path fills device memory instead of re-prefilling. Everything here
+// is CPU-side record surgery inside one context transaction; the only GPU work is the empty
+// record allocations the device-born allocators force, and no compute frame is used (the
+// transaction rides a Context frame like release submission does).
+std::optional<CheckpointHandle> Session::archive_import(const RequestBasePlan& base) {
+    auto& p = *impl_;
+    if (!p.archive_enabled() || p.context_operation_ || p.pending_maintenance_ || p.release_ticket)
+        return std::nullopt;
+    const auto& prompt = base.summary().prompt_tokens;
+    static const bool trace = [] {
+        const char* v = ::getenv("NINFER_ARCHIVE_TRACE");
+        return v && v[0] == '1';
+    }();
+
+    try {
+        const auto candidate = p.archive_find(1, prompt, base.impl_->prefix_digests);
+        if (!candidate) {
+            if (trace) std::fprintf(stderr, "archive-import: no candidate (prompt=%u)\n", prompt);
+            return std::nullopt;
+        }
+        // One import per manifest per boot; imported checkpoints retire through the normal
+        // reclaim paths, and a retired import's lineage is proven stale for this session.
+        if (const auto found = p.import_memo.find(candidate->manifest);
+            found != p.import_memo.end())
+            return p.checkpoints.valid(found->second) ? std::optional{found->second}
+                                                      : std::nullopt;
+        p.import_memo.emplace(candidate->manifest, CheckpointHandle{});
+
+        auto prefetch = p.archive_prefetch(*candidate);
+        if (!prefetch) return std::nullopt;
+        if (prefetch->wait_for(std::chrono::milliseconds(500)) !=
+            ninfer::DiskContextArchive::Prefetch::Status::Ready)
+            return std::nullopt;
+
+        // --- Manifest payload ---
+        auto parsed = detail::parse_identity(prefetch->identity());
+        const auto state_blob = prefetch->state();
+        if (state_blob.size() < sizeof(ContinuationMetadata) + 16)
+            throw std::invalid_argument("archived state blob is truncated");
+        ContinuationMetadata metadata;
+        std::memcpy(&metadata, state_blob.data(), sizeof(metadata));
+        std::uint64_t role_raw = 0, sentinel = 0;
+        std::memcpy(&role_raw, state_blob.data() + sizeof(metadata), sizeof(role_raw));
+        std::memcpy(&sentinel, state_blob.data() + sizeof(metadata) + 8, sizeof(sentinel));
+        if (sentinel != detail::kImportStateSentinel)
+            throw std::invalid_argument("archived state blob has a bad sentinel");
+        const auto state_image = state_blob.subspan(sizeof(metadata) + 16);
+        // Intermediate checkpoints carry the full-sequence identity (their digests span the
+        // whole prompt, not just the capture frontier); the archive's chain match already
+        // proves the request's digests agree up to the candidate frontier.
+        if (metadata.execution_frontier != candidate->frontier ||
+            parsed.ledger.size() < candidate->frontier) {
+            if (trace)
+                std::fprintf(stderr,
+                             "archive-import: declined: inconsistent (manifest=%u metadata=%u "
+                             "tokens=%zu state_blob=%zu)\n",
+                             candidate->frontier, metadata.execution_frontier,
+                             parsed.ledger.size(), state_blob.size());
+            throw std::invalid_argument("archived checkpoint is inconsistent");
+        }
+
+        const bool mtp = metadata.backend_kv_valid > 0;
+        const auto main_frontier = candidate->frontier;
+        const auto backend_frontier = mtp ? metadata.backend_kv_valid : 0;
+
+        // --- Reserve: device-born page working set per pool (dropped in-transaction), Host
+        // page replicas per pool, device-born state shell + its Host replica.
+        context::ContextDemand demand;
+        std::vector<detail::PoolImport> pool_plans;
+        {
+            const auto main_pages = context::kv_pages_for_frontier(main_frontier);
+            detail::PoolImport main_plan{.pool = 0, .kind = 0, .pages = main_pages,
+                                         .frontier = main_frontier};
+            main_plan.device = demand.add_history(0, p.directory.pool(0).histories().binding_demand(
+                                          nullptr, 0, main_frontier, {}));
+            main_plan.host = demand.add_history(0, main_pages, context::ContextMemory::Host);
+            pool_plans.push_back(main_plan);
+            if (mtp) {
+                const auto backend_pages = context::kv_pages_for_frontier(backend_frontier);
+                detail::PoolImport backend_plan{.pool = 1, .kind = 1, .pages = backend_pages,
+                                                .frontier = backend_frontier};
+                backend_plan.device =
+                    demand.add_history(1, p.directory.pool(1).histories().binding_demand(
+                                              nullptr, 0, backend_frontier, {}));
+                backend_plan.host =
+                    demand.add_history(1, backend_pages, context::ContextMemory::Host);
+                pool_plans.push_back(backend_plan);
+            }
+        }
+        auto state_device_demand = context::StateDemand{};
+        state_device_demand.count = 1;
+        state_device_demand.variant = 0;
+        const auto state_device_id = demand.add_state(state_device_demand);
+        auto state_host_demand = context::StateDemand{};
+        state_host_demand.count = 1;
+        state_host_demand.variant = 0;
+        state_host_demand.logical_count = 1;
+        state_host_demand.memory = context::ContextMemory::Host;
+        const auto state_host_id = demand.add_state(state_host_demand);
+        auto reserved = p.directory.reserve(demand);
+        if (!reserved.reservation || !reserved.reservation->ready()) return std::nullopt;
+
+        context::ContextTransaction migration(p.directory);
+        auto& targets = *reserved.reservation;
+        // commit_history/prepare_write/deactivate all require the Reserved stage, so every
+        // history action below rides `migration` before prepare_actions(); nothing is queued
+        // after preparation.
+
+        // --- State image via the donor pattern: device-born shell, a D2H transfer to it as
+        // the Host record allocation, archived bytes written into those records, publish
+        // keeping the (never-copied) source, then the empty device replica dropped. Result:
+        // a Host-only CheckpointImmutable image with archived content.
+        auto& states = p.directory.states();
+        const auto shell = states.reserve_destination(targets.take(state_device_id), 0);
+        if (!shell) throw std::invalid_argument("import state device reservation failed");
+        // Donor-pattern order: the shell must be CheckpointImmutable BEFORE the D2H donor
+        // transfer (reserve_device_to_host rejects ActiveMutable), so promote + freeze on the
+        // empty device-born shell first; the Host replica is filled by memcpy below, and the
+        // donor device replica is dropped after publish.
+        states.complete_initialization(*shell);
+        states.freeze(*shell);
+        auto transfer = states.reserve_device_to_host(*shell, targets.take(state_host_id));
+        if (!transfer) throw std::invalid_argument("import state host reservation failed");
+        {
+            const auto ranks = states.ranks(0);
+            if (ranks.size() != 1)
+                throw std::invalid_argument("import expects a single-rank state layout");
+            const auto rank = ranks.front();
+            const auto bytes = states.image_bytes(rank, 0);
+            if (state_image.size() != bytes)
+                throw std::invalid_argument("archived state image size differs from the layout");
+            const auto destination = transfer->description(rank).destination_record;
+            if (destination.bytes != bytes)
+                throw std::invalid_argument("state host record size differs from the layout");
+            if (destination.offset < 0 ||
+                static_cast<std::size_t>(destination.offset) + bytes >
+                    p.archive_host_arena_mut.bytes)
+                throw std::invalid_argument("state host record is outside the context arena");
+            std::memcpy(p.archive_host_arena_mut.data + destination.offset, state_image.data(),
+                        bytes);
+        }
+        transfer->publish(true);
+        // Host replica landed; the shell is already CheckpointImmutable (frozen pre-transfer),
+        // so just drop the device donor replica.
+        if (!states.drop_device_replica(*shell))
+            throw std::invalid_argument("import state donor drop failed");
+
+        // --- Pages, pool by pool: device-born working set bound on the fresh-history path
+        // through the import transaction (publish() runs publish_restores + prepare_mapping,
+        // the commit() preconditions), then Host replicas filled from the contiguous
+        // per-kind archive span, device replicas dropped.
+        std::vector<context::HistoryPrefix> prefixes;
+        std::vector<std::vector<context::RecordReservation>> host_record_sets;
+        const auto part_bytes_for = [&](const context::PageDirectory& pages) {
+            return pages.layout().parts.empty() ? std::size_t{0}
+                                                : pages.layout().parts.front().record.bytes;
+        };
+        for (std::size_t index = 0; index < pool_plans.size(); ++index) {
+            auto& plan = pool_plans[index];
+            auto& pool = p.directory.pool(plan.pool);
+            auto& histories = pool.histories();
+            const auto row = histories.free_row();
+            if (!row) return std::nullopt;
+            auto binding = histories.prepare_binding(nullptr, 0, plan.frontier, *row,
+                                                     targets.take(plan.device), false, {});
+            migration.add_binding(plan.pool, std::move(binding));
+            // Split the Host page records per rank now; materialize after publish.
+            auto host_records = targets.take(plan.host);
+            std::vector<context::RecordReservation> per_rank;
+            per_rank.reserve(pool.pages().layout().parts.size());
+            for (std::size_t i = 0; i < pool.pages().layout().parts.size(); ++i)
+                per_rank.push_back(host_records.split(static_cast<std::uint32_t>(plan.pages)));
+            host_record_sets.push_back(std::move(per_rank));
+            const auto staged_pages = prefetch->pages(plan.kind);
+            const auto part_bytes = part_bytes_for(pool.pages());
+            const auto frontier_pages = context::kv_pages_for_frontier(plan.frontier);
+            if (plan.pages != frontier_pages ||
+                staged_pages.size() < std::size_t{part_bytes} * frontier_pages)
+                throw std::invalid_argument("archived page count differs from the frontier");
+        }
+
+        // --- Publish the transaction: restores + mappings land, bindings become committable
+        migration.prepare_actions();
+        migration.mark_submitted();
+        migration.adopt();
+        migration.mark_completed();
+        migration.publish();
+
+        // --- Fill Host page replicas from the archived spans and shed device donors. The
+        // mappings exist now (logical_page resolves). settle carries the writers + the
+        // deactivation; one transaction per pool, published inside the loop.
+        for (std::size_t index = 0; index < pool_plans.size(); ++index) {
+            const auto& plan = pool_plans[index];
+            auto& pool = p.directory.pool(plan.pool);
+            auto& histories = pool.histories();
+            auto& pages = pool.pages();
+            context::ContextTransaction settle(p.directory);
+            // Post-publish commit: the binding now has published restores + prepared mapping
+            // + its row; commit() hands back the owned history with the row attached.
+            auto owner = migration.binding(plan.pool)->commit();
+            const auto history_id = owner.handle();
+            // Acquire writers on every page and commit the frontier: prepare_write ->
+            // commit_frontier raises the per-page coverage to the archived shape. The
+            // deactivation below then releases the writers, so the page-fill D2H read that
+            // follows sees clean replicas (read_device rejects a live writer).
+            histories.prepare_write(owner, 0, plan.frontier, settle);
+            settle.commit_history(histories, history_id, plan.frontier, plan.frontier);
+            settle.prepare_actions();
+            settle.mark_submitted();
+            settle.adopt();
+            settle.mark_completed();
+            settle.publish();
+            // Prefix first: retain_prefix requires the committed frontier. Then deactivate
+            // on a SECOND transaction (settle is already Published): releases writers +
+            // active references while the transaction retains the pages for the prefix.
+            prefixes.push_back(histories.retain_prefix(history_id, plan.frontier));
+            {
+                context::ContextTransaction retire(p.directory);
+                histories.deactivate(history_id, retire);
+                retire.prepare_actions();
+                retire.mark_submitted();
+                retire.adopt();
+                retire.mark_completed();
+                retire.publish();
+            }
+            const auto staged_pages = prefetch->pages(plan.kind);
+            const auto part_bytes = part_bytes_for(pages);
+            const auto frontier_pages = context::kv_pages_for_frontier(plan.frontier);
+            for (std::uint32_t i = 0; i < frontier_pages; ++i) {
+                const auto page = histories.logical_page(history_id, i);
+                auto& per_rank = host_record_sets[index];
+                for (std::size_t r = 0; r < pages.layout().parts.size(); ++r) {
+                    const auto& part = pages.layout().parts[r];
+                    auto lease = per_rank.at(r).materialize(part.rank);
+                    const auto destination = lease.binding();
+                    if (destination.bytes != part_bytes)
+                        throw std::invalid_argument("page record size differs from the layout");
+                    if (destination.offset < 0 ||
+                        static_cast<std::size_t>(destination.offset) + part_bytes >
+                            p.archive_host_arena_mut.bytes)
+                        throw std::invalid_argument("page host record is outside the arena");
+                    auto backup = pages.prepare_host_replica(page, part.rank, std::move(lease));
+                    std::memcpy(p.archive_host_arena_mut.data + destination.offset,
+                                staged_pages.data() + std::size_t{i} * part_bytes, part_bytes);
+                    // Host bytes staged; the published backup leaves the device replica
+                    // intact, and the drop below removes it (no readers during import).
+                    backup.publish();
+                    if (!pages.drop_device_replica(page, part.rank))
+                        throw std::invalid_argument("import page donor drop failed");
+                }
+            }
+        }
+        // The prefixes reference the (now host-resident, deactivated) histories.
+        auto continuation = context::Continuation{.image = *shell, .metadata = metadata};
+        auto snapshot_identity = std::make_shared<detail::PreparedCaptureBacking>();
+        snapshot_identity->ledger = std::move(parsed.ledger);
+        snapshot_identity->prefix_identity = std::move(parsed.positions);
+        // Admission compares the record key, not the snapshot identity, so it must carry this
+        // request's identity tag and the archived digests at the capture frontier.
+        auto key = PrefixShortlistKey{.digests      = parsed.digests.at(main_frontier),
+                                      .frontier     = main_frontier,
+                                      .identity_tag = base.impl_->prefix_identity_tag};
+        snapshot_identity->digests = std::move(parsed.digests);
+        auto slot = p.checkpoints.reserve_owned();
+        if (!slot.valid()) throw std::invalid_argument("checkpoint slot unavailable");
+        auto handle = slot.publish(
+            {context::ContextSnapshot<ContinuationMetadata, detail::PreparedCaptureBacking>(
+                 states, std::move(continuation), std::move(prefixes),
+                 std::move(snapshot_identity)),
+             // An imported checkpoint has no owner, so it must publish as SharedPrefix; the
+             // archived role describes the capturing request, not the restored copy.
+             runtime::CheckpointRole::SharedPrefix,
+             std::move(key)});
+        p.import_memo.at(candidate->manifest) = handle;
+        if (trace)
+            std::fprintf(stderr, "archive-import: manifest=%llu frontier=%u mtp=%d\n",
+                         static_cast<unsigned long long>(candidate->manifest), main_frontier,
+                         mtp ? 1 : 0);
+        return handle;
+    } catch (const std::exception& error) {
+        if (trace) std::fprintf(stderr, "archive-import: declined: %s\n", error.what());
+        return std::nullopt;
+    }
+}
+
+} // namespace ninfer::models::qwen3_5

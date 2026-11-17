@@ -447,7 +447,11 @@ public:
     // Attached by the rank program after startup: the Host context arena, whose base turns
     // ContextRecordBinding offsets into CPU addresses.
     ConstMemorySpan archive_host_arena;
+    MemorySpan archive_host_arena_mut;
     bool archive_dirty = false;
+    // One import per manifest per boot: an imported checkpoint retires through the normal
+    // reclaim paths, and a retired import's lineage is proven stale for this session.
+    std::unordered_map<std::uint64_t, CheckpointHandle> import_memo;
 
     struct PauseReservation {
         SequenceHandle sequence;
@@ -577,6 +581,14 @@ public:
         archive_host_arena = arena;
         archive_dirty      = true;
     }
+    // Import writes archived bytes into the Host arena, so it needs a mutable view of the same
+    // span the save path reads through.
+    void attach_archive_host_arena_mut(ninfer::MemorySpan arena) {
+        archive_host_arena_mut = arena;
+    }
+    // Builds a Host-resident checkpoint from an archived manifest so the next admission binds it
+    // instead of re-prefilling. Empty when no candidate matches or the payload is unusable.
+    [[nodiscard]] std::optional<CheckpointHandle> archive_import(const RequestBasePlan& base);
     void archive_register(CheckpointHandle handle, const CheckpointState& record);
     // Registered-but-unsaved checkpoints, capped at kArchiveSavePins (reclaim.cpp): returned
     // as plain-release exclusions so reclaim must demote them instead of retiring them.
