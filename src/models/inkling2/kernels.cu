@@ -1228,37 +1228,47 @@ __global__ void route_kernel(RouteArgs a) {
 // route_kernel picks them, then the pairs grouped by expert, each expert's in row order. An expert
 // holds at most 8 pairs, so it fills one column tile of every width.
 constexpr int kRouteTileWidths = 4;
-__global__ void __launch_bounds__(kSortedRouteRows * kSortedRouteExperts)
+// The block holds up to kSortedRouteBlockRows rows of threads; each thread takes rows t,
+// t + kSortedRouteBlockRows, ... of up to kSortedRouteRows.
+__global__ void __launch_bounds__(kSortedRouteBlockRows * kSortedRouteExperts)
     route_sorted_kernel(RouteArgs a) {
     ninfer::pdl::enter();
     constexpr int E = kSortedRouteExperts;
-    const int t = int(threadIdx.x) / E, e = int(threadIdx.x) % E;
+    const int tt = int(threadIdx.x) / E, e = int(threadIdx.x) % E;
+    const int row_step = int(blockDim.x) / E;
     __shared__ float selections[kSortedRouteRows][E];
+    __shared__ float probs[kSortedRouteRows][E];
     __shared__ int pick[kSortedRouteRows][E]; // the choice's k, -1 when not chosen
     __shared__ int chosen[kSortedRouteRows][8];
     __shared__ float chosen_p[kSortedRouteRows][8];
     __shared__ int warp_total[E / 32];
     const bool expert = e < a.experts;
-    const float logit = expert ? a.logits[std::int64_t(t) * a.experts + e] : 0.0f;
-    const float p     = sigmoidf(logit);
-    const float selection = expert ? p + a.bias[e] : -INFINITY;
-    selections[t][e]      = selection;
-    __syncthreads();
-    int rank = -1;
-    if (expert) {
-        int r = 0;
-        for (int j = 0; j < a.experts; ++j) {
-            const float other = selections[t][j];
-            r += other > selection || (other == selection && j < e) ? 1 : 0;
-        }
-        if (r < a.top_k) {
-            rank           = r;
-            chosen[t][r]   = e;
-            chosen_p[t][r] = p;
-        }
+    for (int t = tt; t < a.tokens; t += row_step) {
+        const float logit = expert ? a.logits[std::int64_t(t) * a.experts + e] : 0.0f;
+        const float p     = sigmoidf(logit);
+        probs[t][e]       = p;
+        selections[t][e]  = expert ? p + a.bias[e] : -INFINITY;
     }
-    pick[t][e] = rank;
     __syncthreads();
+    for (int t = tt; t < a.tokens; t += row_step) {
+        const float selection = selections[t][e];
+        int rank = -1;
+        if (expert) {
+            int r = 0;
+            for (int j = 0; j < a.experts; ++j) {
+                const float other = selections[t][j];
+                r += other > selection || (other == selection && j < e) ? 1 : 0;
+            }
+            if (r < a.top_k) {
+                rank           = r;
+                chosen[t][r]   = e;
+                chosen_p[t][r] = probs[t][e];
+            }
+        }
+        pick[t][e] = rank;
+    }
+    __syncthreads();
+    for (int t = tt; t < a.tokens; t += row_step) {
     if (e < a.top_k) {
         float sum = 0.0f;
         for (int j = 0; j < a.top_k; ++j) { sum += chosen_p[t][j]; }
@@ -1270,16 +1280,17 @@ __global__ void __launch_bounds__(kSortedRouteRows * kSortedRouteExperts)
         a.weights[at]    = w;
         a.pair_scale[at] = a.gate_up_scale != nullptr ? a.gate_up_scale[x] : 1.0f;
     }
+    }
     // Row 0's threads, expert e each: its pairs, then exclusive scans of the pairs (low half) and
     // of the experts with any (high half) over the experts.
     int count = 0;
-    if (t == 0) {
+    if (tt == 0) {
         for (int r = 0; r < a.tokens; ++r) { count += pick[r][e] >= 0 ? 1 : 0; }
     }
     const int packed = count | (count > 0 ? 1 << 16 : 0);
     int inclusive    = packed;
     const int lane = e & 31, warp = e >> 5;
-    if (t == 0) {
+    if (tt == 0) {
 #pragma unroll
         for (int o = 1; o < 32; o <<= 1) {
             const int v = __shfl_up_sync(0xFFFFFFFFu, inclusive, o);
@@ -1288,7 +1299,7 @@ __global__ void __launch_bounds__(kSortedRouteRows * kSortedRouteExperts)
         if (lane == 31) { warp_total[warp] = inclusive; }
     }
     __syncthreads();
-    if (t != 0) { return; }
+    if (tt != 0) { return; }
     int offset = 0, total = 0;
 #pragma unroll
     for (int w = 0; w < E / 32; ++w) {
@@ -1892,9 +1903,9 @@ void route(const RouteArgs& args, cudaStream_t stream) {
     if (args.tokens <= 0) { return; }
     if (args.sorted.bounds != nullptr) {
         if (args.tokens > kSortedRouteRows || args.experts > kSortedRouteExperts) {
-            throw std::invalid_argument("inkling2 route: sorted pairs of at most 8 rows of 128 experts");
+            throw std::invalid_argument("inkling2 route: sorted pairs of at most 16 rows of 128 experts");
         }
-        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(1), dim3(args.tokens * kSortedRouteExperts), std::size_t(0), stream}, route_sorted_kernel, args);
+        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(1), dim3(std::min(args.tokens, kSortedRouteBlockRows) * kSortedRouteExperts), std::size_t(0), stream}, route_sorted_kernel, args);
         check_launch("route_sorted");
         return;
     }

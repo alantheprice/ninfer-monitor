@@ -304,7 +304,8 @@ struct RouteArgs {
     // gguf::moe_sorted_routes's view of the same workspace), in the same launch.
     RouteSort sorted;
 };
-inline constexpr int kSortedRouteRows    = 8;
+inline constexpr int kSortedRouteRows    = 16;
+inline constexpr int kSortedRouteBlockRows = 8; // rows of threads in its block
 inline constexpr int kSortedRouteExperts = 128;
 void route(const RouteArgs& args, cudaStream_t stream);
 
