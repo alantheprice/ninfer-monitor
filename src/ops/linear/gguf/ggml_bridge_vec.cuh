@@ -847,6 +847,8 @@ __launch_bounds__(kVecWarps * 32, NINFER_VEC_MIN_BLOCKS) __global__ void kernel(
         for (int g = 0; g < p.column_groups; ++g) {
         const std::int8_t* gqs = act_qs + std::int64_t(g) * T * k;
         const half2* gds       = act_ds + std::int64_t(g) * T * slices;
+        // A short last group: its missing columns read column 0 and are never stored.
+        const int ncols = p.last_columns > 0 && g + 1 == p.column_groups ? p.last_columns : T;
             float acc[kRows][T];
     #pragma unroll
             for (int r = 0; r < kRows; ++r) {
@@ -859,10 +861,11 @@ __launch_bounds__(kVecWarps * 32, NINFER_VEC_MIN_BLOCKS) __global__ void kernel(
                 float d[T], sum[T];
     #pragma unroll
                 for (int j = 0; j < T; ++j) {
-                    const float2 ds = __half22float2(gds[std::int64_t(j) * slices + s]);
+                    const int jj    = j < ncols ? j : 0;
+                    const float2 ds = __half22float2(gds[std::int64_t(jj) * slices + s]);
                     d[j]            = ds.x;
                     sum[j]          = ds.y;
-                    const auto* q   = reinterpret_cast<const int4*>(gqs + std::int64_t(j) * k + 32 * s);
+                    const auto* q   = reinterpret_cast<const int4*>(gqs + std::int64_t(jj) * k + 32 * s);
                     const int4 v0 = q[0], v1 = q[1];
                     a[j][0] = v0.x; a[j][1] = v0.y; a[j][2] = v0.z; a[j][3] = v0.w;
                     a[j][4] = v1.x; a[j][5] = v1.y; a[j][6] = v1.z; a[j][7] = v1.w;
@@ -901,13 +904,13 @@ __launch_bounds__(kVecWarps * 32, NINFER_VEC_MIN_BLOCKS) __global__ void kernel(
             if (lane == 0) {
                 if constexpr (Fused) {
     #pragma unroll
-                    for (int j = 0; j < T; ++j) { vec_store(out, row0, g * T + j, vec_gate(acc[0][j], out.activation) * acc[1][j]); }
+                    for (int j = 0; j < T; ++j) { if (j < ncols) { vec_store(out, row0, g * T + j, vec_gate(acc[0][j], out.activation) * acc[1][j]); } }
                 } else {
     #pragma unroll
                     for (int r = 0; r < kRows; ++r) {
                         if (row0 + r < rows) {
     #pragma unroll
-                            for (int j = 0; j < T; ++j) { vec_store(out, row0 + r, g * T + j, acc[r][j]); }
+                            for (int j = 0; j < T; ++j) { if (j < ncols) { vec_store(out, row0 + r, g * T + j, acc[r][j]); } }
                         }
                     }
                 }

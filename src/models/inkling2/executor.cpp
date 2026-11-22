@@ -1351,8 +1351,8 @@ struct Executor::Impl {
     static constexpr int kHeadRows = 64; // LM-head columns per FP32 plane pass
 
     // Rows of one decode call: every active lane's next token. The vector products take 8
-    // columns a launch, so a call of 9..16 lanes runs them in two column slices.
-    static constexpr int kMaxDecodeRows = 16;
+    // columns a group, so a call of 9..32 lanes runs them in up to four column groups.
+    static constexpr int kMaxDecodeRows = 32;
 
     [[nodiscard]] int decode_rows() const {
         return std::min<int>(kMaxDecodeRows,
@@ -1925,8 +1925,8 @@ struct Executor::Impl {
         }
         down.count = count;
         up.count   = 2 * count;
-        kernels::gemm_f32_batch(r, t, 2 * hidden, down, stream);
-        kernels::gemm_f32_batch(hidden, t, r, up, stream);
+        kernels::gemm_f32_batch(r, t, 2 * hidden, down, stream, 0, 0, c.q8);
+        kernels::gemm_f32_batch(hidden, t, r, up, stream, 0, 0, c.q8);
         ca.eps          = eps;
         ca.query_stride = c.plane;
         set_outputs(c, ca.out, ca.out_q, ca.f32, ca.q8_stride, out_bf16, out_q, q_stride, out_f32);
@@ -2097,15 +2097,15 @@ struct Executor::Impl {
             product(lp.key, input_q(c, ki), bf16_in(ki), t, kv, 2 * kvd, 0);
             product(lp.value, input_q(c, vi), bf16_in(vi), t, kv, 2 * kvd, kvd);
         }
-        kernels::gemm_f32(query_heads, t, hidden, lp.sinks, f32_in(0), sinks, stream);
+        kernels::gemm_f32(query_heads, t, hidden, lp.sinks, f32_in(0), sinks, stream, 0, 0, c.q8);
         float* taps = nullptr;
         const int tap_columns = 2 * kv_heads * kTaps;
         if (lp.full) {
             taps = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * tap_columns * 4).data);
             kernels::gemm_f32(kv_heads * kTaps, t, hidden, lp.key_taps, f32_in(ki), taps, stream, 0,
-                              tap_columns);
+                              tap_columns, c.q8);
             kernels::gemm_f32(kv_heads * kTaps, t, hidden, lp.value_taps, f32_in(vi),
-                              taps + kv_heads * kTaps, stream, 0, tap_columns);
+                              taps + kv_heads * kTaps, stream, 0, tap_columns, c.q8);
         }
         auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
         auto* r = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * rel * 4).data);
@@ -2308,7 +2308,7 @@ struct Executor::Impl {
         auto* weights    = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * 4).data);
         auto* pair_scale = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * 4).data);
         auto* logits     = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * e * 4).data);
-        kernels::gemm_f32(e, t, hidden, p.router, c.ffn_f32, logits, stream);
+        kernels::gemm_f32(e, t, hidden, p.router, c.ffn_f32, logits, stream, 0, 0, c.q8);
         kernels::RouteArgs route;
         route.hidden        = hidden;
         route.tokens        = t;

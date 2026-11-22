@@ -1238,7 +1238,7 @@ __global__ void __launch_bounds__(kSortedRouteBlockRows * kSortedRouteExperts)
     const int row_step = int(blockDim.x) / E;
     __shared__ float selections[kSortedRouteRows][E];
     __shared__ float probs[kSortedRouteRows][E];
-    __shared__ int pick[kSortedRouteRows][E]; // the choice's k, -1 when not chosen
+    __shared__ std::int8_t pick[kSortedRouteRows][E]; // the choice's k, -1 when not chosen
     __shared__ int chosen[kSortedRouteRows][8];
     __shared__ float chosen_p[kSortedRouteRows][8];
     __shared__ int warp_total[E / 32];
@@ -1265,7 +1265,7 @@ __global__ void __launch_bounds__(kSortedRouteBlockRows * kSortedRouteExperts)
                 chosen_p[t][r] = probs[t][e];
             }
         }
-        pick[t][e] = rank;
+        pick[t][e] = std::int8_t(rank);
     }
     __syncthreads();
     for (int t = tt; t < a.tokens; t += row_step) {
@@ -1735,12 +1735,23 @@ template <class F> void with_columns(int n, F&& f) {
     }
 }
 
+// vector_call: a decode call (the vector path's rows), whose 9..32 columns take the GEMV forms so a
+// row's sums do not depend on its batch; prompt chunks keep cuBLAS past 8 columns.
 void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, cudaStream_t stream,
-              std::int64_t x_stride, std::int64_t out_stride) {
+              std::int64_t x_stride, std::int64_t out_stride, bool vector_call) {
     if (m <= 0 || n <= 0) { return; }
     if (x_stride == 0) { x_stride = k; }
     if (out_stride == 0) { out_stride = m; }
-    if (n <= 2 * kGemvRows) {
+    if (vector_call && n > 2 * kGemvRows && n <= 4 * kGemvRows) {
+        // 17..32 columns: two launches of at most 16 (the matrix is small; its second read comes
+        // from L2). Each column's sums are those of a narrower call.
+        const int first = (n + 1) / 2;
+        gemm_f32(m, first, k, w, x, out, stream, x_stride, out_stride, true);
+        gemm_f32(m, n - first, k, w, x + std::int64_t(first) * x_stride,
+                 out + std::int64_t(first) * out_stride, stream, x_stride, out_stride, true);
+        return;
+    }
+    if (n <= kGemvRows || (vector_call && n <= 2 * kGemvRows)) {
         // Up to 16 columns (a decode call of 16 lanes) in one launch; each column's sums are those
         // of a narrower call.
         with_columns(n, [&](auto tokens) {
@@ -1758,14 +1769,25 @@ void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, c
 }
 
 void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t stream,
-                    std::int64_t x_stride, std::int64_t out_stride) {
+                    std::int64_t x_stride, std::int64_t out_stride, bool vector_call) {
     if (batch.count < 0 || batch.count > kMaxGemvBatch) {
         throw std::invalid_argument("inkling2 gemm_f32_batch: at most 8 products");
     }
     if (m <= 0 || n <= 0 || batch.count == 0) { return; }
     if (x_stride == 0) { x_stride = k; }
     if (out_stride == 0) { out_stride = m; }
-    if (n > 2 * kGemvRows) {
+    if (vector_call && n > 2 * kGemvRows && n <= 4 * kGemvRows) {
+        const int first = (n + 1) / 2;
+        GemvBatch second = batch;
+        for (int e = 0; e < batch.count; ++e) {
+            second.x[e]   = batch.x[e] + std::int64_t(first) * x_stride;
+            second.out[e] = batch.out[e] + std::int64_t(first) * out_stride;
+        }
+        gemm_f32_batch(m, first, k, batch, stream, x_stride, out_stride, true);
+        gemm_f32_batch(m, n - first, k, second, stream, x_stride, out_stride, true);
+        return;
+    }
+    if (n > (vector_call ? 2 * kGemvRows : kGemvRows)) {
         for (int e = 0; e < batch.count; ++e) {
             gemm_f32(m, n, k, batch.w[e], batch.x[e], batch.out[e], stream, x_stride, out_stride);
         }
@@ -1903,7 +1925,7 @@ void route(const RouteArgs& args, cudaStream_t stream) {
     if (args.tokens <= 0) { return; }
     if (args.sorted.bounds != nullptr) {
         if (args.tokens > kSortedRouteRows || args.experts > kSortedRouteExperts) {
-            throw std::invalid_argument("inkling2 route: sorted pairs of at most 16 rows of 128 experts");
+            throw std::invalid_argument("inkling2 route: sorted pairs of at most 32 rows of 128 experts");
         }
         (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(1), dim3(std::min(args.tokens, kSortedRouteBlockRows) * kSortedRouteExperts), std::size_t(0), stream}, route_sorted_kernel, args);
         check_launch("route_sorted");

@@ -95,7 +95,7 @@ void mix(const MixArgs& args, cudaStream_t stream);
 // apart, k when 0), out rows `out_stride` apart (m when 0): up to eight rows by the GEMV kernel (a
 // fixed grid, so CUDA graphs replay it), more by cuBLAS SGEMM.
 void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, cudaStream_t stream,
-              std::int64_t x_stride = 0, std::int64_t out_stride = 0);
+              std::int64_t x_stride = 0, std::int64_t out_stride = 0, bool vector_call = false);
 
 // Up to kMaxGemvBatch products of one shape, out[b] = w[b] x[b] as gemm_f32 computes each of them
 // (the same values), in one launch for up to eight rows: k <= 128 a warp per output row.
@@ -107,7 +107,7 @@ struct GemvBatch {
     int count = 0;
 };
 void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t stream,
-                    std::int64_t x_stride = 0, std::int64_t out_stride = 0);
+                    std::int64_t x_stride = 0, std::int64_t out_stride = 0, bool vector_call = false);
 
 // The loop controllers of up to four inputs: concat[i][t] = [rms(x_i[t]); rms(message_i[t])]
 // (kMixEps, no weight), [count][T][2 hidden] FP32.
@@ -304,7 +304,7 @@ struct RouteArgs {
     // gguf::moe_sorted_routes's view of the same workspace), in the same launch.
     RouteSort sorted;
 };
-inline constexpr int kSortedRouteRows    = 16;
+inline constexpr int kSortedRouteRows    = 32;
 inline constexpr int kSortedRouteBlockRows = 8; // rows of threads in its block
 inline constexpr int kSortedRouteExperts = 128;
 void route(const RouteArgs& args, cudaStream_t stream);

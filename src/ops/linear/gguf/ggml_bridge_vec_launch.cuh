@@ -70,6 +70,7 @@ struct VecArgs {
     // Groups of the launch's T columns, each at T * group columns on (activation and output):
     // a call of 2T columns reads its rows once from memory.
     int column_groups = 1;
+    int last_columns  = 0; // columns of the last group when fewer than T (0: T)
     int more_count = 0;
     int block_end[kMaxVecSegments] = {};
     VecSegment more[kMaxVecSegments - 1] = {};
