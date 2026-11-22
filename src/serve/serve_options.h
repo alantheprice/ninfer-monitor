@@ -44,6 +44,10 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    // --electricity-rate: USD per kWh for /usage's energy cost (the fleet contract).
+    double electricity_rate_usd_per_kwh = 0.0;
+    // --slots-format: GET /slots in the fleet contract's shape (port, default) or llama.cpp's list.
+    bool llamacpp_slots = false;
     // --request-log-max-mib: rotate the request log at this size (0 keeps one unbounded file),
     // keeping --request-log-keep rotated copies.
     std::uint32_t request_log_max_mib  = 0;

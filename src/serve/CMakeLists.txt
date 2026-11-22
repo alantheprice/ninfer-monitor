@@ -35,6 +35,7 @@ add_library(ninfer_serve STATIC
   mcp_proxy.cpp
   load_report.cpp
   serve_metrics.cpp
+  port_contract.cpp
   openai_responses_http.cpp
   serve_options.cpp
   stop_control.cpp

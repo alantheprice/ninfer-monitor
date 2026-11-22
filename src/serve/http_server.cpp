@@ -1,4 +1,5 @@
 #include "serve/http_server.h"
+#include "product/speculative_options.h"
 #include "serve/slot_files.h"
 
 #include "product/logging/logging.h"
@@ -361,6 +362,7 @@ void HttpServer::record_request_start(const RequestLogContext& context) {
 void HttpServer::record_request_rejected(const RequestRejectionLogContext& context) {
     request_jsonl_.write_request_rejected(context);
     metrics_.record_rejection();
+    port_contract_.record_rejection();
     operational_log_.request_rejected(context);
     if (console_stats_) {
         console_stats_->request_rejected(
@@ -372,6 +374,7 @@ void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
     request_jsonl_.write_request_done(context, outcome);
     metrics_.record_done(outcome);
+    port_contract_.record_done(outcome);
     operational_log_.request_done(context, outcome);
     if (console_stats_) { console_stats_->request_done(outcome); }
 }
@@ -380,6 +383,7 @@ void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
     request_jsonl_.write_request_error(context, failure.machine_message);
     metrics_.record_failure();
+    port_contract_.record_failure();
     operational_log_.request_failure(context, failure);
     if (console_stats_) { console_stats_->request_failure(failure); }
 }
@@ -417,6 +421,7 @@ void HttpServer::run_stats_reporter() {
             const ThroughputReport report = make_throughput_report(
                 found->second.stats, current,
                 std::chrono::duration<double>(now - found->second.time).count());
+            if (public_model_id_.empty() || id == public_model_id_) { port_contract_.tick(report); }
             if (report_has_activity(report)) {
                 // The exact partial interval remains useful to measurement consumers. Pretty
                 // throughput is a fixed-cadence operational record without an irregular tail.
@@ -448,6 +453,7 @@ void HttpServer::run_stats_reporter() {
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
     }
     sample(true);
+    port_contract_.persist();
 }
 
 void HttpServer::stop_stats_reporter() {
@@ -619,6 +625,9 @@ void HttpServer::register_routes() {
     });
     server_.Get("/slots", [this](const httplib::Request& req, httplib::Response& res) {
         handle_slots(req, res);
+    });
+    server_.Get("/usage", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_usage(req, res);
     });
     register_post(R"(/slots/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_slot_action(req, res);
@@ -803,6 +812,11 @@ void HttpServer::handle_slots(const httplib::Request& req, httplib::Response& re
         return;
     }
     GenerationService& service = lease.service();
+    if (!options_.llamacpp_slots && port_contract_configured_) {
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(port_contract_.slots_json(service.runtime_stats()), "application/json");
+        return;
+    }
     // The Engine's resolved backend: without --spec it may draft (SpeculativeOptions::automatic).
     const bool speculative =
         service.engine_options().speculative.backend != ninfer::SpeculativeBackend::None;
@@ -828,6 +842,45 @@ void HttpServer::handle_slots(const httplib::Request& req, httplib::Response& re
     }
     res.set_header("Cache-Control", "no-store");
     res.set_content(slots.dump(), "application/json");
+}
+
+// The fleet contract's usage summary: tokens, cache, the last reporter window, speculative
+// acceptance by position, lanes and NVML energy with its cost.
+void HttpServer::handle_usage(const httplib::Request& req, httplib::Response& res) const {
+    ModelRegistry::Lease lease;
+    try {
+        lease = lease_query_model(req);
+    } catch (const ApiException& exception) {
+        write_openai_error(res, exception.error());
+        return;
+    }
+    if (!port_contract_configured_) {
+        res.status = 503;
+        res.set_content(R"({"error":"service not attached"})", "application/json");
+        return;
+    }
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(port_contract_.usage_json(lease.service().runtime_stats()), "application/json");
+}
+
+void HttpServer::configure_port_contract() {
+    if (port_contract_configured_ || registry_ == nullptr) { return; }
+    const std::string id = public_model_id_.empty() ? registry_->status().front().id : public_model_id_;
+    auto lease           = registry_->observe(id);
+    if (!lease) { return; }
+    GenerationService& service             = lease->service();
+    const ninfer::EngineOptions& engine    = service.engine_options();
+    PortContractConfig config;
+    config.model_id                = id;
+    config.max_concurrency         = engine.max_concurrency;
+    config.max_context             = service.options().max_context;
+    config.speculative_backend     = product::speculative_backend_name(engine.speculative.backend);
+    config.draft_window            = engine.speculative.draft_tokens;
+    config.electricity_usd_per_kwh = options_.electricity_rate_usd_per_kwh;
+    config.state_path = options_.request_log_jsonl.empty() ? std::string()
+                                                           : options_.request_log_jsonl + ".metrics-state.json";
+    port_contract_.configure(std::move(config));
+    port_contract_configured_ = true;
 }
 
 // llama.cpp-shaped session persistence: POST /slots/{id}?action=save|restore|erase with
@@ -1019,8 +1072,12 @@ void HttpServer::handle_metrics(const httplib::Request& req, httplib::Response& 
     try {
         const ModelRegistry::Lease lease = lease_query_model(req);
         res.set_header("Cache-Control", "no-store");
-        res.set_content(metrics_.render(model_facts(lease).capacity, load_sample(lease.service())),
-                        "text/plain; version=0.0.4; charset=utf-8");
+        std::string body = metrics_.render(model_facts(lease).capacity, load_sample(lease.service()));
+        if (port_contract_configured_) {
+            body += port_contract_.metrics_text(lease.service().runtime_stats(),
+                                                !lease.service().has_failed());
+        }
+        res.set_content(body, "text/plain; version=0.0.4; charset=utf-8");
     } catch (const ApiException& exception) { write_openai_error(res, exception.error()); }
 }
 
@@ -1538,6 +1595,7 @@ void HttpServer::attach(ModelRegistry& registry) {
     }
     // Release: everything above must be visible to a handler that observes ready_ as true. This is
     // the only write, and handlers acquire it in the pre-routing guard before touching registry_.
+    configure_port_contract();
     ready_.store(true, std::memory_order_release);
 }
 

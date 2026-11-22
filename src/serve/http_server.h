@@ -9,6 +9,7 @@
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_metrics.h"
+#include "serve/port_contract.h"
 #include "serve/serve_options.h"
 #include "serve/systemone.h"
 #include "serve/text_completion.h"
@@ -163,6 +164,7 @@ private:
     void handle_stats(const httplib::Request& req, httplib::Response& res) const;
     void handle_health(httplib::Response& res) const;
     void handle_slots(const httplib::Request& req, httplib::Response& res) const;
+    void handle_usage(const httplib::Request& req, httplib::Response& res) const;
     void handle_model_residency(const httplib::Request& req, httplib::Response& res) const;
     void handle_model_suspend(const httplib::Request& req, httplib::Response& res);
     void handle_model_resume(const httplib::Request& req, httplib::Response& res);
@@ -249,6 +251,10 @@ private:
     // Mutable: a model's server_start record is written when a const handler first sees it.
     mutable JsonlRequestLog request_jsonl_;
     ServeMetrics metrics_;
+    // The fleet monitoring contract (/usage, port-shaped /slots, ninfer_* metrics).
+    PortContract port_contract_;
+    bool port_contract_configured_ = false;
+    void configure_port_contract();
     std::unique_ptr<ConsoleStatsPanel> console_stats_;
     httplib::Server server_;
     // Present only with --stats-port.

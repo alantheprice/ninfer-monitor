@@ -684,6 +684,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --response-store-max-mib N    Responses state budget (default 256)\n"
            "\n"
            "LOGGING\n"
+           "  --electricity-rate USD        USD per kWh for /usage's energy cost (default 0)\n"
+           "  --slots-format port|llamacpp  GET /slots as lane occupancy (port, default) or\n"
+           "                                llama.cpp's catalog-cell list\n"
            "  --request-log-jsonl FILE      append full-precision server and request records\n"
            "  --request-log-max-mib N       rotate the request log at N MiB (default 0: one\n"
            "                                unbounded file)\n"
@@ -1224,6 +1227,27 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
                 parse_nonnegative_int(require_value("--max-cache-markers-per-request"),
                                       "max-cache-markers-per-request"));
             context_capacity_explicit = true;
+            continue;
+        }
+        if (arg == "--electricity-rate") {
+            const std::string value = require_value("--electricity-rate");
+            std::size_t used = 0;
+            double rate      = 0.0;
+            try {
+                rate = std::stod(value, &used);
+            } catch (const std::exception&) { used = 0; }
+            if (used != value.size() || !(rate >= 0.0)) {
+                throw std::invalid_argument("--electricity-rate must be a non-negative USD per kWh");
+            }
+            options.electricity_rate_usd_per_kwh = rate;
+            continue;
+        }
+        if (arg == "--slots-format") {
+            const std::string value = require_value("--slots-format");
+            if (value != "port" && value != "llamacpp") {
+                throw std::invalid_argument("--slots-format must be port or llamacpp");
+            }
+            options.llamacpp_slots = value == "llamacpp";
             continue;
         }
         if (arg == "--request-log-jsonl") {
