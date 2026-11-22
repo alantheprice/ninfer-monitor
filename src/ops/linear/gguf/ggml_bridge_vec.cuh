@@ -1191,11 +1191,12 @@ inline bool balanced_tail_enabled() {
 // 13.5 us for Inkling 2's NVFP4 down banks): a quarter of the warps, at 96 registers.
 // With many experts in one call (a batch of tokens) there are blocks enough that 8 rows a warp at
 // a remainder of 4 no longer starves the GPU of warps: from NINFER_VEC_TAIL8_MIN_EXPERTS active
-// experts K = 1152 takes 8 (default 0: off; 16 and 32 measured no faster at 4 and 8 requests).
+// experts (default 16: calls of 2+ tokens) K = 1152 takes 8. With the register budget and the static-K
+// form this measured +1.5% at 8 requests and +2.3% at 16, -1.3% for one token (so it waits for 16).
 inline int balanced_tail_min_experts() {
     static const int n = [] {
         const char* v = std::getenv("NINFER_VEC_TAIL8_MIN_EXPERTS");
-        return v != nullptr ? std::atoi(v) : 0;
+        return v != nullptr ? std::atoi(v) : 16;
     }();
     return n;
 }
