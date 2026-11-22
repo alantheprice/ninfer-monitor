@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <climits>
+#include <cstdlib>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -1014,6 +1015,380 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
     }
 }
 
+// ---- Prompt attention on the tensor cores --------------------------------------------------------
+// A prompt chunk without branches (rows at positions first + t, logical and physical alike) by
+// mma.sync m16n8k16 (F16 in, FP32 sums), FlashAttention-2 style. Block (32 rows, kv head) of
+// kGroup * 2 warps, warp (g, h) rows [16 g, 16 g + 16) of the group's head h; the block's tiles of
+// 32 keys and values pass through shared memory as F16 (an E4M3 cache's codes converted times
+// its scale), double-buffered. Scores run in the log2 domain. The relative bias of a tile within
+// `extent` of its rows is one more product, R (16 x 16) by the table rows of the 48 distances the
+// tile spans, gathered from the warp's shared scratch. Q and P round to F16 for the products: the
+// sums differ from attention_kernel's FP32 ones in the last bits.
+constexpr int kTcRows   = 16;              // rows a warp
+constexpr int kTcGroups = 2;               // row groups a block
+constexpr int kTcKeys   = 32;              // keys a tile
+constexpr int kTcSpan   = kTcKeys + kTcRows; // distances a tile spans for a warp's rows
+
+__device__ __forceinline__ std::uint32_t pack_half2(float x, float y) {
+    const __half2 h = __floats2half2_rn(x, y);
+    return *reinterpret_cast<const std::uint32_t*>(&h);
+}
+__device__ __forceinline__ void mma16816(float (&c)[4], const std::uint32_t (&a)[4], std::uint32_t b0,
+                                         std::uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+                 "{%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void ldsm_x4(std::uint32_t (&r)[4], const void* p) {
+    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(at));
+}
+__device__ __forceinline__ void ldsm_x4_t(std::uint32_t (&r)[4], const void* p) {
+    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(at));
+}
+// Element offset of (key, 16-byte chunk c) in a [kTcKeys][kD] F16 tile, chunks XOR-swizzled by
+// key so ldmatrix's eight rows hit eight different bank groups.
+__device__ __forceinline__ int tc_at(int key, int c) { return key * kD + ((c ^ (key & 7)) << 3); }
+
+std::size_t attention_tc_smem(int group) {
+    return std::size_t(2 * 2 * kTcKeys * kD) * sizeof(__half) +
+           std::size_t(group * kTcGroups * kTcRows * kTcSpan) * sizeof(float);
+}
+
+template <int kGroup>
+__global__ void __launch_bounds__(kGroup * kTcGroups * 32) attention_tc_kernel(AttentionArgs a) {
+    ninfer::pdl::enter();
+    constexpr int kWarps   = kGroup * kTcGroups;
+    constexpr int kThreads = kWarps * 32;
+    extern __shared__ __align__(16) unsigned char tc_smem[];
+    __half* tiles = reinterpret_cast<__half*>(tc_smem); // [stage][K, V][kTcKeys][kD]
+    float* scratch = reinterpret_cast<float*>(tc_smem + std::size_t(2 * 2 * kTcKeys * kD) * sizeof(__half));
+    const int warp = int(threadIdx.x) >> 5, lane = int(threadIdx.x) & 31;
+    const int g = warp / kGroup, hq = warp % kGroup;
+    const int kv_head = int(blockIdx.y);
+    const int head    = kv_head * kGroup + hq;
+    const int T       = a.rows.tokens;
+    const int first   = a.rows.first;
+    // The longest blocks (latest rows) first.
+    const int t0  = (int(gridDim.x) - 1 - int(blockIdx.x)) * kTcRows * kTcGroups;
+    const int wt0 = t0 + g * kTcRows;
+    const int r = lane >> 2, q = lane & 3;
+    constexpr float kLog2e = 1.4426950408889634f;
+
+    const int block_last = min(T, t0 + kTcRows * kTcGroups) - 1;
+    const int lo = a.window != 0 ? max(0, first + t0 - a.window + 1) : 0;
+    const int hi = first + block_last;
+    const bool live = wt0 < T;
+    const int w_last = min(T - 1, wt0 + kTcRows - 1);
+    const int w_lo   = a.window != 0 ? max(0, first + wt0 - a.window + 1) : 0;
+    const int w_hi   = first + w_last;
+
+    // Q (16 rows x 128) as eight A fragments, times scale * log2(e); R likewise, times log2(e).
+    std::uint32_t qa[kD / 16][4];
+    std::uint32_t ra[4] = {0, 0, 0, 0};
+    {
+        const int ta = wt0 + r, tb = wt0 + r + 8;
+        const bool va = ta < T, vb = tb < T;
+        const float* qra = a.q + (std::int64_t(va ? ta : 0) * a.query_heads + head) * kD;
+        const float* qrb = a.q + (std::int64_t(vb ? tb : 0) * a.query_heads + head) * kD;
+        const float s = a.scale * kLog2e;
+#pragma unroll
+        for (int ks = 0; ks < kD / 16; ++ks) {
+            const int c = 16 * ks + 2 * q;
+            const float2 x0 = va ? *reinterpret_cast<const float2*>(qra + c) : make_float2(0, 0);
+            const float2 x1 = vb ? *reinterpret_cast<const float2*>(qrb + c) : make_float2(0, 0);
+            const float2 x2 = va ? *reinterpret_cast<const float2*>(qra + c + 8) : make_float2(0, 0);
+            const float2 x3 = vb ? *reinterpret_cast<const float2*>(qrb + c + 8) : make_float2(0, 0);
+            qa[ks][0] = pack_half2(x0.x * s, x0.y * s);
+            qa[ks][1] = pack_half2(x1.x * s, x1.y * s);
+            qa[ks][2] = pack_half2(x2.x * s, x2.y * s);
+            qa[ks][3] = pack_half2(x3.x * s, x3.y * s);
+        }
+        if (a.extent > 0) {
+            const float* rra = a.r + (std::int64_t(va ? ta : 0) * a.query_heads + head) * kRel;
+            const float* rrb = a.r + (std::int64_t(vb ? tb : 0) * a.query_heads + head) * kRel;
+            const float2 x0 = va ? *reinterpret_cast<const float2*>(rra + 2 * q) : make_float2(0, 0);
+            const float2 x1 = vb ? *reinterpret_cast<const float2*>(rrb + 2 * q) : make_float2(0, 0);
+            const float2 x2 = va ? *reinterpret_cast<const float2*>(rra + 2 * q + 8) : make_float2(0, 0);
+            const float2 x3 = vb ? *reinterpret_cast<const float2*>(rrb + 2 * q + 8) : make_float2(0, 0);
+            ra[0] = pack_half2(x0.x * kLog2e, x0.y * kLog2e);
+            ra[1] = pack_half2(x1.x * kLog2e, x1.y * kLog2e);
+            ra[2] = pack_half2(x2.x * kLog2e, x2.y * kLog2e);
+            ra[3] = pack_half2(x3.x * kLog2e, x3.y * kLog2e);
+        }
+    }
+
+    float o[kD / 8][4];
+#pragma unroll
+    for (int i = 0; i < kD / 8; ++i) { o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f; }
+    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+
+    const int sequence = row_sequence(a.rows, 0);
+    const std::int64_t base = std::int64_t(sequence) * a.seq_stride + std::int64_t(kv_head) * a.head_stride;
+    const bool fp8 = a.k_scale > 0.0f;
+    constexpr int kChunks = 2 * kTcKeys * (kD / 8);
+    constexpr int kPer    = (kChunks + kThreads - 1) / kThreads;
+    uint4 raw[kPer];
+    const auto fetch = [&](int tile) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int w = int(threadIdx.x) + i * kThreads;
+            raw[i]      = make_uint4(0, 0, 0, 0);
+            if (w >= kChunks) { continue; }
+            const int matrix = w / (kTcKeys * (kD / 8));
+            const int rest   = w % (kTcKeys * (kD / 8));
+            const int key = rest / (kD / 8), c = rest % (kD / 8);
+            const int p   = tile + key;
+            if (p > hi) { continue; }
+            const int slot      = a.ring != 0 ? p % a.ring : p;
+            const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
+            if (fp8) {
+                const uint2 codes = *reinterpret_cast<const uint2*>(
+                    reinterpret_cast<const std::uint8_t*>(cache) + base + std::int64_t(slot) * kD + c * 8);
+                raw[i].x = codes.x;
+                raw[i].y = codes.y;
+            } else {
+                raw[i] = *reinterpret_cast<const uint4*>(cache + base + std::int64_t(slot) * kD + c * 8);
+            }
+        }
+    };
+    const auto store = [&](int stage) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int w = int(threadIdx.x) + i * kThreads;
+            if (w >= kChunks) { continue; }
+            const int matrix = w / (kTcKeys * (kD / 8));
+            const int rest   = w % (kTcKeys * (kD / 8));
+            const int key = rest / (kD / 8), c = rest % (kD / 8);
+            uint4 word = raw[i];
+            if (fp8) {
+                const float scale = matrix == 0 ? a.k_scale : a.v_scale;
+                const std::uint32_t parts[2] = {raw[i].x, raw[i].y};
+                __half2 h[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(
+                        __nv_fp8x2_storage_t(parts[e / 2] >> (16 * (e % 2))), __NV_E4M3);
+                    const float2 f = __half22float2(__half2(hr));
+                    h[e] = __floats2half2_rn(f.x * scale, f.y * scale);
+                }
+                word = *reinterpret_cast<const uint4*>(h);
+            }
+            *reinterpret_cast<uint4*>(tiles + (stage * 2 + matrix) * kTcKeys * kD + tc_at(key, c)) = word;
+        }
+    };
+
+    float* bias = scratch + warp * kTcRows * kTcSpan;
+    if (lo <= hi) { fetch(lo); }
+    int stage = 0;
+    for (int tile = lo; tile <= hi; tile += kTcKeys, stage ^= 1) {
+        store(stage);
+        __syncthreads();
+        if (tile + kTcKeys <= hi) { fetch(tile + kTcKeys); }
+        if (!live || tile > w_hi || tile + kTcKeys - 1 < w_lo) { continue; }
+        const __half* ks_ = tiles + (stage * 2 + 0) * kTcKeys * kD;
+        const __half* vs_ = tiles + (stage * 2 + 1) * kTcKeys * kD;
+        // S = Q K^T: four n-tiles of eight keys.
+        float s[kTcKeys / 8][4];
+#pragma unroll
+        for (int i = 0; i < kTcKeys / 8; ++i) { s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f; }
+#pragma unroll
+        for (int ks = 0; ks < kD / 16; ++ks) {
+#pragma unroll
+            for (int np = 0; np < kTcKeys / 16; ++np) {
+                std::uint32_t b[4];
+                const int key = np * 16 + ((lane >> 4) << 3) + (lane & 7);
+                ldsm_x4(b, ks_ + tc_at(key, 2 * ks + ((lane >> 3) & 1)));
+                mma16816(s[2 * np], qa[ks], b[0], b[1]);
+                mma16816(s[2 * np + 1], qa[ks], b[2], b[3]);
+            }
+        }
+        // The relative bias of the distances [dmin, dmin + kTcSpan) this tile spans.
+        const int p0   = first + wt0;
+        const int dmin = p0 - (tile + kTcKeys - 1);
+        const bool biased = a.extent > 0 && p0 + kTcRows - 1 - tile >= 0 && dmin < a.extent;
+        if (biased) {
+#pragma unroll
+            for (int nt = 0; nt < kTcSpan / 8; ++nt) {
+                float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                const int d = dmin + nt * 8 + r;
+                std::uint32_t b0 = 0, b1 = 0;
+                if (d >= 0 && d < a.extent) {
+                    const float* row = a.table + std::int64_t(d) * kRel;
+                    const float2 x = *reinterpret_cast<const float2*>(row + 2 * q);
+                    const float2 y = *reinterpret_cast<const float2*>(row + 2 * q + 8);
+                    b0 = pack_half2(x.x, x.y);
+                    b1 = pack_half2(y.x, y.y);
+                }
+                mma16816(c, ra, b0, b1);
+                bias[r * kTcSpan + nt * 8 + 2 * q]           = c[0];
+                bias[r * kTcSpan + nt * 8 + 2 * q + 1]       = c[1];
+                bias[(r + 8) * kTcSpan + nt * 8 + 2 * q]     = c[2];
+                bias[(r + 8) * kTcSpan + nt * 8 + 2 * q + 1] = c[3];
+            }
+            __syncwarp();
+        }
+        float mx[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int nt = 0; nt < kTcKeys / 8; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int row = r + 8 * (e >> 1);
+                const int col = nt * 8 + 2 * q + (e & 1);
+                const int key = tile + col;
+                const int d   = p0 + row - key;
+                const bool visible = key <= hi && wt0 + row < T && d >= 0 &&
+                                     (a.window == 0 || d < a.window);
+                float v = s[nt][e];
+                if (biased && visible && d < a.extent) { v += bias[row * kTcSpan + row + kTcKeys - 1 - col]; }
+                s[nt][e] = visible ? v : -INFINITY;
+                mx[e >> 1] = fmaxf(mx[e >> 1], s[nt][e]);
+            }
+        }
+        if (biased) { __syncwarp(); }
+        float alpha[2];
+#pragma unroll
+        for (int h2 = 0; h2 < 2; ++h2) {
+            mx[h2] = fmaxf(mx[h2], __shfl_xor_sync(0xFFFFFFFFu, mx[h2], 1));
+            mx[h2] = fmaxf(mx[h2], __shfl_xor_sync(0xFFFFFFFFu, mx[h2], 2));
+            const float m_new = fmaxf(m[h2], mx[h2]);
+            alpha[h2] = m_new == -INFINITY ? 1.0f : exp2f(m[h2] - m_new);
+            m[h2]     = m_new;
+        }
+        float sum[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int nt = 0; nt < kTcKeys / 8; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float mm = m[e >> 1];
+                const float p  = mm == -INFINITY ? 0.0f : exp2f(s[nt][e] - mm);
+                s[nt][e] = p;
+                sum[e >> 1] += p;
+            }
+        }
+#pragma unroll
+        for (int h2 = 0; h2 < 2; ++h2) {
+            sum[h2] += __shfl_xor_sync(0xFFFFFFFFu, sum[h2], 1);
+            sum[h2] += __shfl_xor_sync(0xFFFFFFFFu, sum[h2], 2);
+            l[h2] = l[h2] * alpha[h2] + sum[h2];
+        }
+#pragma unroll
+        for (int i = 0; i < kD / 8; ++i) {
+            o[i][0] *= alpha[0];
+            o[i][1] *= alpha[0];
+            o[i][2] *= alpha[1];
+            o[i][3] *= alpha[1];
+        }
+        // O += P V.
+#pragma unroll
+        for (int kk = 0; kk < kTcKeys / 16; ++kk) {
+            const std::uint32_t pa[4] = {pack_half2(s[2 * kk][0], s[2 * kk][1]),
+                                         pack_half2(s[2 * kk][2], s[2 * kk][3]),
+                                         pack_half2(s[2 * kk + 1][0], s[2 * kk + 1][1]),
+                                         pack_half2(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+#pragma unroll
+            for (int np = 0; np < kD / 16; ++np) {
+                std::uint32_t b[4];
+                const int key = 16 * kk + (((lane >> 3) & 1) << 3) + (lane & 7);
+                ldsm_x4_t(b, vs_ + tc_at(key, 2 * np + (lane >> 4)));
+                mma16816(o[2 * np], pa, b[0], b[1]);
+                mma16816(o[2 * np + 1], pa, b[2], b[3]);
+            }
+        }
+    }
+    if (!live) { return; }
+    const int width = a.query_heads * kD;
+#pragma unroll
+    for (int h2 = 0; h2 < 2; ++h2) {
+        const int t       = wt0 + r + 8 * h2;
+        const bool row_ok = t < T;
+        const int tt      = row_ok ? t : 0;
+        const float sink  = a.sinks != nullptr ? a.sinks[std::int64_t(tt) * a.sink_stride + head] * kLog2e
+                                               : -INFINITY;
+        const float top = fmaxf(m[h2], sink);
+        const float w   = m[h2] == -INFINITY ? 0.0f : exp2f(m[h2] - top);
+        const float inv = 1.0f / (l[h2] * w + (sink == -INFINITY ? 0.0f : exp2f(sink - top)));
+        const float* gate = a.gate != nullptr ? a.gate + std::int64_t(tt) * a.gate_stride + head * kD : nullptr;
+        float y[kD / 8][2];
+#pragma unroll
+        for (int i = 0; i < kD / 8; ++i) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int dcol = i * 8 + 2 * q + e;
+                const float gv = gate != nullptr ? sigmoidf(gate[dcol]) : 1.0f;
+                y[i][e] = o[i][2 * h2 + e] * w * inv * gv;
+            }
+        }
+        if (a.out_q.qs != nullptr) {
+            // q8_1 blocks of 32 values: n-tiles 4b..4b+3, eight values a thread, the quad's four
+            // threads one block.
+#pragma unroll
+            for (int b = 0; b < kD / 32; ++b) {
+                float amax = 0.0f, total = 0.0f;
+#pragma unroll
+                for (int i = 4 * b; i < 4 * b + 4; ++i) {
+                    amax = fmaxf(amax, fmaxf(fabsf(y[i][0]), fabsf(y[i][1])));
+                    total += y[i][0] + y[i][1];
+                }
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
+                total += __shfl_xor_sync(0xFFFFFFFFu, total, 1);
+                total += __shfl_xor_sync(0xFFFFFFFFu, total, 2);
+                if (!row_ok) { continue; }
+                const float dq = amax / 127.0f;
+#pragma unroll
+                for (int i = 4 * b; i < 4 * b + 4; ++i) {
+                    char2 c = make_char2(0, 0);
+                    if (amax != 0.0f) {
+                        c = make_char2(static_cast<signed char>(roundf(y[i][0] / dq)),
+                                       static_cast<signed char>(roundf(y[i][1] / dq)));
+                    }
+                    *reinterpret_cast<char2*>(a.out_q.qs + std::int64_t(t) * width + head * kD + i * 8 + 2 * q) = c;
+                }
+                if (q == 0) {
+                    a.out_q.ds[std::int64_t(t) * (width / 32) + (head * kD) / 32 + b] =
+                        make_half2(__float2half(dq), __float2half(total));
+                }
+            }
+        } else if (row_ok) {
+#pragma unroll
+            for (int i = 0; i < kD / 8; ++i) {
+                *reinterpret_cast<__nv_bfloat162*>(a.out + std::int64_t(t) * width + head * kD + i * 8 + 2 * q) =
+                    __floats2bfloat162_rn(y[i][0], y[i][1]);
+            }
+        }
+    }
+}
+
+template <int kGroup>
+void launch_attention_tc(const AttentionArgs& args, cudaStream_t stream) {
+    const std::size_t smem = attention_tc_smem(kGroup);
+    static const bool configured = [&] {
+        CUDA_CHECK(cudaFuncSetAttribute(attention_tc_kernel<kGroup>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)));
+        return true;
+    }();
+    (void)configured;
+    const int rows_a_block = kTcRows * kTcGroups;
+    (void)ninfer::pdl::launch_consumer(
+        ninfer::pdl::LaunchConfig{dim3((args.rows.tokens + rows_a_block - 1) / rows_a_block, args.kv_heads, 1),
+                                  dim3(kGroup * kTcGroups * 32), smem, stream},
+        attention_tc_kernel<kGroup>, args);
+}
+
+// NINFER_INKLING_TC_ATTENTION=0 keeps prompt chunks on attention_kernel<8> (FP32 sums).
+bool tc_attention_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_INKLING_TC_ATTENTION");
+        return v == nullptr || std::string(v) != "0";
+    }();
+    return on;
+}
+
 // Block (head, row): merges the splits of one query head and its sink, thread d the output's
 // dimension d. Every split counts with weight exp(m_s - M), the sink as a key without a value:
 // M = max(max_s m_s, sink), l = sum_s l_s exp(m_s - M) + exp(sink - M).
@@ -1871,6 +2246,15 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
     }
     if (args.rows.chunk) {
         if (args.splits != 1) { throw std::invalid_argument("inkling2 attention: chunk splits"); }
+        if (args.rows.starts == nullptr && tc_attention_enabled()) {
+            const int group = args.query_heads / args.kv_heads;
+            if (group == 1) { launch_attention_tc<1>(args, stream); }
+            else if (group == 2) { launch_attention_tc<2>(args, stream); }
+            else if (group == 3) { launch_attention_tc<3>(args, stream); }
+            else { launch_attention_tc<4>(args, stream); }
+            check_launch("attention_tc");
+            return;
+        }
         (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(blocks_for(t, 8), args.kv_heads, 1)), dim3(256), std::size_t(0), stream}, attention_kernel<8>, args);
         check_launch("attention");
         return;

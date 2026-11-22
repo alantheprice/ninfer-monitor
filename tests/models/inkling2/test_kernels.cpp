@@ -1394,6 +1394,10 @@ int main() {
         attention_case({"window ring, chunk after 1100", {iota(1100, 37), {}, true, 1100}, ring, kWindow, 1}, rng);
         attention_case({"full cache, chunk after 600", {iota(600, 21), {}, true, 600}, 0, 0, 1}, rng);
         attention_case({"full cache, chunk at 0", {iota(0, 64), {}, true, 0}, 0, 0, 1}, rng);
+        // Longer chunks: many key tiles, the relative extent's edge and the window's inside them.
+        attention_case({"window ring, long chunk after 900", {iota(900, 333), {}, true, 900}, kWindow + 400, kWindow, 1}, rng);
+        attention_case({"full cache, long chunk after 1000", {iota(1000, 301), {}, true, 1000}, 0, 0, 1}, rng);
+        attention_case({"full cache, long chunk at 0", {iota(0, 517), {}, true, 0}, 0, 0, 1}, rng);
         attention_case({"full cache, branches", branches, 0, 0, 1}, rng);
         attention_case({"window ring, branches", branches, ring, kWindow, 1}, rng);
 
