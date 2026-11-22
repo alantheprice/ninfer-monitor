@@ -640,6 +640,8 @@ struct AttentionCase {
     RowsCase rows;
     int ring = 0, window = 0, splits = 1;
     float sink_offset = 0.0f;
+    int span = 0;            // span splits (splits then the most a block covers)
+    std::vector<int> runs;   // verification runs ([tokens + 1]); compared bit for bit with no runs
 };
 
 void attention_case(const AttentionCase& c, std::mt19937& rng) {
@@ -692,6 +694,23 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
     a.gate        = as<float>(dg);
     a.gate_stride = gate_stride;
     a.out         = as<bf16>(out);
+    a.span        = c.span;
+    DeviceBuffer druns = upload(std::vector<std::int32_t>(c.runs.begin(), c.runs.end()));
+    int run_mismatch = -1;
+    if (!c.runs.empty()) {
+        // The rows one block each, then in their runs: the same bits.
+        k::attention(a, nullptr);
+        sync("attention rows");
+        const auto alone = download<bf16>(out, std::size_t(t) * kHeads * kD);
+        a.runs = as<std::int32_t>(druns);
+        k::attention(a, nullptr);
+        sync("attention runs");
+        const auto together = download<bf16>(out, std::size_t(t) * kHeads * kD);
+        run_mismatch = 0;
+        for (std::size_t i = 0; i < alone.size(); ++i) {
+            run_mismatch += std::memcmp(&alone[i], &together[i], sizeof(bf16)) != 0;
+        }
+    }
     k::attention(a, nullptr);
     sync("attention");
     const auto got = download<bf16>(out, std::size_t(t) * kHeads * kD);
@@ -759,8 +778,10 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
             }
         }
     }
-    report(eb.rel() < 6e-3 && eq.rel() < 1.5e-2,
+    report(eb.rel() < 6e-3 && eq.rel() < 1.5e-2 && run_mismatch <= 0,
            "attention " + c.name + ", splits " + std::to_string(c.splits) +
+               (c.span > 0 ? ", span " + std::to_string(c.span) : "") +
+               (run_mismatch >= 0 ? ", runs differ " + std::to_string(run_mismatch) : "") +
                (c.sink_offset != 0.0f ? ", sinks " + num(c.sink_offset) : "") + " (" +
                std::to_string(biased) + " biased, " + std::to_string(unbiased) +
                " unbiased scores): bf16 " + num(eb.rel()) + ", q8_1 " + num(eq.rel()));
@@ -1398,6 +1419,17 @@ int main() {
         attention_case({"window ring, long chunk after 900", {iota(900, 333), {}, true, 900}, kWindow + 400, kWindow, 1}, rng);
         attention_case({"full cache, long chunk after 1000", {iota(1000, 301), {}, true, 1000}, 0, 0, 1}, rng);
         attention_case({"full cache, long chunk at 0", {iota(0, 517), {}, true, 0}, 0, 0, 1}, rng);
+        // Span splits: decode rows, and verification runs of 1..6 rows of three sequences.
+        attention_case({"full cache, decode", {{0, 900, 1500}, {0, 1, 2}}, 0, 0, 8, 0.0f, 256}, rng);
+        attention_case({"window ring, decode", {{5, 1100, 3000}, {0, 1, 2}}, ring, kWindow, 19, 0.0f, 64}, rng);
+        {
+            RowsCase v{{700, 701, 702, 703, 704, 705, 1999, 2000, 2001, 40}, {0, 0, 0, 0, 0, 0, 1, 1, 1, 2}};
+            const std::vector<int> runs{0, 6, 9, 10, 10, 10, 10, 10, 10, 10, 10};
+            attention_case({"full cache, verification runs", v, 0, 0, 10, 0.0f, 256, runs}, rng);
+            RowsCase w{{1100, 1101, 1102, 1103, 2999, 3000, 3001, 3002, 3003, 3004}, {0, 0, 0, 0, 1, 1, 1, 1, 1, 1}};
+            const std::vector<int> wruns{0, 4, 10, 10, 10, 10, 10, 10, 10, 10, 10};
+            attention_case({"window ring, verification runs", w, ring, kWindow, 19, 0.0f, 64, wruns}, rng);
+        }
         attention_case({"full cache, branches", branches, 0, 0, 1}, rng);
         attention_case({"window ring, branches", branches, ring, kWindow, 1}, rng);
 

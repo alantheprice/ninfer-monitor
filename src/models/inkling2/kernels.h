@@ -224,6 +224,15 @@ struct AttentionArgs {
     int splits  = 1;
     bool uniform = false;
     float* partial = nullptr; // decode: attention_workspace_floats
+    // Decode and verification calls with `span` > 0 split every row's keys at the positions
+    // s * span (16-aligned tiles within), the same for a row whatever rows run beside it, so
+    // a row's output does not depend on its call; `splits` is then the most splits a block
+    // spans. With `runs` ([tokens + 1] row offsets, a sequence's consecutive rows each, entries
+    // past the last run equal to tokens), one block of each run's up to eight rows reads each
+    // key and value tile once for all of them.
+    int span = 0;
+    const std::int32_t* runs = nullptr;
+    int run_count = 0; // blocks of runs (the first run_count entries of runs)
     const float* gate = nullptr;
     std::int64_t gate_stride = 0;
     __nv_bfloat16* out = nullptr;
@@ -439,8 +448,13 @@ struct SparkStepArgs {
     float* joint = nullptr;
     float* logits = nullptr;
     float* partials = nullptr;
+    // Several sequences' blocks at once: `lanes` blocks of `block` rows (lane j's rows
+    // j * block ..), lane j's state, prev, drafts and confidence at j * 256, j, j * block and
+    // j * block, its scratch at j * spark_step_floats(vocab), hidden and base rows j * block + row.
+    int lanes = 1, block = 0;
 };
 [[nodiscard]] std::size_t spark_step_floats(int vocab);
+constexpr int kSparkMaxLanes = 4;
 void spark_step(const SparkStepArgs& args, cudaStream_t stream);
 
 // sums[i] += products[i] for i < n when *flag is nonzero: the 2^-32 fixed-point sums of the

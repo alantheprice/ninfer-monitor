@@ -644,6 +644,12 @@ struct Inkling2Core::Impl {
     static constexpr double kPrefillSecondsPerToken  = 2e-4;
     std::vector<Stored> stored;
     std::uint64_t host_budget = 0, host_used = 0;
+    // NINFER_INKLING_BATCH_DRAFT=0: DSpark drafts only for a lone decoding request.
+    static constexpr std::size_t kBatchRoundRows = 32;
+    const bool batch_drafting = [] {
+        const char* v = std::getenv("NINFER_INKLING_BATCH_DRAFT");
+        return v == nullptr || std::string(v) != "0";
+    }();
     std::uint32_t decode_run                = 0;
     std::uint32_t decode_rounds_per_prefill = 1;
 
@@ -1693,11 +1699,7 @@ struct Inkling2Core::Impl {
             std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
             store_image(r.slot, slot.fed, slot.media, nullptr, PrefixReusePath::SharedStablePrefix);
         }
-        // The anchor: the state where the prompt's last user turn closes, or (no such frontier) at
-        // the prompt's end, so the conversation's next turn resumes in this sequence even when its
-        // rendering of this turn's answer differs from the tokens sampled.
-        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at &&
-            (r.prefilled < prompt_n || !r.branches)) {
+        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at && r.prefilled < prompt_n) {
             executor.snapshot(r.slot, slot.snapshot);
             slot.anchor       = slot.fed;
             slot.anchor_media = slot.media;
@@ -2063,7 +2065,14 @@ struct Inkling2Core::Impl {
     // one) sets the same bounds here.
     // The DSpark drafter drafts for one request at a time.
     [[nodiscard]] std::uint32_t round_drafts(std::size_t decoding) const noexcept {
-        if (spark_drafts != 0) { return decoding == 1 ? drafts : 0U; }
+        if (spark_drafts != 0) {
+            if (decoding == 1) { return drafts; }
+            // Several decoding requests draft together, each round's rows (drafts and bonus) within
+            // the executor's 32 decode rows.
+            if (!batch_drafting || decoding == 0) { return 0U; }
+            const std::size_t width = kBatchRoundRows / decoding;
+            return width >= 2 ? std::min<std::uint32_t>(drafts, std::uint32_t(width - 1)) : 0U;
+        }
         return decoding == 1 ? drafts : decoding <= 3 ? 1U : 0U;
     }
 
@@ -2828,7 +2837,11 @@ Inkling2Core::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
         const auto prompt_n  = static_cast<std::uint32_t>(request->prompt_tokens.size());
         request->reusable   = identity.reusable;
         request->disposable = data.tap_hints.disposable;
-        request->anchor_at  = prompt_n;
+        // The anchor: the state where the prompt's last user turn closes, or (no such frontier)
+        // before the prompt's last token, so the conversation's next turn, or the same prompt
+        // again, resumes in this sequence even when the next turn's rendering of this answer
+        // differs from the tokens sampled. A branched read anchors at its prompt's end itself.
+        request->anchor_at  = !options.execution.branches && prompt_n >= 2 ? prompt_n - 1 : prompt_n;
         if (identity.rewrite_checkpoint &&
             identity.rewrite_checkpoint->kind ==
                 models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
