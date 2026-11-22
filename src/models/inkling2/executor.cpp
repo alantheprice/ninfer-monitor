@@ -2324,7 +2324,10 @@ struct Executor::Impl {
         route.pair_scale    = pair_scale;
         // A short call's route kernel also groups its pairs by expert.
         void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
-        const bool sorted = t <= kernels::kSortedRouteRows && e <= kernels::kSortedRouteExperts;
+        // The sorted route's tile lists hold one tile an expert, right for the matrix kernels only
+        // while no expert has more than 8 pairs: past 8 rows only a vector call takes it.
+        const bool sorted = (t <= kernels::kSortedRouteBlockRows || c.q8) &&
+                            t <= kernels::kSortedRouteRows && e <= kernels::kSortedRouteExperts;
         gguf::MoeRouting routing;
         if (sorted) {
             routing = gguf::moe_sorted_routes(routing_space, pairs, e);
