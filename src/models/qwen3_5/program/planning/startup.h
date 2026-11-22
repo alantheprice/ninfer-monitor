@@ -207,15 +207,18 @@ struct SequencePlanImpl {
     return std::max(plan.draft_window, plan.ngram_draft_window);
 }
 
-// The most requests a copy round holds: every lane's copy-window verification has to fit the
-// widest round the Qwen family plans (the cuBLAS prefill floor, 128 columns), and a copy window
-// past 15 holds one request. A larger batch runs a neural round; its copies wait for the batch to
-// thin out.
+// The most requests a copy round holds. A copy round verifies every lane at the copy window, so
+// it pays only while that stays narrow: past 32 columns the rows without a copy lose more than the
+// copies gain (Qwen3.8-27B, 16 lanes, 32K coding contexts: 128 columns cost 12% of C=8
+// throughput, 32 columns none, and both keep the C=1 gain). A copy window past 15 holds one
+// request. A larger batch runs a neural round; its copies wait for the batch to thin out.
+inline constexpr std::uint32_t kCopyRoundColumns = 32;
+
 [[nodiscard]] inline std::uint32_t copy_round_lanes(std::uint32_t ngram_draft_window,
                                                     std::uint32_t max_concurrency) noexcept {
     if (ngram_draft_window == 0) { return 0; }
     if (ngram_draft_window > 15U) { return 1; }
-    return std::min(max_concurrency, 128U / (ngram_draft_window + 1U));
+    return std::max(1U, std::min(max_concurrency, kCopyRoundColumns / (ngram_draft_window + 1U)));
 }
 
 // The widest proposal a masked drafter makes: its draft window, or above one request the copy
