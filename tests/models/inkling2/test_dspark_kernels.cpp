@@ -108,7 +108,7 @@ double sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 // ---- Attention over a uniform block -------------------------------------------------------------
 
 void uniform_case(const std::string& name, int anchor, int rows, int ring, int window, int splits,
-                  std::mt19937& rng) {
+                  std::mt19937& rng, int span = 0) {
     const int sequences = 2, sequence = 1;
     const int last = anchor + rows - 1;
     const int slots = ring != 0 ? ring : last + 1;
@@ -143,6 +143,7 @@ void uniform_case(const std::string& name, int anchor, int rows, int ring, int w
     a.scale          = scale;
     a.splits         = splits;
     a.uniform        = true;
+    a.span           = span;
     a.partial        = as<float>(partial);
     a.out            = as<bf16>(out);
     k::attention(a, nullptr);
@@ -192,6 +193,7 @@ void uniform_case(const std::string& name, int anchor, int rows, int ring, int w
     report(eb.rel() < 6e-3 && eq.rel() < 1.5e-2,
            "uniform attention " + name + ", " + std::to_string(rows) + " rows, " +
                std::to_string(last + 1 - lo) + " keys, splits " + std::to_string(splits) +
+               (span > 0 ? ", span " + std::to_string(span) : std::string()) +
                ": bf16 " + num(eb.rel()) + ", q8_1 " + num(eq.rel()));
 }
 
@@ -623,6 +625,11 @@ int main() {
         uniform_case("full cache", 2100, kBlock, 0, 0, 1, rng);
         uniform_case("full cache", 2100, kBlock, 0, 0, 20, rng);
         uniform_case("full cache", 40, 3, 0, 0, 20, rng);
+        // Full layers on the tensor cores: span splits at fixed positions.
+        uniform_case("full cache", 2100, kBlock, 0, 0, 2100 / 256 + 2, rng, 256);
+        uniform_case("full cache", 2100, kBlock, 0, 0, 2100 / 832 + 2, rng, 832);
+        uniform_case("full cache", 40, 3, 0, 0, 2, rng, 256);
+        uniform_case("full cache", 255, kBlock, 0, 0, 3, rng, 256);
         mix_case("decode rows, q8_1", 5, true, 5, 0, false, rng);
         mix_case("prompt rows, bf16", 40, false, 37, 9, true, rng);
         rotate_case(rng);

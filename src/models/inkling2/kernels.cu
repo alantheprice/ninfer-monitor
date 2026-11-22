@@ -1521,8 +1521,10 @@ __global__ void __launch_bounds__(kDtWarps * 32) attention_dtc_kernel(AttentionA
     const int warp = int(threadIdx.x) >> 5, lane = int(threadIdx.x) & 31;
     const int r = lane >> 2, q = lane & 3;
     const int kv_head = int(blockIdx.y);
-    const int t0 = a.runs != nullptr ? a.runs[blockIdx.x] : int(blockIdx.x);
-    const int t1 = a.runs != nullptr ? a.runs[blockIdx.x + 1] : t0 + 1;
+    // Uniform calls (a DSpark block of eight rows a block): every row sees its block's keys.
+    const int t0 = a.uniform ? int(blockIdx.x) * 8 : a.runs != nullptr ? a.runs[blockIdx.x] : int(blockIdx.x);
+    const int t1 = a.uniform ? min(a.rows.tokens, t0 + 8)
+                             : a.runs != nullptr ? a.runs[blockIdx.x + 1] : t0 + 1;
     if (t0 >= t1) { return; }
     const int pairs = (t1 - t0) * kGroup;
     constexpr float kLog2e = 1.4426950408889634f;
@@ -1540,7 +1542,7 @@ __global__ void __launch_bounds__(kDtWarps * 32) attention_dtc_kernel(AttentionA
     const bool va = ma < pairs, vb = mb < pairs;
     const int ta = t0 + (va ? ma / kGroup : 0), tb = t0 + (vb ? mb / kGroup : 0);
     const int ha = kv_head * kGroup + (va ? ma % kGroup : 0), hb = kv_head * kGroup + (vb ? mb % kGroup : 0);
-    const int pa = a.rows.positions[ta], pb = a.rows.positions[tb];
+    const int pa = a.uniform ? hi : a.rows.positions[ta], pb = a.uniform ? hi : a.rows.positions[tb];
     const bool live = m0 < pairs;
 
     std::uint32_t qa[kD / 16][4];
@@ -1909,7 +1911,7 @@ __global__ void attention_combine_kernel(AttentionArgs a) {
     const std::int64_t first = (std::int64_t(t) * a.query_heads + head) * a.splits;
     int lo = 0, hi = 0;
     key_range(a, t, t + 1, lo, hi);
-    const int active = a.span > 0 && !a.uniform ? hi / a.span - lo / a.span + 1
+    const int active = a.span > 0 ? hi / a.span - lo / a.span + 1
                                                 : active_splits(hi + 1 - lo, a.splits);
     __shared__ float weight[kMaxSplits];
     __shared__ float max_s, inv_l;
@@ -3095,12 +3097,24 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
             throw std::invalid_argument("inkling2 attention: uniform blocks of 1..8 decode rows, or "
                                         "of eight rows each");
         }
-        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3((t + 7) / 8, args.kv_heads, args.splits)), dim3(256), std::size_t(0), stream}, attention_kernel<8>, args);
-        check_launch("attention");
-        if (args.splits > 1) {
-            (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(args.query_heads, t, 1)), dim3(kCombineThreads), std::size_t(0), stream}, attention_combine_kernel, args);
-            check_launch("attention_combine");
+        if (args.span > 0 && args.window == 0 && args.ring == 0 && group == 3 &&
+            args.span % kDtKeys == 0 && args.extent == 0 && dtc_attention_enabled()) {
+            // A full layer's DSpark blocks on the tensor cores, split at fixed span positions.
+            launch_attention_dtc<3>(args, unsigned((t + 7) / 8), stream);
+        } else {
+            AttentionArgs fp32 = args;
+            fp32.span = 0;
+            (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3((t + 7) / 8, args.kv_heads, args.splits)), dim3(256), std::size_t(0), stream}, attention_kernel<8>, fp32);
+            check_launch("attention");
+            if (args.splits > 1) {
+                (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(args.query_heads, t, 1)), dim3(kCombineThreads), std::size_t(0), stream}, attention_combine_kernel, fp32);
+                check_launch("attention_combine");
+            }
+            return;
         }
+        check_launch("attention");
+        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(args.query_heads, t, 1)), dim3(kCombineThreads), std::size_t(0), stream}, attention_combine_kernel, args);
+        check_launch("attention_combine");
         return;
     }
     if (args.rows.chunk) {

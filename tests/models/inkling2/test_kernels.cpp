@@ -55,6 +55,7 @@
 #include <iostream>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -1519,6 +1520,87 @@ std::vector<int> iota(int first, int count) {
 
 } // namespace
 
+// ---- Q6_K products on the tensor cores (the output head's) -------------------------------------
+// Random Q6_K rows against the vector kernel at several column counts; inside the scope each
+// column's values are the same bits at any column count.
+void q6k_mma_case(std::mt19937& rng) {
+    const int rows = 1000, k = 2304, blocks = k / 256;
+    const std::int64_t row_bytes = std::int64_t(blocks) * 210;
+    std::vector<std::uint8_t> w(std::size_t(rows) * row_bytes);
+    std::uniform_int_distribution<int> byte(0, 255), scale(-127, 127);
+    std::uniform_real_distribution<float> d(0.0005f, 0.004f);
+    for (int r = 0; r < rows; ++r) {
+        for (int b = 0; b < blocks; ++b) {
+            std::uint8_t* sb = w.data() + r * row_bytes + b * 210;
+            for (int i = 0; i < 192; ++i) { sb[i] = std::uint8_t(byte(rng)); }
+            for (int i = 0; i < 16; ++i) { sb[192 + i] = std::uint8_t(std::int8_t(scale(rng))); }
+            const __half h = __float2half(d(rng));
+            std::memcpy(sb + 208, &h, 2);
+        }
+    }
+    const int max_cols = 64;
+    const auto x = normal(std::size_t(max_cols) * k, 1.0f, rng);
+    std::vector<bf16> xb(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i) { xb[i] = __float2bfloat16(x[i]); }
+    DeviceBuffer dw = upload(w), dx = upload(xb), act(gguf::vector_activation_bytes(k, max_cols)),
+                 vec_out(std::size_t(max_cols) * rows * 4), mma_out(std::size_t(max_cols) * rows * 4);
+    std::vector<float> first;
+    bool same = true;
+    double worst = 0.0;
+    for (const int cols : {1, 6, 29, 64}) {
+        gguf::quantize_vector_activation(as<bf16>(dx), k, cols, nullptr, act.p, nullptr);
+        gguf::VectorOutput o;
+        o.column_stride = rows;
+        o.f32 = as<float>(vec_out);
+        gguf::vector_product(gguf::GgmlType::Q6_K, dw.p, row_bytes, rows, k, act.p, cols, o, nullptr);
+        {
+            gguf::VectorQ6KMmaScope scope;
+            o.f32 = as<float>(mma_out);
+            gguf::vector_product(gguf::GgmlType::Q6_K, dw.p, row_bytes, rows, k, act.p, cols, o, nullptr);
+        }
+        sync("q6_k products");
+        const auto v = download<float>(vec_out, std::size_t(cols) * rows);
+        const auto m = download<float>(mma_out, std::size_t(cols) * rows);
+        Error e;
+        for (std::size_t i = 0; i < v.size(); ++i) { e.add(m[i], v[i]); }
+        worst = std::max(worst, e.rel());
+        if (first.empty()) {
+            first.assign(m.begin(), m.begin() + rows);
+        } else {
+            same = same && std::memcmp(first.data(), m.data(), std::size_t(rows) * 4) == 0;
+        }
+    }
+    if (std::getenv("NINFER_TEST_Q6K_TIMING") != nullptr) {
+        // The head's shape: time both forms at verification widths.
+        const int vr = 200000;
+        DeviceBuffer big(std::size_t(vr) * row_bytes), bo(std::size_t(max_cols) * vr * 4);
+        check(cudaMemset(big.p, 0x11, std::size_t(vr) * row_bytes), "fill");
+        for (const int cols : {1, 6, 29, 32}) {
+            gguf::quantize_vector_activation(as<bf16>(dx), k, cols, nullptr, act.p, nullptr);
+            gguf::VectorOutput o;
+            o.column_stride = vr;
+            o.f32 = as<float>(bo);
+            for (int form = 0; form < 2; ++form) {
+                std::optional<gguf::VectorQ6KMmaScope> scope;
+                if (form == 1) { scope.emplace(); }
+                cudaEvent_t e0, e1;
+                cudaEventCreate(&e0); cudaEventCreate(&e1);
+                for (int it = 0; it < 3; ++it) { gguf::vector_product(gguf::GgmlType::Q6_K, big.p, row_bytes, vr, k, act.p, cols, o, nullptr); }
+                cudaEventRecord(e0);
+                for (int it = 0; it < 20; ++it) { gguf::vector_product(gguf::GgmlType::Q6_K, big.p, row_bytes, vr, k, act.p, cols, o, nullptr); }
+                cudaEventRecord(e1);
+                cudaEventSynchronize(e1);
+                float ms = 0;
+                cudaEventElapsedTime(&ms, e0, e1);
+                std::printf("q6_k %s %d columns: %.1f us\n", form ? "mma" : "vec", cols, 1000 * ms / 20);
+            }
+        }
+    }
+    report(worst < 1e-5 && same, "Q6_K tensor-core products, 1..64 columns: vs vector kernel " +
+                                     num(worst) + (same ? ", column 0 the same bits at every width"
+                                                        : ", column 0 DIFFERS across widths"));
+}
+
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
@@ -1527,6 +1609,7 @@ int main() {
     }
     std::mt19937 rng(20261121);
     try {
+        q6k_mma_case(rng);
         rms_norm_case(1, true, rng);
         rms_norm_case(9, false, rng);
         for (const auto& [count, queries] : std::vector<std::pair<int, int>>{{1, 1}, {3, 2}, {5, 4}, {8, 3}}) {

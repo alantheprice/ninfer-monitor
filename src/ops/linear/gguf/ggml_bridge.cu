@@ -874,10 +874,211 @@ void q8_0_mma_launch(VecArgs a, int columns, cudaStream_t stream) {
     }
 }
 
+// ---- Q6_K products on the int8 tensor cores ---------------------------------------------------
+// Inside a VectorQ6KMmaScope, a non-fused Q6_K product of 1..64 columns: block (16-row tile), four
+// warps each a fixed quarter of the 32-value chunks; a chunk's two 16-value sub-blocks (each its
+// own scale) one mma.sync m16n8k16 s8 each, their integer sums exact, scaled and combined in
+// integers, then d_w d_a times that in chunk order within the quarter and the quarters added in
+// order: an element's value depends on its row and column alone, the same at any column count.
+thread_local int g_vector_q6k_mma = 0;
+
+__device__ __forceinline__ void mma_s8_16816(int (&c)[4], std::uint32_t a0, std::uint32_t a1,
+                                             std::uint32_t b0) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(b0));
+}
+
+// Four signed 6-bit values of a Q6_K super-block (210 bytes: ql[128], qh[64], scales[16], d) as
+// s8 bytes: values l .. l + 3 of group g (0..3) of half n (0..1).
+__device__ __forceinline__ std::uint32_t q6k_word(const std::uint8_t* sb, int n, int g, int l) {
+    const std::uint32_t lo = mma_u32_a2(sb + n * 64 + 32 * (g & 1) + l);
+    const std::uint32_t hi = mma_u32_a2(sb + 128 + n * 32 + l);
+    const std::uint32_t v  = ((lo >> (4 * (g >> 1))) & 0x0F0F0F0Fu) | (((hi >> (2 * g)) & 0x03030303u) << 4);
+    return __vsub4(v, 0x20202020u);
+}
+
+// Block of kQ6Warps warps, warp w rows 16 w .. of the block's tile, every warp the whole K: per
+// super-block the block stages the columns' 256 activation bytes (and their scales) in shared
+// memory, each thread loads its two rows' 48 ql/qh bytes and 16 scales once, then the super-block's
+// eight 32-value chunks run in order.
+constexpr int kQ6Warps   = 4;
+constexpr int kQ6ActPad  = 65; // words a staged column takes (256 bytes + 4: no bank conflicts)
+
+template <int NT>
+__global__ void __launch_bounds__(kQ6Warps * 32) q6_k_mma_kernel(VecArgs p, int columns) {
+    ninfer::pdl::enter_streaming();
+    __shared__ std::uint32_t act[NT * 8][kQ6ActPad];
+    __shared__ float act_d[NT * 8][8];
+    int block = int(blockIdx.x);
+    const std::uint8_t* weight = p.weight;
+    std::int64_t row_bytes     = p.row_bytes;
+    int rows                   = p.rows;
+    const std::int8_t* act_qs  = p.qs;
+    const half2* act_ds        = p.ds;
+    VecStore out               = p.out;
+    if (p.more_count > 0) {
+        int seg = 0;
+        while (seg < p.more_count && block >= p.block_end[seg]) { ++seg; }
+        const int first = seg == 0 ? 0 : p.block_end[seg - 1];
+        block -= first;
+        if (seg > 0) {
+            weight    = p.more[seg - 1].weight;
+            row_bytes = p.more[seg - 1].row_bytes;
+            rows      = p.more[seg - 1].rows;
+            act_qs    = p.more[seg - 1].qs;
+            act_ds    = p.more[seg - 1].ds;
+            out       = p.more[seg - 1].out;
+        }
+    }
+    const int warp = int(threadIdx.x) >> 5, lane = int(threadIdx.x) & 31;
+    const int r = lane >> 2, q = lane & 3;
+    const int k = p.k, kb = k / 32, supers = k / 256;
+    const int row0 = block * (16 * kQ6Warps) + warp * 16;
+    const int ra = min(row0 + r, rows - 1), rb = min(row0 + r + 8, rows - 1);
+    const std::uint8_t* wa = weight + std::int64_t(ra) * row_bytes;
+    const std::uint8_t* wb = weight + std::int64_t(rb) * row_bytes;
+    float acc[NT][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i) { acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f; }
+    // Per super-block, this thread's weight bytes: per half n, ql words (g & 1, l) and qh words
+    // (l) of l = 4q and 16 + 4q, rows a and b; the scales and d. Prefetched a super-block ahead.
+    std::uint32_t pqla[2][2][2], pqlb[2][2][2], pqha[2][2], pqhb[2][2], psca[4], pscb[4];
+    float pdwa = 0.0f, pdwb = 0.0f;
+    const auto load_q6 = [&](int sb) {
+        const std::uint8_t* sa = wa + std::int64_t(sb) * 210;
+        const std::uint8_t* sbb = wb + std::int64_t(sb) * 210;
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int l = 16 * h + 4 * q;
+#pragma unroll
+                for (int g1 = 0; g1 < 2; ++g1) {
+                    pqla[n][g1][h] = mma_u32_a2(sa + n * 64 + 32 * g1 + l);
+                    pqlb[n][g1][h] = mma_u32_a2(sbb + n * 64 + 32 * g1 + l);
+                }
+                pqha[n][h] = mma_u32_a2(sa + 128 + n * 32 + l);
+                pqhb[n][h] = mma_u32_a2(sbb + 128 + n * 32 + l);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            psca[i] = mma_u32_a2(sa + 192 + 4 * i);
+            pscb[i] = mma_u32_a2(sbb + 192 + 4 * i);
+        }
+        pdwa = __half2float(*reinterpret_cast<const half*>(sa + 208));
+        pdwb = __half2float(*reinterpret_cast<const half*>(sbb + 208));
+    };
+    const auto copy_q6 = [&](auto& qla, auto& qlb, auto& qha, auto& qhb, auto& sca, auto& scb,
+                             float& dwa, float& dwb) {
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                qla[n][0][h] = pqla[n][0][h]; qla[n][1][h] = pqla[n][1][h];
+                qlb[n][0][h] = pqlb[n][0][h]; qlb[n][1][h] = pqlb[n][1][h];
+                qha[n][h] = pqha[n][h]; qhb[n][h] = pqhb[n][h];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { sca[i] = psca[i]; scb[i] = pscb[i]; }
+        dwa = pdwa;
+        dwb = pdwb;
+    };
+    load_q6(0);
+    for (int sb = 0; sb < supers; ++sb) {
+        // Stage the super-block's activations: NT * 8 columns of 64 words (columns past the
+        // call's repeat its last).
+        __syncthreads();
+        for (int i = int(threadIdx.x); i < NT * 8 * 64; i += kQ6Warps * 32) {
+            const int c = i >> 6, wd = i & 63;
+            const int col = min(c, columns - 1);
+            act[c][wd] = reinterpret_cast<const std::uint32_t*>(act_qs + std::int64_t(col) * k + 256 * sb)[wd];
+        }
+        for (int i = int(threadIdx.x); i < NT * 8 * 8; i += kQ6Warps * 32) {
+            const int c = i >> 3, j = i & 7;
+            act_d[c][j] = __low2float(act_ds[std::int64_t(min(c, columns - 1)) * kb + 8 * sb + j]);
+        }
+        // This super-block's weight words (loaded the iteration before), then the next one's.
+        std::uint32_t qla[2][2][2], qlb[2][2][2], qha[2][2], qhb[2][2], sca[4], scb[4];
+        float dwa, dwb;
+        copy_q6(qla, qlb, qha, qhb, sca, scb, dwa, dwb);
+        if (sb + 1 < supers) { load_q6(sb + 1); }
+        __syncthreads();
+#pragma unroll
+        for (int c8 = 0; c8 < 8; ++c8) {
+            const int n = c8 >> 2, g = c8 & 3;
+            const auto six = [&](std::uint32_t lo, std::uint32_t hi) {
+                const std::uint32_t v = ((lo >> (4 * (g >> 1))) & 0x0F0F0F0Fu) | (((hi >> (2 * g)) & 0x03030303u) << 4);
+                return __vsub4(v, 0x20202020u);
+            };
+            const std::uint32_t a_lo0 = six(qla[n][g & 1][0], qha[n][0]), a_lo1 = six(qlb[n][g & 1][0], qhb[n][0]);
+            const std::uint32_t a_hi0 = six(qla[n][g & 1][1], qha[n][1]), a_hi1 = six(qlb[n][g & 1][1], qhb[n][1]);
+            const int si = n * 8 + 2 * g; // scales si (l < 16) and si + 1
+            const int sa_lo = int(std::int8_t(sca[si >> 2] >> (8 * (si & 3))));
+            const int sa_hi = int(std::int8_t(sca[(si + 1) >> 2] >> (8 * ((si + 1) & 3))));
+            const int sb_lo = int(std::int8_t(scb[si >> 2] >> (8 * (si & 3))));
+            const int sb_hi = int(std::int8_t(scb[(si + 1) >> 2] >> (8 * ((si + 1) & 3))));
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const std::uint32_t* aq = act[nt * 8 + r] + 8 * c8;
+                int lo[4] = {0, 0, 0, 0}, hi[4] = {0, 0, 0, 0};
+                mma_s8_16816(lo, a_lo0, a_lo1, aq[q]);
+                mma_s8_16816(hi, a_hi0, a_hi1, aq[4 + q]);
+                const float da0 = act_d[nt * 8 + 2 * q][c8], da1 = act_d[nt * 8 + 2 * q + 1][c8];
+                const float c0 = float(sa_lo * lo[0] + sa_hi * hi[0]), c1 = float(sa_lo * lo[1] + sa_hi * hi[1]);
+                const float c2 = float(sb_lo * lo[2] + sb_hi * hi[2]), c3 = float(sb_lo * lo[3] + sb_hi * hi[3]);
+                acc[nt][0] = __fadd_rn(acc[nt][0], __fmul_rn(__fmul_rn(dwa, da0), c0));
+                acc[nt][1] = __fadd_rn(acc[nt][1], __fmul_rn(__fmul_rn(dwa, da1), c1));
+                acc[nt][2] = __fadd_rn(acc[nt][2], __fmul_rn(__fmul_rn(dwb, da0), c2));
+                acc[nt][3] = __fadd_rn(acc[nt][3], __fmul_rn(__fmul_rn(dwb, da1), c3));
+            }
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int row = row0 + r + 8 * (e >> 1), col = nt * 8 + 2 * q + (e & 1);
+            if (row < rows && col < columns) { vec_store(out, row, col, acc[nt][e]); }
+        }
+    }
+}
+
+void q6_k_mma_launch(VecArgs a, int columns, cudaStream_t stream) {
+    const auto tiles = [](int rows) { return (rows + 16 * kQ6Warps - 1) / (16 * kQ6Warps); };
+    int blocks = tiles(a.rows);
+    if (a.more_count > 0) {
+        a.block_end[0] = blocks;
+        for (int s = 0; s < a.more_count; ++s) {
+            blocks += tiles(a.more[s].rows);
+            a.block_end[s + 1] = blocks;
+        }
+    }
+    const ninfer::pdl::LaunchConfig config{dim3(blocks), dim3(kQ6Warps * 32), 0, stream};
+    switch ((columns + 7) / 8) {
+    case 1: (void)ninfer::pdl::launch_consumer(config, q6_k_mma_kernel<1>, a, columns); break;
+    case 2: (void)ninfer::pdl::launch_consumer(config, q6_k_mma_kernel<2>, a, columns); break;
+    case 3: (void)ninfer::pdl::launch_consumer(config, q6_k_mma_kernel<3>, a, columns); break;
+    case 4: (void)ninfer::pdl::launch_consumer(config, q6_k_mma_kernel<4>, a, columns); break;
+    case 5: (void)ninfer::pdl::launch_consumer(config, q6_k_mma_kernel<5>, a, columns); break;
+    case 6: (void)ninfer::pdl::launch_consumer(config, q6_k_mma_kernel<6>, a, columns); break;
+    case 7: (void)ninfer::pdl::launch_consumer(config, q6_k_mma_kernel<7>, a, columns); break;
+    default: (void)ninfer::pdl::launch_consumer(config, q6_k_mma_kernel<8>, a, columns); break;
+    }
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) {
+        throw std::runtime_error(std::string("q6_k mma product launch: ") + cudaGetErrorString(e));
+    }
+}
+
 } // namespace detail
 
 VectorMmaScope::VectorMmaScope() { ++detail::g_vector_mma; }
 VectorMmaScope::~VectorMmaScope() { --detail::g_vector_mma; }
+VectorQ6KMmaScope::VectorQ6KMmaScope() { ++detail::g_vector_q6k_mma; }
+VectorQ6KMmaScope::~VectorQ6KMmaScope() { --detail::g_vector_q6k_mma; }
 
 namespace {
 
@@ -906,6 +1107,10 @@ void vector_launch_sliced(GgmlType type, detail::VecArgs args, int columns, bool
     if (detail::g_vector_mma > 0 && type == GgmlType::Q8_0 && !fused && columns >= 1 &&
         columns <= 64 && args.k % 32 == 0) {
         return detail::q8_0_mma_launch(args, columns, stream);
+    }
+    if (detail::g_vector_q6k_mma > 0 && type == GgmlType::Q6_K && !fused && columns >= 1 &&
+        columns <= 64 && args.k % 256 == 0) {
+        return detail::q6_k_mma_launch(args, columns, stream);
     }
     const int step = vector_max_columns();
     if (columns <= step) { return detail::vector_launch(type)(args, columns, fused, stream); }

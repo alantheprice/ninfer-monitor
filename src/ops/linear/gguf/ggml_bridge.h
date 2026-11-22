@@ -107,6 +107,14 @@ struct VectorMmaScope {
     VectorMmaScope(const VectorMmaScope&)            = delete;
     VectorMmaScope& operator=(const VectorMmaScope&) = delete;
 };
+// The same for non-fused Q6_K products of 1..64 columns (an output head's: its logits then the
+// same for a row whatever rows run beside it).
+struct VectorQ6KMmaScope {
+    VectorQ6KMmaScope();
+    ~VectorQ6KMmaScope();
+    VectorQ6KMmaScope(const VectorQ6KMmaScope&)            = delete;
+    VectorQ6KMmaScope& operator=(const VectorQ6KMmaScope&) = delete;
+};
 
 void vector_product_segments(GgmlType type, int k, int columns, const VectorSegment* segments,
                              int count, cudaStream_t stream);

@@ -1157,8 +1157,9 @@ struct Executor::Impl {
         void* act      = workspace->alloc_bytes(gguf::vector_activation_bytes(w, b)).data;
         const int splits_sliding = 4;
         auto* partial = static_cast<float*>(workspace->alloc_bytes(
-            kernels::attention_workspace_floats(b, query_heads,
-                                                std::max(decode_splits_full, splits_sliding)) * 4).data);
+            kernels::attention_workspace_floats(
+                b, query_heads,
+                std::max({decode_splits_full, splits_sliding, span_full > 0 ? span_splits_full : 1})) * 4).data);
         for (const SparkLayer& l : d.layers) {
             kernels::rms_norm(h, l.attention_norm, hidden, b, deps, nullptr, stream, x.rows);
             vector_f32(x.base, l.query, b, qv, q);
@@ -1200,6 +1201,15 @@ struct Executor::Impl {
             aa.uniform     = true;
             aa.partial     = partial;
             aa.out_q       = attn.rows;
+            static const bool spark_dtc = [] {
+                const char* v = std::getenv("NINFER_INKLING_SPARK_DTC");
+                return v == nullptr || std::string(v) != "0";
+            }();
+            if (spark_dtc && l.cache.full && l.cache.ring == 0 && span_full > 0) {
+                // The full layers' blocks on the tensor cores, split at the verifier's spans.
+                aa.span   = span_full;
+                aa.splits = span_splits_full;
+            }
             kernels::attention(aa, stream);
             vector_f32(attn.base, l.output, b, y, hidden);
             kernels::add_rows(h, y, hidden, hidden, b, stream);
@@ -1226,7 +1236,11 @@ struct Executor::Impl {
             const Q8Act head_in = alloc_q8(hidden, head_rows);
             kernels::rms_norm(h + hidden, d.final_norm, hidden, head_rows, deps, nullptr, stream,
                               head_in.rows);
-            vector_f32(head_in.base, head, head_rows, base + vocab, vocab);
+            {
+                std::optional<gguf::VectorQ6KMmaScope> head_mma;
+                if (head_mma_enabled()) { head_mma.emplace(); }
+                vector_f32(head_in.base, head, head_rows, base + vocab, vocab);
+            }
         }
         auto* scratch = static_cast<float*>(
             workspace->alloc_bytes(kernels::spark_step_floats(vocab) * 4 * std::size_t(n)).data);
@@ -1900,6 +1914,16 @@ struct Executor::Impl {
     }
 
     // out[:, c] = W x_c for the q8_1 rows x: FP32 columns `column_stride` apart, from row `row`.
+    // The output head's Q6_K products on the tensor cores (NINFER_INKLING_HEAD_MMA=0: the vector
+    // kernel): a row's logits the same at any batch, 4-6x faster at verification widths.
+    static bool head_mma_enabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("NINFER_INKLING_HEAD_MMA");
+            return v == nullptr || std::string(v) != "0";
+        }();
+        return on;
+    }
+
     void vector_f32(const void* x, const Weight& w, int t, float* out, int column_stride,
                     int row = 0) {
         gguf::VectorOutput o;
@@ -2866,7 +2890,11 @@ struct Executor::Impl {
         }
         auto scope  = workspace->scope();
         auto* plane = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * vocab * 4).data);
-        vector_f32(x.base, head, t, plane, vocab);
+        {
+            std::optional<gguf::VectorQ6KMmaScope> head_mma;
+            if (head_mma_enabled()) { head_mma.emplace(); }
+            vector_f32(x.base, head, t, plane, vocab);
+        }
         kernels::softcap_bf16(plane + std::int64_t(t - rows) * vocab,
                               static_cast<__nv_bfloat16*>(logits_bf16.p),
                               std::int64_t(rows) * vocab, cap, stream);
