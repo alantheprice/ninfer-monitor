@@ -871,8 +871,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         throw std::logic_error("speculative pending batch has no ReplaySSM records");
     }
 
-    std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
+    std::array<ops::GdnReplayFoldRow, kMaximumFamilyConcurrency> fold_rows{};
+    std::array<std::int32_t, kMaximumFamilyConcurrency> hidden_selectors{};
     bool needs_hidden_correction = false;
     std::uint32_t record_width   = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -928,10 +928,10 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     // the round's features of the tokens before the hold are appended to it below, while the
     // round still has them. The image is the hybrid cache's checkpoint or, with the catalog, the
     // lane's own (stop_hold_slot).
-    std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> hold_rows{};
-    std::array<std::optional<HybridPendingTap>, kMaximumConcurrency> holds{};
-    std::array<std::optional<std::int32_t>, kMaximumConcurrency> hold_slots{};
-    std::array<std::uint32_t, kMaximumConcurrency> hold_columns{};
+    std::array<ops::GdnReplayFoldRow, kMaximumFamilyConcurrency> hold_rows{};
+    std::array<std::optional<HybridPendingTap>, kMaximumFamilyConcurrency> holds{};
+    std::array<std::optional<std::int32_t>, kMaximumFamilyConcurrency> hold_slots{};
+    std::array<std::uint32_t, kMaximumFamilyConcurrency> hold_columns{};
     std::size_t hold_span = 0;
     const bool mtp_holds  = speculative_backend == SpeculativeBackend::Mtp && io.mtp_decode;
     const bool draft_holds =
@@ -1077,9 +1077,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         // next round's submission rewrites; only that path needs the host to wait here.
         bool host_ingress_in_flight = false;
         if (is_masked_draft_backend(speculative_backend)) {
-            std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
-            std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
-            std::array<std::uint32_t, kMaximumConcurrency> append_counts{};
+            std::array<std::uint32_t, kMaximumFamilyConcurrency> append_lanes{};
+            std::array<std::uint32_t, kMaximumFamilyConcurrency> append_starts{};
+            std::array<std::uint32_t, kMaximumFamilyConcurrency> append_counts{};
             std::size_t append_size = 0;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 if (!cancelled[row] && terminal[row]) {
@@ -1113,10 +1113,10 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             // The hold images' draft context: the row's context, which ends at the round's base,
             // and the features of the tokens the image has read past it. The append goes through
             // the pinned ingress like a terminal row's, so the host waits for it as well.
-            std::array<std::uint32_t, kMaximumConcurrency> hold_lanes{};
-            std::array<std::uint32_t, kMaximumConcurrency> hold_starts{};
-            std::array<std::uint32_t, kMaximumConcurrency> hold_counts{};
-            std::array<std::int32_t, kMaximumConcurrency> hold_destinations{};
+            std::array<std::uint32_t, kMaximumFamilyConcurrency> hold_lanes{};
+            std::array<std::uint32_t, kMaximumFamilyConcurrency> hold_starts{};
+            std::array<std::uint32_t, kMaximumFamilyConcurrency> hold_counts{};
+            std::array<std::int32_t, kMaximumFamilyConcurrency> hold_destinations{};
             std::size_t hold_size = 0;
             for (std::size_t row = 0; row < hold_span; ++row) {
                 if (!hold_slots[row]) { continue; }
@@ -1874,7 +1874,7 @@ ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
     if (lanes.empty() || lanes.size() > max_concurrency) {
         throw std::invalid_argument("batched prefill needs one to max-concurrency lanes");
     }
-    std::array<PrefillBatchUnit, kMaximumConcurrency> units{};
+    std::array<PrefillBatchUnit, kMaximumFamilyConcurrency> units{};
     std::uint64_t seen     = 0;
     std::uint32_t columns  = 0;
     std::uint32_t segments = 0;
@@ -1905,7 +1905,7 @@ ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
             StateImageSelectors selectors{};
         };
 
-        std::array<LanePass, kMaximumConcurrency> passes{};
+        std::array<LanePass, kMaximumFamilyConcurrency> passes{};
         std::vector<execution::PrefillSegment> pass_segments;
         pass_segments.reserve(segments);
         std::int32_t column = 0;

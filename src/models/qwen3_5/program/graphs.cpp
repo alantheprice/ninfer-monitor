@@ -108,7 +108,7 @@ void ProgramImpl::prepare_graphs() {
     if (!use_cuda_graph) { return; }
     nvtx::ScopedRange prepare_range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
 
-    std::array<StateImageHandle, kMaximumConcurrency> capture_states{};
+    std::array<StateImageHandle, kMaximumFamilyConcurrency> capture_states{};
     for (std::uint32_t row = 0; row < max_concurrency; ++row) {
         std::optional<StateImageHandle> state = state_store->reserve_reset(compute_streams);
         if (!state) {

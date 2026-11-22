@@ -1067,13 +1067,13 @@ public:
     };
     std::unordered_map<std::string, GraftPrefixEntry> graft_prefix_slots;
     std::unordered_map<std::string, std::uint32_t> graft_rm_catalog_slots;
-    std::array<std::uint32_t, kMaximumConcurrency> active_continuations{};
+    std::array<std::uint32_t, kMaximumFamilyConcurrency> active_continuations{};
     // Overlay Vision residency only: the one-window broker and the per-lane pinned result slots.
     // Declared before `requests`, whose Vision sessions borrow both.
     std::optional<execution::VisionResidencyBroker> vision_broker;
     std::optional<execution::PinnedResultPool> vision_results;
-    std::array<RequestControl, kMaximumConcurrency> requests;
-    std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
+    std::array<RequestControl, kMaximumFamilyConcurrency> requests;
+    std::array<std::uint64_t, kMaximumFamilyConcurrency> lane_epochs{};
 
     // Declared before Graphs so all graph users die before the delivery tables and service.
     std::unique_ptr<execution::NativeExpertRuntime> experts;
@@ -1100,7 +1100,7 @@ public:
     // Engine commits it. The host copy of the device gather lands in logprobs_host, and
     // logprobs_armed mirrors the device flag that enables the gather, unknown after a resume.
     std::array<runtime::RawTokenLogprob,
-               kMaximumConcurrency * std::max(kMtpDecodeMaximumWidth, kDFlashVerifyMaximumWidth)>
+               kMaximumFamilyConcurrency * std::max(kMtpDecodeMaximumWidth, kDFlashVerifyMaximumWidth)>
         round_logprobs{};
     std::optional<PinnedHostBuffer> logprobs_host;
     std::optional<bool> logprobs_armed;
@@ -1205,8 +1205,8 @@ private:
 
     struct PendingTransaction {
         std::uint64_t id = 0;
-        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
-        std::array<std::uint64_t, kMaximumConcurrency> epochs{};
+        std::array<std::uint32_t, kMaximumFamilyConcurrency> lanes{};
+        std::array<std::uint64_t, kMaximumFamilyConcurrency> epochs{};
         std::size_t size = 0;
     };
 
@@ -1465,7 +1465,7 @@ private:
 
     // Hybrid prefix cache (null in Legacy mode).
     std::unique_ptr<HybridPrefixCache> hybrid_;
-    std::array<HybridLaneState, kMaximumConcurrency> hybrid_lanes_;
+    std::array<HybridLaneState, kMaximumFamilyConcurrency> hybrid_lanes_;
     runtime::prefix_cache::CacheCostModel hybrid_cost_;
     double hybrid_coalesce_wait_seconds_ = 0.0;
     std::filesystem::path hybrid_file_;
@@ -1555,7 +1555,7 @@ private:
         bool tail_hidden_valid           = false;
     };
     std::uint32_t stop_hold_slots_ = 0;
-    std::array<std::optional<StopHold>, kMaximumConcurrency> stop_holds_;
+    std::array<std::optional<StopHold>, kMaximumFamilyConcurrency> stop_holds_;
     // Drops the lane's hold and returns the pool slot a hold at `frontier` is written to, when
     // the lane keeps one.
     [[nodiscard]] std::optional<std::int32_t> stop_hold_slot(SequenceState& sequence,
@@ -1647,7 +1647,7 @@ private:
     };
 
     using ActiveExclusiveBaseline =
-        std::array<std::optional<ActiveExclusiveEntry>, kMaximumConcurrency>;
+        std::array<std::optional<ActiveExclusiveEntry>, kMaximumFamilyConcurrency>;
     [[nodiscard]] ActiveExclusiveBaseline active_exclusive_baseline() const noexcept;
     void credit_active_ownership_transfers(const ActiveExclusiveBaseline& baseline) noexcept;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
@@ -1934,7 +1934,7 @@ private:
     // Rows of the decode round whose sampled or licensed tokens left the public domain, in the
     // round's row order. wrap_pending reports them on the PendingBatch: the Engine ends those
     // requests and commits the other rows.
-    std::array<bool, kMaximumConcurrency> numerical_faults{};
+    std::array<bool, kMaximumFamilyConcurrency> numerical_faults{};
     // The drafts a lane's round may verify: none for a structured lane whose masks cost more than
     // a verification hides, so its round computes one mask for it.
     [[nodiscard]] static std::uint32_t speculative_extent(const RequestControl& request) noexcept;

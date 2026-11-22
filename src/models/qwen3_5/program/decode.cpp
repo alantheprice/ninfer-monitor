@@ -31,7 +31,7 @@ namespace {
 auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          ops::CausalAttentionExecutionEnvelope envelope) {
     return [&state, batch_size, envelope] {
-        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumFamilyConcurrency)) {
             throw std::logic_error("ordinary decode batch state is incomplete");
         }
 
@@ -276,7 +276,7 @@ std::int32_t ProgramImpl::arm_readout(std::span<const TokenId> ids) {
 void ProgramImpl::fetch_readout(std::int32_t count) {
     if (count <= 0) { return; }
     if (!readout_host) {
-        readout_host.emplace(kMaximumConcurrency * kMaximumReadoutTokens * sizeof(float));
+        readout_host.emplace(kMaximumFamilyConcurrency * kMaximumReadoutTokens * sizeof(float));
     }
     CUDA_CHECK(cudaMemcpyAsync(readout_host->data(), io.readout_values.data,
                                static_cast<std::size_t>(count) * sizeof(float),
@@ -760,9 +760,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     }
 
     std::uint32_t maximum_frontier = 0;
-    std::array<const MtpAdaptiveSignal*, kMaximumConcurrency> signals{};
-    std::array<std::uint32_t, kMaximumConcurrency> available{};
-    std::array<std::uint32_t, kMaximumConcurrency> room{};
+    std::array<const MtpAdaptiveSignal*, kMaximumFamilyConcurrency> signals{};
+    std::array<std::uint32_t, kMaximumFamilyConcurrency> available{};
+    std::array<std::uint32_t, kMaximumFamilyConcurrency> room{};
     std::uint64_t cohort_key = 1469598103934665603ULL;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
@@ -1035,8 +1035,8 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     if (masked_controller && !copy_round &&
         std::all_of(lanes.begin(), lanes.end(),
                     [this](std::uint32_t lane) { return lane < max_concurrency; })) {
-        std::array<const MaskedWidthSignal*, kMaximumConcurrency> signals{};
-        std::array<std::uint32_t, kMaximumConcurrency> room{};
+        std::array<const MaskedWidthSignal*, kMaximumFamilyConcurrency> signals{};
+        std::array<std::uint32_t, kMaximumFamilyConcurrency> room{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const SequenceState& sequence = active_sequence(lanes[row]);
             signals[row]                  = &requests[lanes[row]].masked_signal;

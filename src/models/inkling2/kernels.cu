@@ -6,13 +6,16 @@
 #include "models/inkling2/situ.h"
 #include "ops/common/mma.cuh"
 
+#include "core/pdl.cuh"
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <algorithm>
 #include <cfloat>
 #include <climits>
+#include <cstdlib>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -214,6 +217,7 @@ __device__ __forceinline__ float* history_slot(const History& h, int sequence, i
 __global__ void __launch_bounds__(kRowBlock)
     rms_norm_kernel(const float* __restrict__ x, const float* __restrict__ w, int hidden, float eps,
                     __nv_bfloat16* __restrict__ out, Q8Rows q8, float* f32) {
+    ninfer::pdl::enter();
     const int q = hidden >> 2, i = threadIdx.x;
     const std::int64_t row = std::int64_t(blockIdx.x) * hidden;
     const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -371,6 +375,7 @@ __device__ void mix_row(const MixArgs& a, int t, bool has_current, float4 curren
 }
 
 __global__ void __launch_bounds__(kRowBlock) mix_kernel(MixArgs a) {
+    ninfer::pdl::enter();
     mix_row(a, blockIdx.x, false, make_float4(0.0f, 0.0f, 0.0f, 0.0f));
 }
 
@@ -430,6 +435,7 @@ __device__ __forceinline__ float* split_mixed(const MixArgs& a, int q, int t) {
 }
 
 __global__ void __launch_bounds__(32) mix_split_terms_kernel(MixArgs a) {
+    ninfer::pdl::enter();
     const int w = int(blockIdx.x), t = int(blockIdx.y), i = 32 * w + int(threadIdx.x);
     const bool valid = i < (a.hidden >> 2);
     float4 s[kMaxStates], qv[kMaxQueries];
@@ -444,6 +450,7 @@ __global__ void __launch_bounds__(32) mix_split_terms_kernel(MixArgs a) {
 // raw mixes and, for normed outputs, the mixed rows and the warps' sums of their squares; the
 // second the normed outputs.
 __global__ void __launch_bounds__(32) mix_split_rows_kernel(MixArgs a, bool normed) {
+    ninfer::pdl::enter();
     const int w = int(blockIdx.x), t = int(blockIdx.y), i = 32 * w + int(threadIdx.x);
     const bool valid = i < (a.hidden >> 2);
     const int warps  = row_warps(a.hidden);
@@ -494,10 +501,13 @@ __device__ __forceinline__ void gemv_row(const float* __restrict__ w, const floa
         const auto* w4  = reinterpret_cast<const float4*>(wr);
         // The thread's quads i, i + 256, ... in order, the loads of up to kGemvAhead of them
         // issued before their products.
-        for (int i = threadIdx.x; i < quads; i += kGemvAhead * kGemvThreads) {
-            float4 wv[kGemvAhead], xv[kGemvAhead][N];
+        // Fewer loads in flight past 8 columns keep the registers; the products stay in order
+        // (quads i, i + 256, ... whatever the depth), so the sums do not change.
+        constexpr int kAhead = N > 8 ? 2 : kGemvAhead;
+        for (int i = threadIdx.x; i < quads; i += kAhead * kGemvThreads) {
+            float4 wv[kAhead], xv[kAhead][N];
 #pragma unroll
-            for (int a = 0; a < kGemvAhead; ++a) {
+            for (int a = 0; a < kAhead; ++a) {
                 const int at = i + a * kGemvThreads;
                 if (at >= quads) { continue; }
                 wv[a] = w4[at];
@@ -507,7 +517,7 @@ __device__ __forceinline__ void gemv_row(const float* __restrict__ w, const floa
                 }
             }
 #pragma unroll
-            for (int a = 0; a < kGemvAhead; ++a) {
+            for (int a = 0; a < kAhead; ++a) {
                 if (i + a * kGemvThreads >= quads) { continue; }
 #pragma unroll
                 for (int t = 0; t < N; ++t) { dot[t] += dot4(wv[a], xv[a][t]); }
@@ -538,6 +548,7 @@ template <int N>
 __global__ void gemv_kernel(const float* __restrict__ w, const float* __restrict__ x, int m, int k,
                             std::int64_t x_stride, float* __restrict__ out,
                             std::int64_t out_stride) {
+    ninfer::pdl::enter();
     gemv_row<N>(w, x, int(blockIdx.x), k, x_stride, out, out_stride);
 }
 
@@ -545,6 +556,7 @@ __global__ void gemv_kernel(const float* __restrict__ w, const float* __restrict
 template <int N>
 __global__ void gemv_batch_kernel(GemvBatch b, int k, std::int64_t x_stride,
                                   std::int64_t out_stride) {
+    ninfer::pdl::enter();
     const int e = int(blockIdx.y);
     gemv_row<N>(b.w[e], b.x[e], int(blockIdx.x), k, x_stride, b.out[e], out_stride);
 }
@@ -557,6 +569,7 @@ constexpr int kShortRows = kGemvThreads / 32; // output rows per block of the sh
 template <int N>
 __global__ void __launch_bounds__(kGemvThreads)
     gemv_short_kernel(GemvBatch b, int m, int k, std::int64_t x_stride, std::int64_t out_stride) {
+    ninfer::pdl::enter();
     const int e = int(blockIdx.y), lane = threadIdx.x & 31;
     const int row = int(blockIdx.x) * kShortRows + int(threadIdx.x >> 5);
     if (row >= m) { return; }
@@ -581,6 +594,7 @@ __global__ void __launch_bounds__(kGemvThreads)
 
 // Block (t, input): [rms(x); rms(message)] into concat.
 __global__ void __launch_bounds__(kRowBlock) control_inputs_kernel(ControlInputs a) {
+    ninfer::pdl::enter();
     const int t = blockIdx.x, c = blockIdx.y, i = threadIdx.x, quads = a.hidden >> 2;
     const std::int64_t row = std::int64_t(t) * a.hidden;
     const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -596,6 +610,7 @@ __global__ void __launch_bounds__(kRowBlock) control_inputs_kernel(ControlInputs
 
 // Block (t, input).
 __global__ void __launch_bounds__(kRowBlock) control_apply_kernel(ControlApply a) {
+    ninfer::pdl::enter();
     const int t = blockIdx.x, c = blockIdx.y, i = threadIdx.x, quads = a.hidden >> 2;
     const bool valid = i < quads;
     const std::int64_t row = std::int64_t(t) * a.hidden;
@@ -619,8 +634,7 @@ __global__ void __launch_bounds__(kRowBlock) control_apply_kernel(ControlApply a
 // ---- Attention inputs ---------------------------------------------------------------------------
 
 // Block (t, head) of 128 threads: Q's value d, and the relative feature's in the first 16.
-__global__ void query_post_kernel(QueryArgs a) {
-    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+__device__ __forceinline__ void query_post_body(const QueryArgs& a, int t, int h, int d) {
     const float* row = a.qgr + std::int64_t(t) * a.stride;
     float tau = 1.0f;
     if (a.log_scale) {
@@ -637,6 +651,11 @@ __global__ void query_post_kernel(QueryArgs a) {
     const float rn = sqrtf(warp_sum(r * r)) + 1e-6f;
     const float rf = fminf(1.0f, fmaxf(0.0f, a.rel_clip / rn));
     if (d < kRel) { a.r_out[(std::int64_t(t) * a.heads + h) * kRel + d] = r * rf * tau; }
+}
+
+__global__ void query_post_kernel(QueryArgs a) {
+    ninfer::pdl::enter();
+    query_post_body(a, int(blockIdx.x), int(blockIdx.y), int(threadIdx.x));
 }
 
 // The short convolution of channel c of row t over its site's raw inputs x (rows `stride` apart,
@@ -667,8 +686,7 @@ __device__ __forceinline__ float convolve(const Rows& rows, int t, const float* 
 }
 
 // Block (t, kv head) of 128 threads, channel d of the head.
-__global__ void kv_post_kernel(KvArgs a) {
-    const int t = blockIdx.x, kh = blockIdx.y, d = threadIdx.x;
+__device__ __forceinline__ void kv_post_body(const KvArgs& a, int t, int kh, int d) {
     const int c = kh * kD + d, v_column = a.kv_heads * kD + c;
     const bool dynamic = a.k_taps != nullptr;
     const float* k_taps = dynamic ? a.k_taps + std::int64_t(t) * a.taps_stride + kh * kTaps : nullptr;
@@ -711,6 +729,21 @@ __global__ void kv_post_kernel(KvArgs a) {
         const int p = a.rows.positions[t];
         history_slot(a.k_history, sequence, p)[c] = a.kv[std::int64_t(t) * a.kv_stride + c];
         history_slot(a.v_history, sequence, p)[c] = a.kv[std::int64_t(t) * a.kv_stride + v_column];
+    }
+}
+
+__global__ void kv_post_kernel(KvArgs a) {
+    ninfer::pdl::enter();
+    kv_post_body(a, int(blockIdx.x), int(blockIdx.y), int(threadIdx.x));
+}
+
+// query_post's blocks (y < heads) and kv_post's (the rest) in one launch: independent outputs.
+__global__ void qkv_post_kernel(QueryArgs q, KvArgs kv) {
+    ninfer::pdl::enter();
+    if (int(blockIdx.y) < q.heads) {
+        query_post_body(q, int(blockIdx.x), int(blockIdx.y), int(threadIdx.x));
+    } else {
+        kv_post_body(kv, int(blockIdx.x), int(blockIdx.y) - q.heads, int(threadIdx.x));
     }
 }
 
@@ -791,7 +824,8 @@ __device__ __forceinline__ bool sees(const AttentionArgs& a, int t, int key, int
 // The physical key positions [lo, hi] rows [t0, t1) read.
 __device__ __forceinline__ void key_range(const AttentionArgs& a, int t0, int t1, int& lo, int& hi) {
     if (a.uniform) {
-        hi = a.rows.positions[a.rows.tokens - 1];
+        // Blocks of eight rows, each one sequence's DSpark block: its last row's keys.
+        hi = a.rows.positions[min(a.rows.tokens, (t0 / 8) * 8 + 8) - 1];
         lo = a.window != 0 ? max(0, hi - a.window + 1) : 0;
         return;
     }
@@ -841,6 +875,7 @@ __device__ __forceinline__ bool split_keys(const AttentionArgs& a, int t0, int t
 template <int kRows, bool kFar = false>
 __global__ void __launch_bounds__(kRows == 1 ? 128 * kMaxRowGroup : 256)
     attention_kernel(AttentionArgs a) {
+    ninfer::pdl::enter();
     constexpr int kWarps = kRows == 1 ? 4 * kMaxRowGroup : 8;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int group   = a.query_heads / a.kv_heads;
@@ -1050,6 +1085,800 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 * kMaxRowGroup : 256)
     }
 }
 
+// ---- Prompt attention on the tensor cores --------------------------------------------------------
+// A prompt chunk without branches (rows at positions first + t, logical and physical alike) by
+// mma.sync m16n8k16 (F16 in, FP32 sums), FlashAttention-2 style. Block (32 rows, kv head) of
+// kGroup * 2 warps, warp (g, h) rows [16 g, 16 g + 16) of the group's head h; the block's tiles of
+// 32 keys and values pass through shared memory as F16 (an E4M3 cache's codes converted times
+// its scale), double-buffered. Scores run in the log2 domain. The relative bias of a tile within
+// `extent` of its rows is one more product, R (16 x 16) by the table rows of the 48 distances the
+// tile spans, gathered from the warp's shared scratch. Q and P round to F16 for the products: the
+// sums differ from attention_kernel's FP32 ones in the last bits.
+constexpr int kTcRows   = 16;              // rows a warp
+constexpr int kTcGroups = 2;               // row groups a block
+constexpr int kTcKeys   = 32;              // keys a tile
+constexpr int kTcSpan   = kTcKeys + kTcRows; // distances a tile spans for a warp's rows
+
+__device__ __forceinline__ std::uint32_t pack_half2(float x, float y) {
+    const __half2 h = __floats2half2_rn(x, y);
+    return *reinterpret_cast<const std::uint32_t*>(&h);
+}
+__device__ __forceinline__ void mma16816(float (&c)[4], const std::uint32_t (&a)[4], std::uint32_t b0,
+                                         std::uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+                 "{%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void ldsm_x4(std::uint32_t (&r)[4], const void* p) {
+    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(at));
+}
+__device__ __forceinline__ void ldsm_x4_t(std::uint32_t (&r)[4], const void* p) {
+    const unsigned at = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(at));
+}
+// Element offset of (key, 16-byte chunk c) in a [kTcKeys][kD] F16 tile, chunks XOR-swizzled by
+// key so ldmatrix's eight rows hit eight different bank groups.
+__device__ __forceinline__ int tc_at(int key, int c) { return key * kD + ((c ^ (key & 7)) << 3); }
+
+std::size_t attention_tc_smem(int group) {
+    return std::size_t(2 * 2 * kTcKeys * kD) * sizeof(__half) +
+           std::size_t(group * kTcGroups * kTcRows * kTcSpan) * sizeof(float);
+}
+
+// A launch's KV form: both planes F16, both MXFP8 (decoded when stored), or any (chunk_word).
+constexpr int kKvF16 = 0, kKvMxfp8 = 1, kKvAny = 2;
+
+__host__ int kv_mode(const AttentionArgs& a) {
+    if (a.k_plane.coding == KvCoding::F16 && a.v_plane.coding == KvCoding::F16) { return kKvF16; }
+    if (a.k_plane.coding == KvCoding::Mxfp8 && a.v_plane.coding == KvCoding::Mxfp8) { return kKvMxfp8; }
+    return kKvAny;
+}
+
+template <int kGroup, int kMode>
+__global__ void __launch_bounds__(kGroup * kTcGroups * 32) attention_tc_kernel(AttentionArgs a) {
+    ninfer::pdl::enter();
+    constexpr int kWarps   = kGroup * kTcGroups;
+    constexpr int kThreads = kWarps * 32;
+    extern __shared__ __align__(16) unsigned char tc_smem[];
+    __half* tiles = reinterpret_cast<__half*>(tc_smem); // [stage][K, V][kTcKeys][kD]
+    float* scratch = reinterpret_cast<float*>(tc_smem + std::size_t(2 * 2 * kTcKeys * kD) * sizeof(__half));
+    const int warp = int(threadIdx.x) >> 5, lane = int(threadIdx.x) & 31;
+    const int g = warp / kGroup, hq = warp % kGroup;
+    const int kv_head = int(blockIdx.y);
+    const int head    = kv_head * kGroup + hq;
+    const int T       = a.rows.tokens;
+    const int first   = a.rows.first;
+    // The longest blocks (latest rows) first.
+    const int t0  = (int(gridDim.x) - 1 - int(blockIdx.x)) * kTcRows * kTcGroups;
+    const int wt0 = t0 + g * kTcRows;
+    const int r = lane >> 2, q = lane & 3;
+    constexpr float kLog2e = 1.4426950408889634f;
+
+    const int block_last = min(T, t0 + kTcRows * kTcGroups) - 1;
+    const int lo = a.window != 0 ? max(0, first + t0 - a.window + 1) : 0;
+    const int hi = first + block_last;
+    const bool live = wt0 < T;
+    const int w_last = min(T - 1, wt0 + kTcRows - 1);
+    const int w_lo   = a.window != 0 ? max(0, first + wt0 - a.window + 1) : 0;
+    const int w_hi   = first + w_last;
+
+    // Q (16 rows x 128) as eight A fragments, times scale * log2(e); R likewise, times log2(e).
+    std::uint32_t qa[kD / 16][4];
+    std::uint32_t ra[4] = {0, 0, 0, 0};
+    {
+        const int ta = wt0 + r, tb = wt0 + r + 8;
+        const bool va = ta < T, vb = tb < T;
+        const float* qra = a.q + (std::int64_t(va ? ta : 0) * a.query_heads + head) * kD;
+        const float* qrb = a.q + (std::int64_t(vb ? tb : 0) * a.query_heads + head) * kD;
+        const float s = a.scale * kLog2e;
+#pragma unroll
+        for (int ks = 0; ks < kD / 16; ++ks) {
+            const int c = 16 * ks + 2 * q;
+            const float2 x0 = va ? *reinterpret_cast<const float2*>(qra + c) : make_float2(0, 0);
+            const float2 x1 = vb ? *reinterpret_cast<const float2*>(qrb + c) : make_float2(0, 0);
+            const float2 x2 = va ? *reinterpret_cast<const float2*>(qra + c + 8) : make_float2(0, 0);
+            const float2 x3 = vb ? *reinterpret_cast<const float2*>(qrb + c + 8) : make_float2(0, 0);
+            qa[ks][0] = pack_half2(x0.x * s, x0.y * s);
+            qa[ks][1] = pack_half2(x1.x * s, x1.y * s);
+            qa[ks][2] = pack_half2(x2.x * s, x2.y * s);
+            qa[ks][3] = pack_half2(x3.x * s, x3.y * s);
+        }
+        if (a.extent > 0) {
+            const float* rra = a.r + (std::int64_t(va ? ta : 0) * a.query_heads + head) * kRel;
+            const float* rrb = a.r + (std::int64_t(vb ? tb : 0) * a.query_heads + head) * kRel;
+            const float2 x0 = va ? *reinterpret_cast<const float2*>(rra + 2 * q) : make_float2(0, 0);
+            const float2 x1 = vb ? *reinterpret_cast<const float2*>(rrb + 2 * q) : make_float2(0, 0);
+            const float2 x2 = va ? *reinterpret_cast<const float2*>(rra + 2 * q + 8) : make_float2(0, 0);
+            const float2 x3 = vb ? *reinterpret_cast<const float2*>(rrb + 2 * q + 8) : make_float2(0, 0);
+            ra[0] = pack_half2(x0.x * kLog2e, x0.y * kLog2e);
+            ra[1] = pack_half2(x1.x * kLog2e, x1.y * kLog2e);
+            ra[2] = pack_half2(x2.x * kLog2e, x2.y * kLog2e);
+            ra[3] = pack_half2(x3.x * kLog2e, x3.y * kLog2e);
+        }
+    }
+
+    float o[kD / 8][4];
+#pragma unroll
+    for (int i = 0; i < kD / 8; ++i) { o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f; }
+    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+
+    const int sequence = row_sequence(a.rows, 0);
+    const std::int64_t base = std::int64_t(sequence) * a.seq_stride + std::int64_t(kv_head) * a.head_stride;
+    constexpr int kChunks = 2 * kTcKeys * (kD / 8);
+    constexpr int kPer    = (kChunks + kThreads - 1) / kThreads;
+    // Prefetch registers: F16 and decoded words (uint4), or, MXFP8, the raw codes (uint2) with
+    // their group exponents four to a word: a thread's chunks share their column (keeps the
+    // prefetch out of local memory).
+    constexpr bool kMx = kMode == kKvMxfp8;
+    uint4 raw[kMx ? 1 : kPer];
+    uint2 mxc[kMx ? kPer : 1];
+    std::uint32_t mxs[kMx ? (kPer + 3) / 4 : 1];
+    const auto fetch = [&](int tile) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int w = int(threadIdx.x) + i * kThreads;
+            if constexpr (kMx) {
+                mxc[i] = make_uint2(0, 0);
+                if (i % 4 == 0) { mxs[i / 4] = 0; }
+            } else {
+                raw[i] = make_uint4(0, 0, 0, 0);
+            }
+            if (w >= kChunks) { continue; }
+            const int matrix = w / (kTcKeys * (kD / 8));
+            const int rest   = w % (kTcKeys * (kD / 8));
+            const int key = rest / (kD / 8), c = rest % (kD / 8);
+            const int p   = tile + key;
+            if (p > hi) { continue; }
+            const int slot      = a.ring != 0 ? p % a.ring : p;
+            const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
+            if constexpr (kMode == kKvF16) {
+                const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
+                raw[i] = *reinterpret_cast<const uint4*>(cache + base + std::int64_t(slot) * kD + c * 8);
+            } else if constexpr (kMx) {
+                mxc[i] = *reinterpret_cast<const uint2*>(
+                    plane.codes + std::int64_t(sequence) * plane.code_seq +
+                    std::int64_t(kv_head) * plane.code_head + std::int64_t(slot) * plane.code_row + c * 8);
+                mxs[i / 4] |= std::uint32_t(plane.scales[std::int64_t(sequence) * plane.scale_seq +
+                                                        std::int64_t(kv_head) * plane.scale_head +
+                                                        std::int64_t(slot) * plane.scale_row + c / 4])
+                              << (8 * (i % 4));
+            } else if (plane.coding != KvCoding::F16) {
+                // A quantized plane's chunk decoded to eight F16 values.
+                raw[i] = chunk_word(plane,
+                                    plane.codes + std::int64_t(sequence) * plane.code_seq +
+                                        std::int64_t(kv_head) * plane.code_head +
+                                        std::int64_t(slot) * plane.code_row,
+                                    plane.scales + std::int64_t(sequence) * plane.scale_seq +
+                                        std::int64_t(kv_head) * plane.scale_head +
+                                        std::int64_t(slot) * plane.scale_row,
+                                    c);
+            } else {
+                const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
+                raw[i] = *reinterpret_cast<const uint4*>(cache + base + std::int64_t(slot) * kD + c * 8);
+            }
+        }
+    };
+    const auto store = [&](int stage) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int w = int(threadIdx.x) + i * kThreads;
+            if (w >= kChunks) { continue; }
+            const int matrix = w / (kTcKeys * (kD / 8));
+            const int rest   = w % (kTcKeys * (kD / 8));
+            const int key = rest / (kD / 8), c = rest % (kD / 8);
+            uint4 word;
+            if constexpr (kMx) {
+                const unsigned e = (mxs[i / 4] >> (8 * (i % 4))) & 0xFFu;
+                if (e >= 113u && e <= 142u) {
+                    // The scale 2^(e - 127) a normal FP16 power of two: code (exact in FP16)
+                    // times it is exact, the float decode's value.
+                    const __half2 sc = __half2half2(__ushort_as_half(
+                        static_cast<unsigned short>((e - 127u + 15u) << 10)));
+                    const std::uint32_t parts[2] = {mxc[i].x, mxc[i].y};
+                    __half2 h[4];
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(
+                            __nv_fp8x2_storage_t(parts[q / 2] >> (16 * (q % 2))), __NV_E4M3);
+                        h[q] = __hmul2(__half2(hr), sc);
+                    }
+                    word = *reinterpret_cast<const uint4*>(h);
+                } else {
+                    float f[8];
+                    ops::kv_row::Chunk<KvCoding::Mxfp8>::decode(mxc[i], std::uint8_t(e), f);
+                    word = ops::kv_row::pack8(f);
+                }
+            } else {
+                word = raw[i];
+            }
+            *reinterpret_cast<uint4*>(tiles + (stage * 2 + matrix) * kTcKeys * kD + tc_at(key, c)) = word;
+        }
+    };
+
+    float* bias = scratch + warp * kTcRows * kTcSpan;
+    if (lo <= hi) { fetch(lo); }
+    int stage = 0;
+    for (int tile = lo; tile <= hi; tile += kTcKeys, stage ^= 1) {
+        store(stage);
+        __syncthreads();
+        if (tile + kTcKeys <= hi) { fetch(tile + kTcKeys); }
+        if (!live || tile > w_hi || tile + kTcKeys - 1 < w_lo) { continue; }
+        const __half* ks_ = tiles + (stage * 2 + 0) * kTcKeys * kD;
+        const __half* vs_ = tiles + (stage * 2 + 1) * kTcKeys * kD;
+        // S = Q K^T: four n-tiles of eight keys.
+        float s[kTcKeys / 8][4];
+#pragma unroll
+        for (int i = 0; i < kTcKeys / 8; ++i) { s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f; }
+#pragma unroll
+        for (int ks = 0; ks < kD / 16; ++ks) {
+#pragma unroll
+            for (int np = 0; np < kTcKeys / 16; ++np) {
+                std::uint32_t b[4];
+                const int key = np * 16 + ((lane >> 4) << 3) + (lane & 7);
+                ldsm_x4(b, ks_ + tc_at(key, 2 * ks + ((lane >> 3) & 1)));
+                mma16816(s[2 * np], qa[ks], b[0], b[1]);
+                mma16816(s[2 * np + 1], qa[ks], b[2], b[3]);
+            }
+        }
+        // The relative bias of the distances [dmin, dmin + kTcSpan) this tile spans.
+        const int p0   = first + wt0;
+        const int dmin = p0 - (tile + kTcKeys - 1);
+        const bool biased = a.extent > 0 && p0 + kTcRows - 1 - tile >= 0 && dmin < a.extent;
+        if (biased) {
+#pragma unroll
+            for (int nt = 0; nt < kTcSpan / 8; ++nt) {
+                float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                const int d = dmin + nt * 8 + r;
+                std::uint32_t b0 = 0, b1 = 0;
+                if (d >= 0 && d < a.extent) {
+                    const float* row = a.table + std::int64_t(d) * kRel;
+                    const float2 x = *reinterpret_cast<const float2*>(row + 2 * q);
+                    const float2 y = *reinterpret_cast<const float2*>(row + 2 * q + 8);
+                    b0 = pack_half2(x.x, x.y);
+                    b1 = pack_half2(y.x, y.y);
+                }
+                mma16816(c, ra, b0, b1);
+                bias[r * kTcSpan + nt * 8 + 2 * q]           = c[0];
+                bias[r * kTcSpan + nt * 8 + 2 * q + 1]       = c[1];
+                bias[(r + 8) * kTcSpan + nt * 8 + 2 * q]     = c[2];
+                bias[(r + 8) * kTcSpan + nt * 8 + 2 * q + 1] = c[3];
+            }
+            __syncwarp();
+        }
+        float mx[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int nt = 0; nt < kTcKeys / 8; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int row = r + 8 * (e >> 1);
+                const int col = nt * 8 + 2 * q + (e & 1);
+                const int key = tile + col;
+                const int d   = p0 + row - key;
+                const bool visible = key <= hi && wt0 + row < T && d >= 0 &&
+                                     (a.window == 0 || d < a.window);
+                float v = s[nt][e];
+                if (biased && visible && d < a.extent) { v += bias[row * kTcSpan + row + kTcKeys - 1 - col]; }
+                s[nt][e] = visible ? v : -INFINITY;
+                mx[e >> 1] = fmaxf(mx[e >> 1], s[nt][e]);
+            }
+        }
+        if (biased) { __syncwarp(); }
+        float alpha[2];
+#pragma unroll
+        for (int h2 = 0; h2 < 2; ++h2) {
+            mx[h2] = fmaxf(mx[h2], __shfl_xor_sync(0xFFFFFFFFu, mx[h2], 1));
+            mx[h2] = fmaxf(mx[h2], __shfl_xor_sync(0xFFFFFFFFu, mx[h2], 2));
+            const float m_new = fmaxf(m[h2], mx[h2]);
+            alpha[h2] = m_new == -INFINITY ? 1.0f : exp2f(m[h2] - m_new);
+            m[h2]     = m_new;
+        }
+        float sum[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int nt = 0; nt < kTcKeys / 8; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float mm = m[e >> 1];
+                const float p  = mm == -INFINITY ? 0.0f : exp2f(s[nt][e] - mm);
+                s[nt][e] = p;
+                sum[e >> 1] += p;
+            }
+        }
+#pragma unroll
+        for (int h2 = 0; h2 < 2; ++h2) {
+            sum[h2] += __shfl_xor_sync(0xFFFFFFFFu, sum[h2], 1);
+            sum[h2] += __shfl_xor_sync(0xFFFFFFFFu, sum[h2], 2);
+            l[h2] = l[h2] * alpha[h2] + sum[h2];
+        }
+#pragma unroll
+        for (int i = 0; i < kD / 8; ++i) {
+            o[i][0] *= alpha[0];
+            o[i][1] *= alpha[0];
+            o[i][2] *= alpha[1];
+            o[i][3] *= alpha[1];
+        }
+        // O += P V.
+#pragma unroll
+        for (int kk = 0; kk < kTcKeys / 16; ++kk) {
+            const std::uint32_t pa[4] = {pack_half2(s[2 * kk][0], s[2 * kk][1]),
+                                         pack_half2(s[2 * kk][2], s[2 * kk][3]),
+                                         pack_half2(s[2 * kk + 1][0], s[2 * kk + 1][1]),
+                                         pack_half2(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+#pragma unroll
+            for (int np = 0; np < kD / 16; ++np) {
+                std::uint32_t b[4];
+                const int key = 16 * kk + (((lane >> 3) & 1) << 3) + (lane & 7);
+                ldsm_x4_t(b, vs_ + tc_at(key, 2 * np + (lane >> 4)));
+                mma16816(o[2 * np], pa, b[0], b[1]);
+                mma16816(o[2 * np + 1], pa, b[2], b[3]);
+            }
+        }
+    }
+    if (!live) { return; }
+    const int width = a.query_heads * kD;
+#pragma unroll
+    for (int h2 = 0; h2 < 2; ++h2) {
+        const int t       = wt0 + r + 8 * h2;
+        const bool row_ok = t < T;
+        const int tt      = row_ok ? t : 0;
+        const float sink  = a.sinks != nullptr ? a.sinks[std::int64_t(tt) * a.sink_stride + head] * kLog2e
+                                               : -INFINITY;
+        const float top = fmaxf(m[h2], sink);
+        const float w   = m[h2] == -INFINITY ? 0.0f : exp2f(m[h2] - top);
+        const float inv = 1.0f / (l[h2] * w + (sink == -INFINITY ? 0.0f : exp2f(sink - top)));
+        const float* gate = a.gate != nullptr ? a.gate + std::int64_t(tt) * a.gate_stride + head * kD : nullptr;
+        float y[kD / 8][2];
+#pragma unroll
+        for (int i = 0; i < kD / 8; ++i) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int dcol = i * 8 + 2 * q + e;
+                const float gv = gate != nullptr ? sigmoidf(gate[dcol]) : 1.0f;
+                y[i][e] = o[i][2 * h2 + e] * w * inv * gv;
+            }
+        }
+        if (a.out_q.qs != nullptr) {
+            // q8_1 blocks of 32 values: n-tiles 4b..4b+3, eight values a thread, the quad's four
+            // threads one block.
+#pragma unroll
+            for (int b = 0; b < kD / 32; ++b) {
+                float amax = 0.0f, total = 0.0f;
+#pragma unroll
+                for (int i = 4 * b; i < 4 * b + 4; ++i) {
+                    amax = fmaxf(amax, fmaxf(fabsf(y[i][0]), fabsf(y[i][1])));
+                    total += y[i][0] + y[i][1];
+                }
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 1));
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, 2));
+                total += __shfl_xor_sync(0xFFFFFFFFu, total, 1);
+                total += __shfl_xor_sync(0xFFFFFFFFu, total, 2);
+                if (!row_ok) { continue; }
+                const float dq = amax / 127.0f;
+#pragma unroll
+                for (int i = 4 * b; i < 4 * b + 4; ++i) {
+                    char2 c = make_char2(0, 0);
+                    if (amax != 0.0f) {
+                        c = make_char2(static_cast<signed char>(roundf(y[i][0] / dq)),
+                                       static_cast<signed char>(roundf(y[i][1] / dq)));
+                    }
+                    *reinterpret_cast<char2*>(a.out_q.qs + std::int64_t(t) * width + head * kD + i * 8 + 2 * q) = c;
+                }
+                if (q == 0) {
+                    a.out_q.ds[std::int64_t(t) * (width / 32) + (head * kD) / 32 + b] =
+                        make_half2(__float2half(dq), __float2half(total));
+                }
+            }
+        } else if (row_ok) {
+#pragma unroll
+            for (int i = 0; i < kD / 8; ++i) {
+                *reinterpret_cast<__nv_bfloat162*>(a.out + std::int64_t(t) * width + head * kD + i * 8 + 2 * q) =
+                    __floats2bfloat162_rn(y[i][0], y[i][1]);
+            }
+        }
+    }
+}
+
+// ---- Decode and verification attention on the tensor cores -----------------------------------
+// Span-split calls (AttentionArgs::span; 32-key tiles, spans multiples of 32): block (run of up to
+// eight rows of one sequence, kv head, split), its (row, head) pairs m = row * kGroup + head the
+// rows of two m16 tiles, one a warp. Every pair's arithmetic depends on its own row alone (each
+// mma output element sums its own row's products; tiles at fixed positions), so a row's partials
+// are the same in a decode call and in any verification run. Partials as attention_kernel's.
+constexpr int kDtKeys  = 32;
+constexpr int kDtWarps = 2;
+constexpr int kDtSpan  = kDtKeys + 8; // distances a tile spans for a run's rows
+
+std::size_t attention_dtc_smem() {
+    return std::size_t(2 * 2 * kDtKeys * kD) * sizeof(__half) +
+           std::size_t(kDtWarps * 16 * kDtSpan) * sizeof(float);
+}
+
+template <int kGroup, int kMode>
+__global__ void __launch_bounds__(kDtWarps * 32) attention_dtc_kernel(AttentionArgs a) {
+    ninfer::pdl::enter();
+    constexpr int kThreads = kDtWarps * 32;
+    extern __shared__ __align__(16) unsigned char dt_smem[];
+    __half* tiles  = reinterpret_cast<__half*>(dt_smem);
+    float* scratch = reinterpret_cast<float*>(dt_smem + std::size_t(2 * 2 * kDtKeys * kD) * sizeof(__half));
+    const int warp = int(threadIdx.x) >> 5, lane = int(threadIdx.x) & 31;
+    const int r = lane >> 2, q = lane & 3;
+    const int kv_head = int(blockIdx.y);
+    const int t0 = a.runs != nullptr ? a.runs[blockIdx.x] : int(blockIdx.x);
+    const int t1 = a.runs != nullptr ? a.runs[blockIdx.x + 1] : t0 + 1;
+    if (t0 >= t1) { return; }
+    const int pairs = (t1 - t0) * kGroup;
+    constexpr float kLog2e = 1.4426950408889634f;
+    int lo = 0, hi = 0;
+    key_range(a, t0, t1, lo, hi);
+    const int split = lo / a.span + int(blockIdx.z);
+    const int begin = max(split * a.span, lo & ~(kDtKeys - 1));
+    const int end   = min(hi + 1, (split + 1) * a.span);
+    if (begin >= end) { return; }
+    const int p_first = a.rows.positions[t0];
+
+    // This warp's pairs m0 + r and m0 + r + 8.
+    const int m0 = warp * 16;
+    const int ma = m0 + r, mb = m0 + r + 8;
+    const bool va = ma < pairs, vb = mb < pairs;
+    const int ta = t0 + (va ? ma / kGroup : 0), tb = t0 + (vb ? mb / kGroup : 0);
+    const int ha = kv_head * kGroup + (va ? ma % kGroup : 0), hb = kv_head * kGroup + (vb ? mb % kGroup : 0);
+    const int pa = a.rows.positions[ta], pb = a.rows.positions[tb];
+    const bool live = m0 < pairs;
+
+    std::uint32_t qa[kD / 16][4];
+    std::uint32_t ra[4] = {0, 0, 0, 0};
+    if (live) {
+        const float* qra = a.q + (std::int64_t(ta) * a.query_heads + ha) * kD;
+        const float* qrb = a.q + (std::int64_t(tb) * a.query_heads + hb) * kD;
+        const float s = a.scale * kLog2e;
+#pragma unroll
+        for (int ks = 0; ks < kD / 16; ++ks) {
+            const int c = 16 * ks + 2 * q;
+            const float2 x0 = va ? *reinterpret_cast<const float2*>(qra + c) : make_float2(0, 0);
+            const float2 x1 = vb ? *reinterpret_cast<const float2*>(qrb + c) : make_float2(0, 0);
+            const float2 x2 = va ? *reinterpret_cast<const float2*>(qra + c + 8) : make_float2(0, 0);
+            const float2 x3 = vb ? *reinterpret_cast<const float2*>(qrb + c + 8) : make_float2(0, 0);
+            qa[ks][0] = pack_half2(x0.x * s, x0.y * s);
+            qa[ks][1] = pack_half2(x1.x * s, x1.y * s);
+            qa[ks][2] = pack_half2(x2.x * s, x2.y * s);
+            qa[ks][3] = pack_half2(x3.x * s, x3.y * s);
+        }
+        if (a.extent > 0) {
+            const float* rra = a.r + (std::int64_t(ta) * a.query_heads + ha) * kRel;
+            const float* rrb = a.r + (std::int64_t(tb) * a.query_heads + hb) * kRel;
+            const float2 x0 = va ? *reinterpret_cast<const float2*>(rra + 2 * q) : make_float2(0, 0);
+            const float2 x1 = vb ? *reinterpret_cast<const float2*>(rrb + 2 * q) : make_float2(0, 0);
+            const float2 x2 = va ? *reinterpret_cast<const float2*>(rra + 2 * q + 8) : make_float2(0, 0);
+            const float2 x3 = vb ? *reinterpret_cast<const float2*>(rrb + 2 * q + 8) : make_float2(0, 0);
+            ra[0] = pack_half2(x0.x * kLog2e, x0.y * kLog2e);
+            ra[1] = pack_half2(x1.x * kLog2e, x1.y * kLog2e);
+            ra[2] = pack_half2(x2.x * kLog2e, x2.y * kLog2e);
+            ra[3] = pack_half2(x3.x * kLog2e, x3.y * kLog2e);
+        }
+    }
+    float o[kD / 8][4];
+#pragma unroll
+    for (int i = 0; i < kD / 8; ++i) { o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f; }
+    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+
+    const int sequence = row_sequence(a.rows, t0);
+    const std::int64_t base = std::int64_t(sequence) * a.seq_stride + std::int64_t(kv_head) * a.head_stride;
+    constexpr int kChunks = 2 * kDtKeys * (kD / 8);
+    constexpr int kPer    = kChunks / kThreads;
+    static_assert(kPer * kThreads == kChunks, "whole chunks a thread");
+    // Prefetch registers: F16 and decoded words (uint4), or, MXFP8, the raw codes (uint2) with
+    // their group exponents four to a word: a thread's chunks share their column (keeps the
+    // prefetch out of local memory).
+    constexpr bool kMx = kMode == kKvMxfp8;
+    uint4 raw[kMx ? 1 : kPer];
+    uint2 mxc[kMx ? kPer : 1];
+    // MXFP8: lane l's scale words (four group exponents) of the tile's key l, K then V.
+    std::uint32_t mx_kw = 0, mx_vw = 0;
+    static_assert(kDtKeys == 32 && kThreads == 64 && kPer == 16, "MXFP8 scale lanes: 32 keys, 2 warps");
+
+    const auto fetch = [&](int tile) {
+        if constexpr (kMx) {
+            const int p = tile + lane;
+            mx_kw = mx_vw = 0;
+            if (p < end) {
+                const int slot = a.ring != 0 ? p % a.ring : p;
+                const auto word = [&](const KvPlaneView& plane) {
+                    return *reinterpret_cast<const std::uint32_t*>(
+                        plane.scales + std::int64_t(sequence) * plane.scale_seq +
+                        std::int64_t(kv_head) * plane.scale_head + std::int64_t(slot) * plane.scale_row);
+                };
+                mx_kw = word(a.k_plane);
+                mx_vw = word(a.v_plane);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int w = int(threadIdx.x) + i * kThreads;
+            if constexpr (kMx) {
+                mxc[i] = make_uint2(0, 0);
+            } else {
+                raw[i] = make_uint4(0, 0, 0, 0);
+            }
+            const int matrix = w / (kDtKeys * (kD / 8));
+            const int rest   = w % (kDtKeys * (kD / 8));
+            const int key = rest / (kD / 8), c = rest % (kD / 8);
+            const int p   = tile + key;
+            if (p >= end) { continue; }
+            const int slot      = a.ring != 0 ? p % a.ring : p;
+            const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
+            if constexpr (kMode == kKvF16) {
+                const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
+                raw[i] = *reinterpret_cast<const uint4*>(cache + base + std::int64_t(slot) * kD + c * 8);
+            } else if constexpr (kMx) {
+                mxc[i] = *reinterpret_cast<const uint2*>(
+                    plane.codes + std::int64_t(sequence) * plane.code_seq +
+                    std::int64_t(kv_head) * plane.code_head + std::int64_t(slot) * plane.code_row + c * 8);
+            } else if (plane.coding != KvCoding::F16) {
+                // A quantized plane's chunk decoded to eight F16 values.
+                raw[i] = chunk_word(plane,
+                                    plane.codes + std::int64_t(sequence) * plane.code_seq +
+                                        std::int64_t(kv_head) * plane.code_head +
+                                        std::int64_t(slot) * plane.code_row,
+                                    plane.scales + std::int64_t(sequence) * plane.scale_seq +
+                                        std::int64_t(kv_head) * plane.scale_head +
+                                        std::int64_t(slot) * plane.scale_row,
+                                    c);
+            } else {
+                const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
+                raw[i] = *reinterpret_cast<const uint4*>(cache + base + std::int64_t(slot) * kD + c * 8);
+            }
+        }
+    };
+    const auto store = [&](int stage) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int w = int(threadIdx.x) + i * kThreads;
+            const int matrix = w / (kDtKeys * (kD / 8));
+            const int rest   = w % (kDtKeys * (kD / 8));
+            const int key = rest / (kD / 8), c = rest % (kD / 8);
+            uint4 word;
+            if constexpr (kMx) {
+                // Chunk i's row: matrix i / 8 (K then V), key (lane / 16 + 2 warp + 4 i) % 32.
+                const std::uint32_t words = __shfl_sync(0xFFFFFFFFu, i < kPer / 2 ? mx_kw : mx_vw, key);
+                const unsigned e = (words >> (8 * (c / 4))) & 0xFFu;
+                if (e >= 113u && e <= 142u) {
+                    // The scale 2^(e - 127) a normal FP16 power of two: code (exact in FP16)
+                    // times it is exact, the float decode's value.
+                    const __half2 sc = __half2half2(__ushort_as_half(
+                        static_cast<unsigned short>((e - 127u + 15u) << 10)));
+                    const std::uint32_t parts[2] = {mxc[i].x, mxc[i].y};
+                    __half2 h[4];
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(
+                            __nv_fp8x2_storage_t(parts[q / 2] >> (16 * (q % 2))), __NV_E4M3);
+                        h[q] = __hmul2(__half2(hr), sc);
+                    }
+                    word = *reinterpret_cast<const uint4*>(h);
+                } else {
+                    float f[8];
+                    ops::kv_row::Chunk<KvCoding::Mxfp8>::decode(mxc[i], std::uint8_t(e), f);
+                    word = ops::kv_row::pack8(f);
+                }
+            } else {
+                word = raw[i];
+            }
+            *reinterpret_cast<uint4*>(tiles + (stage * 2 + matrix) * kDtKeys * kD + tc_at(key, c)) = word;
+        }
+    };
+    float* bias = scratch + warp * 16 * kDtSpan;
+    fetch(begin);
+    int stage = 0;
+    for (int tile = begin; tile < end; tile += kDtKeys, stage ^= 1) {
+        store(stage);
+        __syncthreads();
+        if (tile + kDtKeys < end) { fetch(tile + kDtKeys); }
+        if (!live) { continue; }
+        const __half* ks_ = tiles + (stage * 2 + 0) * kDtKeys * kD;
+        const __half* vs_ = tiles + (stage * 2 + 1) * kDtKeys * kD;
+        float s[kDtKeys / 8][4];
+#pragma unroll
+        for (int i = 0; i < kDtKeys / 8; ++i) { s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f; }
+#pragma unroll
+        for (int ks = 0; ks < kD / 16; ++ks) {
+#pragma unroll
+            for (int np = 0; np < kDtKeys / 16; ++np) {
+                std::uint32_t b[4];
+                const int key = np * 16 + ((lane >> 4) << 3) + (lane & 7);
+                ldsm_x4(b, ks_ + tc_at(key, 2 * ks + ((lane >> 3) & 1)));
+                mma16816(s[2 * np], qa[ks], b[0], b[1]);
+                mma16816(s[2 * np + 1], qa[ks], b[2], b[3]);
+            }
+        }
+        // Relative bias: distances [dmin, dmin + kDtSpan) cover every pair's row on this tile.
+        const int dmin   = p_first - (tile + kDtKeys - 1);
+        const bool biased = a.extent > 0 && p_first + 7 - tile >= 0 && dmin < a.extent;
+        if (biased) {
+#pragma unroll
+            for (int nt = 0; nt < kDtSpan / 8; ++nt) {
+                float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                const int d = dmin + nt * 8 + r;
+                std::uint32_t b0 = 0, b1 = 0;
+                if (d >= 0 && d < a.extent) {
+                    const float* row = a.table + std::int64_t(d) * kRel;
+                    const float2 x = *reinterpret_cast<const float2*>(row + 2 * q);
+                    const float2 y = *reinterpret_cast<const float2*>(row + 2 * q + 8);
+                    b0 = pack_half2(x.x, x.y);
+                    b1 = pack_half2(y.x, y.y);
+                }
+                mma16816(c, ra, b0, b1);
+                bias[r * kDtSpan + nt * 8 + 2 * q]           = c[0];
+                bias[r * kDtSpan + nt * 8 + 2 * q + 1]       = c[1];
+                bias[(r + 8) * kDtSpan + nt * 8 + 2 * q]     = c[2];
+                bias[(r + 8) * kDtSpan + nt * 8 + 2 * q + 1] = c[3];
+            }
+            __syncwarp();
+        }
+        float mx[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int nt = 0; nt < kDtKeys / 8; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int hrow = e >> 1;
+                const int p    = hrow ? pb : pa;
+                const bool ok  = hrow ? vb : va;
+                const int col  = nt * 8 + 2 * q + (e & 1);
+                const int key  = tile + col;
+                const int d    = p - key;
+                const bool visible = ok && key < end && d >= 0 && (a.window == 0 || d < a.window);
+                float v = s[nt][e];
+                if (biased && visible && d < a.extent) {
+                    v += bias[(r + 8 * hrow) * kDtSpan + (d - dmin)];
+                }
+                s[nt][e] = visible ? v : -INFINITY;
+                mx[hrow] = fmaxf(mx[hrow], s[nt][e]);
+            }
+        }
+        if (biased) { __syncwarp(); }
+        float alpha[2];
+#pragma unroll
+        for (int h2 = 0; h2 < 2; ++h2) {
+            mx[h2] = fmaxf(mx[h2], __shfl_xor_sync(0xFFFFFFFFu, mx[h2], 1));
+            mx[h2] = fmaxf(mx[h2], __shfl_xor_sync(0xFFFFFFFFu, mx[h2], 2));
+            const float m_new = fmaxf(m[h2], mx[h2]);
+            alpha[h2] = m_new == -INFINITY ? 1.0f : exp2f(m[h2] - m_new);
+            m[h2]     = m_new;
+        }
+        float sum[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int nt = 0; nt < kDtKeys / 8; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float mm = m[e >> 1];
+                const float p  = mm == -INFINITY ? 0.0f : exp2f(s[nt][e] - mm);
+                s[nt][e] = p;
+                sum[e >> 1] += p;
+            }
+        }
+#pragma unroll
+        for (int h2 = 0; h2 < 2; ++h2) {
+            sum[h2] += __shfl_xor_sync(0xFFFFFFFFu, sum[h2], 1);
+            sum[h2] += __shfl_xor_sync(0xFFFFFFFFu, sum[h2], 2);
+            l[h2] = l[h2] * alpha[h2] + sum[h2];
+        }
+#pragma unroll
+        for (int i = 0; i < kD / 8; ++i) {
+            o[i][0] *= alpha[0];
+            o[i][1] *= alpha[0];
+            o[i][2] *= alpha[1];
+            o[i][3] *= alpha[1];
+        }
+#pragma unroll
+        for (int kk = 0; kk < kDtKeys / 16; ++kk) {
+            const std::uint32_t pa4[4] = {pack_half2(s[2 * kk][0], s[2 * kk][1]),
+                                          pack_half2(s[2 * kk][2], s[2 * kk][3]),
+                                          pack_half2(s[2 * kk + 1][0], s[2 * kk + 1][1]),
+                                          pack_half2(s[2 * kk + 1][2], s[2 * kk + 1][3])};
+#pragma unroll
+            for (int np = 0; np < kD / 16; ++np) {
+                std::uint32_t b[4];
+                const int key = 16 * kk + (((lane >> 3) & 1) << 3) + (lane & 7);
+                ldsm_x4_t(b, vs_ + tc_at(key, 2 * np + (lane >> 4)));
+                mma16816(o[2 * np], pa4, b[0], b[1]);
+                mma16816(o[2 * np + 1], pa4, b[2], b[3]);
+            }
+        }
+    }
+    if (!live) { return; }
+    // Partials of each valid pair: [B][Hq][splits] rows of D, then (m, l) pairs; a row's splits
+    // from its own first key's.
+    const std::int64_t prow = std::int64_t(a.rows.tokens) * a.query_heads * a.splits;
+#pragma unroll
+    for (int h2 = 0; h2 < 2; ++h2) {
+        const bool ok = h2 ? vb : va;
+        if (!ok) { continue; }
+        const int t = h2 ? tb : ta, head = h2 ? hb : ha, p = h2 ? pb : pa;
+        const int row_lo = a.window != 0 ? max(0, p - a.window + 1) : 0;
+        const int local  = split - row_lo / a.span;
+        if (local < 0 || split > p / a.span) { continue; }
+        const std::int64_t row = (std::int64_t(t) * a.query_heads + head) * a.splits + local;
+#pragma unroll
+        for (int i = 0; i < kD / 8; ++i) {
+            *reinterpret_cast<float2*>(a.partial + row * kD + i * 8 + 2 * q) =
+                make_float2(o[i][2 * h2], o[i][2 * h2 + 1]);
+        }
+        if (q == 0) {
+            // The combine's maxima are natural-log units; the sums are the same in either.
+            a.partial[prow * kD + 2 * row]     = m[h2] == -INFINITY ? -INFINITY : m[h2] * 0.6931471805599453f;
+            a.partial[prow * kD + 2 * row + 1] = l[h2];
+        }
+    }
+}
+
+template <int kGroup, int kMode>
+void launch_attention_dtc_mode(const AttentionArgs& args, unsigned blocks, cudaStream_t stream) {
+    const std::size_t smem = attention_dtc_smem();
+    static const bool configured = [&] {
+        CUDA_CHECK(cudaFuncSetAttribute(attention_dtc_kernel<kGroup, kMode>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)));
+        return true;
+    }();
+    (void)configured;
+    (void)ninfer::pdl::launch_consumer(
+        ninfer::pdl::LaunchConfig{dim3(blocks, args.kv_heads, args.splits), dim3(kDtWarps * 32), smem, stream},
+        attention_dtc_kernel<kGroup, kMode>, args);
+}
+
+template <int kGroup>
+void launch_attention_dtc(const AttentionArgs& args, unsigned blocks, cudaStream_t stream) {
+    switch (kv_mode(args)) {
+    case kKvF16: return launch_attention_dtc_mode<kGroup, kKvF16>(args, blocks, stream);
+    case kKvMxfp8: return launch_attention_dtc_mode<kGroup, kKvMxfp8>(args, blocks, stream);
+    default: return launch_attention_dtc_mode<kGroup, kKvAny>(args, blocks, stream);
+    }
+}
+
+// NINFER_INKLING_DTC_ATTENTION=0 keeps span-split calls on the FP32 attention kernels.
+bool dtc_attention_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_INKLING_DTC_ATTENTION");
+        return v == nullptr || std::string(v) != "0";
+    }();
+    return on;
+}
+
+template <int kGroup, int kMode>
+void launch_attention_tc_mode(const AttentionArgs& args, cudaStream_t stream) {
+    const std::size_t smem = attention_tc_smem(kGroup);
+    static const bool configured = [&] {
+        CUDA_CHECK(cudaFuncSetAttribute(attention_tc_kernel<kGroup, kMode>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)));
+        return true;
+    }();
+    (void)configured;
+    const int rows_a_block = kTcRows * kTcGroups;
+    (void)ninfer::pdl::launch_consumer(
+        ninfer::pdl::LaunchConfig{dim3((args.rows.tokens + rows_a_block - 1) / rows_a_block, args.kv_heads, 1),
+                                  dim3(kGroup * kTcGroups * 32), smem, stream},
+        attention_tc_kernel<kGroup, kMode>, args);
+}
+
+template <int kGroup>
+void launch_attention_tc(const AttentionArgs& args, cudaStream_t stream) {
+    switch (kv_mode(args)) {
+    case kKvF16: return launch_attention_tc_mode<kGroup, kKvF16>(args, stream);
+    case kKvMxfp8: return launch_attention_tc_mode<kGroup, kKvMxfp8>(args, stream);
+    default: return launch_attention_tc_mode<kGroup, kKvAny>(args, stream);
+    }
+}
+
+// NINFER_INKLING_TC_ATTENTION=0 keeps prompt chunks on attention_kernel<8> (FP32 sums).
+bool tc_attention_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_INKLING_TC_ATTENTION");
+        return v == nullptr || std::string(v) != "0";
+    }();
+    return on;
+}
+
 // Block (head, row): merges the splits of one query head and its sink, thread d the output's
 // dimension d. Every split counts with weight exp(m_s - M), the sink as a key without a value:
 // M = max(max_s m_s, sink), l = sum_s l_s exp(m_s - M) + exp(sink - M). Thread d also holds the
@@ -1058,13 +1887,15 @@ constexpr int kCombineThreads = kD;
 constexpr int kMaxSplits      = 4 * kCombineThreads;
 
 __global__ void attention_combine_kernel(AttentionArgs a) {
+    ninfer::pdl::enter();
     const int head = blockIdx.x, t = blockIdx.y;
     const int d    = threadIdx.x;
     const std::int64_t rows  = std::int64_t(a.rows.tokens) * a.query_heads * a.splits;
     const std::int64_t first = (std::int64_t(t) * a.query_heads + head) * a.splits;
     int lo = 0, hi = 0;
     key_range(a, t, t + 1, lo, hi);
-    const int active = active_splits(hi + 1 - lo, a.splits);
+    const int active = a.span > 0 && !a.uniform ? hi / a.span - lo / a.span + 1
+                                                : active_splits(hi + 1 - lo, a.splits);
     __shared__ float weight[kMaxSplits];
     __shared__ float max_s, inv_l;
     float ms[kMaxSplits / kCombineThreads];
@@ -1380,6 +2211,7 @@ __device__ __forceinline__ float4 residual_quad(const ResidualArgs& a, int t, in
 }
 
 __global__ void __launch_bounds__(kRowBlock) residual_kernel(ResidualArgs a) {
+    ninfer::pdl::enter();
     const int t = blockIdx.x;
     const float4 cur = residual_quad(a, t, int(threadIdx.x));
     if (a.mix.query_count > 0) { mix_row(a.mix, t, true, cur); }
@@ -1388,6 +2220,7 @@ __global__ void __launch_bounds__(kRowBlock) residual_kernel(ResidualArgs a) {
 // Block (w, t) of a split call: the update of warp w's quads of row t and their sums of its mix,
 // whose other states and queries load before the update.
 __global__ void __launch_bounds__(32) residual_split_kernel(ResidualArgs a) {
+    ninfer::pdl::enter();
     const int w = int(blockIdx.x), t = int(blockIdx.y), i = 32 * w + int(threadIdx.x);
     const MixArgs& m = a.mix;
     const bool valid = i < (a.hidden >> 2);
@@ -1411,6 +2244,7 @@ __global__ void __launch_bounds__(32) residual_split_kernel(ResidualArgs a) {
 __global__ void keep_history_kernel(const float* __restrict__ x, std::int64_t stride, int channels,
                                     const std::int32_t* __restrict__ positions, int begin,
                                     History h, int sequence) {
+    ninfer::pdl::enter();
     const int t = begin + blockIdx.x;
     float* slot = history_slot(h, sequence, positions[t]);
     for (int c = threadIdx.x; c < channels; c += blockDim.x) {
@@ -1420,6 +2254,7 @@ __global__ void keep_history_kernel(const float* __restrict__ x, std::int64_t st
 
 // Block per row of [begin, end): its product into its history slot.
 __global__ void __launch_bounds__(kRowBlock) keep_products_kernel(ResidualArgs a, int begin) {
+    ninfer::pdl::enter();
     const int t = begin + blockIdx.x, i = threadIdx.x;
     if (i >= a.hidden / 4) { return; }
     reinterpret_cast<float4*>(
@@ -1433,6 +2268,7 @@ constexpr int kRouteThreads = 256; // at least the experts
 // Block per row: thread e the expert. The top_k by p + bias, lower id first: expert e is chosen
 // k-th when k experts precede it in that order.
 __global__ void route_kernel(RouteArgs a) {
+    ninfer::pdl::enter();
     const int t = blockIdx.x, e = threadIdx.x;
     __shared__ float selections[kRouteThreads];
     __shared__ int chosen[8];
@@ -1472,36 +2308,47 @@ __global__ void route_kernel(RouteArgs a) {
 // route_kernel picks them, then the pairs grouped by expert, each expert's in row order. An expert
 // holds at most 8 pairs, so it fills one column tile of every width.
 constexpr int kRouteTileWidths = 4;
-__global__ void __launch_bounds__(kSortedRouteRows * kSortedRouteExperts)
+// The block holds up to kSortedRouteBlockRows rows of threads; each thread takes rows t,
+// t + kSortedRouteBlockRows, ... of up to kSortedRouteRows.
+__global__ void __launch_bounds__(kSortedRouteBlockRows * kSortedRouteExperts)
     route_sorted_kernel(RouteArgs a) {
+    ninfer::pdl::enter();
     constexpr int E = kSortedRouteExperts;
-    const int t = int(threadIdx.x) / E, e = int(threadIdx.x) % E;
+    const int tt = int(threadIdx.x) / E, e = int(threadIdx.x) % E;
+    const int row_step = int(blockDim.x) / E;
     __shared__ float selections[kSortedRouteRows][E];
-    __shared__ int pick[kSortedRouteRows][E]; // the choice's k, -1 when not chosen
+    __shared__ float probs[kSortedRouteRows][E];
+    __shared__ std::int8_t pick[kSortedRouteRows][E]; // the choice's k, -1 when not chosen
     __shared__ int chosen[kSortedRouteRows][8];
     __shared__ float chosen_p[kSortedRouteRows][8];
     __shared__ int warp_total[E / 32];
     const bool expert = e < a.experts;
-    const float logit = expert ? a.logits[std::int64_t(t) * a.experts + e] : 0.0f;
-    const float p     = sigmoidf(logit);
-    const float selection = expert ? p + a.bias[e] : -INFINITY;
-    selections[t][e]      = selection;
-    __syncthreads();
-    int rank = -1;
-    if (expert) {
-        int r = 0;
-        for (int j = 0; j < a.experts; ++j) {
-            const float other = selections[t][j];
-            r += other > selection || (other == selection && j < e) ? 1 : 0;
-        }
-        if (r < a.top_k) {
-            rank           = r;
-            chosen[t][r]   = e;
-            chosen_p[t][r] = p;
-        }
+    for (int t = tt; t < a.tokens; t += row_step) {
+        const float logit = expert ? a.logits[std::int64_t(t) * a.experts + e] : 0.0f;
+        const float p     = sigmoidf(logit);
+        probs[t][e]       = p;
+        selections[t][e]  = expert ? p + a.bias[e] : -INFINITY;
     }
-    pick[t][e] = rank;
     __syncthreads();
+    for (int t = tt; t < a.tokens; t += row_step) {
+        const float selection = selections[t][e];
+        int rank = -1;
+        if (expert) {
+            int r = 0;
+            for (int j = 0; j < a.experts; ++j) {
+                const float other = selections[t][j];
+                r += other > selection || (other == selection && j < e) ? 1 : 0;
+            }
+            if (r < a.top_k) {
+                rank           = r;
+                chosen[t][r]   = e;
+                chosen_p[t][r] = probs[t][e];
+            }
+        }
+        pick[t][e] = std::int8_t(rank);
+    }
+    __syncthreads();
+    for (int t = tt; t < a.tokens; t += row_step) {
     if (e < a.top_k) {
         float sum = 0.0f;
         for (int j = 0; j < a.top_k; ++j) { sum += chosen_p[t][j]; }
@@ -1513,16 +2360,17 @@ __global__ void __launch_bounds__(kSortedRouteRows * kSortedRouteExperts)
         a.weights[at]    = w;
         a.pair_scale[at] = a.gate_up_scale != nullptr ? a.gate_up_scale[x] : 1.0f;
     }
+    }
     // Row 0's threads, expert e each: its pairs, then exclusive scans of the pairs (low half) and
     // of the experts with any (high half) over the experts.
     int count = 0;
-    if (t == 0) {
+    if (tt == 0) {
         for (int r = 0; r < a.tokens; ++r) { count += pick[r][e] >= 0 ? 1 : 0; }
     }
     const int packed = count | (count > 0 ? 1 << 16 : 0);
     int inclusive    = packed;
     const int lane = e & 31, warp = e >> 5;
-    if (t == 0) {
+    if (tt == 0) {
 #pragma unroll
         for (int o = 1; o < 32; o <<= 1) {
             const int v = __shfl_up_sync(0xFFFFFFFFu, inclusive, o);
@@ -1531,7 +2379,7 @@ __global__ void __launch_bounds__(kSortedRouteRows * kSortedRouteExperts)
         if (lane == 31) { warp_total[warp] = inclusive; }
     }
     __syncthreads();
-    if (t != 0) { return; }
+    if (tt != 0) { return; }
     int offset = 0, total = 0;
 #pragma unroll
     for (int w = 0; w < E / 32; ++w) {
@@ -1566,6 +2414,7 @@ constexpr int kSituThreads = 128;
 __global__ void situ_rows_kernel(const float* __restrict__ gu, std::int64_t stride, int width,
                                  const float* __restrict__ pair_scale, float gate_cap, float up_cap,
                                  __nv_bfloat16* __restrict__ out) {
+    ninfer::pdl::enter();
     const std::int64_t p = blockIdx.x;
     const int r          = int(blockIdx.y) * kSituThreads + int(threadIdx.x);
     if (r >= width) { return; }
@@ -1673,6 +2522,7 @@ __global__ void bf16_rows_f32_kernel(const __nv_bfloat16* __restrict__ table, in
 }
 
 __global__ void softcap_kernel(const float* in, __nv_bfloat16* out, std::int64_t n, float cap) {
+    ninfer::pdl::enter();
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) { out[i] = __float2bfloat16(cap * tanhf(in[i] / cap)); }
 }
@@ -1680,6 +2530,7 @@ __global__ void softcap_kernel(const float* in, __nv_bfloat16* out, std::int64_t
 // Block (part, row): every 256th logit of the row from the part's first.
 __global__ void softcap_rows_kernel(const float* in, std::int64_t in_stride, __nv_bfloat16* out,
                                     std::int64_t out_stride, int width, float cap) {
+    ninfer::pdl::enter();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= width) { return; }
     const std::int64_t r = blockIdx.y;
@@ -1687,18 +2538,21 @@ __global__ void softcap_rows_kernel(const float* in, std::int64_t in_stride, __n
 }
 
 __global__ void f32_to_bf16_kernel(const float* in, __nv_bfloat16* out, std::int64_t n) {
+    ninfer::pdl::enter();
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) { out[i] = __float2bfloat16(in[i]); }
 }
 
 __global__ void place_rows_kernel(const __nv_bfloat16* __restrict__ rows, std::int64_t n,
                                   float* __restrict__ h) {
+    ninfer::pdl::enter();
     const std::int64_t k = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (k < n) { h[k] = __bfloat162float(rows[k]); }
 }
 
 // Block (position, head): the position's K and V rows, 16-byte words.
 __global__ void ring_copy_kernel(RingCopyArgs a) {
+    ninfer::pdl::enter();
     const int p = a.begin + blockIdx.x, h = blockIdx.y;
     const std::int64_t src = h * a.src_head_stride + std::int64_t(p % a.src_ring) * kD;
     const std::int64_t dst = h * a.dst_head_stride + std::int64_t(p % a.dst_ring) * kD;
@@ -1710,6 +2564,7 @@ __global__ void ring_copy_kernel(RingCopyArgs a) {
 
 __global__ void add_fixed_kernel(unsigned long long* sums, const unsigned long long* products,
                                  const std::int32_t* flag, std::int64_t n) {
+    ninfer::pdl::enter();
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n || *flag == 0) { return; }
     sums[i] += products[i];
@@ -1719,6 +2574,7 @@ __global__ void add_fixed_kernel(unsigned long long* sums, const unsigned long l
 
 // Block (row): every mix of the row, thread i its values 4i..4i+3.
 __global__ void __launch_bounds__(kRowBlock) spark_mix_kernel(SparkMixArgs a) {
+    ninfer::pdl::enter();
     const int t = a.begin + int(blockIdx.x);
     const int q = a.hidden >> 2, i = threadIdx.x;
     const bool valid = i < q;
@@ -1755,6 +2611,7 @@ __global__ void __launch_bounds__(kRowBlock) spark_mix_kernel(SparkMixArgs a) {
 
 // Block (row, head) of 128 threads, thread d the head's value d.
 __global__ void spark_rotate_kernel(SparkRotateArgs a) {
+    ninfer::pdl::enter();
     const int t = a.begin + int(blockIdx.x), h = blockIdx.y, d = threadIdx.x;
     float* row = a.x + std::int64_t(t) * a.stride + a.column;
     const float v   = row[h * kD + d];
@@ -1786,6 +2643,7 @@ __global__ void spark_rotate_kernel(SparkRotateArgs a) {
 
 __global__ void add_rows_kernel(float* h, const float* y, std::int64_t y_stride, int hidden,
                                 std::int64_t n) {
+    ninfer::pdl::enter();
     const std::int64_t at = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at >= n) { return; }
     const std::int64_t t = at / hidden, c = at % hidden;
@@ -1793,6 +2651,7 @@ __global__ void add_rows_kernel(float* h, const float* y, std::int64_t y_stride,
 }
 
 __global__ void silu_mul_kernel(const float* gu, int width, std::int64_t n, __nv_bfloat16* out) {
+    ninfer::pdl::enter();
     const std::int64_t at = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at >= n) { return; }
     const std::int64_t t = at / width, c = at % width;
@@ -1802,8 +2661,13 @@ __global__ void silu_mul_kernel(const float* gu, int width, std::int64_t n, __nv
 
 constexpr int kSparkRank     = 256;
 constexpr int kSparkPartials = 256;
+// A lane's step scratch (spark_step_floats): joint, logits, partials.
+__host__ __device__ constexpr std::int64_t spark_scratch(int vocab) {
+    return std::int64_t(3 * kSparkRank) + vocab + 3 * kSparkPartials;
+}
 
 __global__ void spark_table_kernel(const float* p, std::int64_t n, __nv_bfloat16* m, float* c) {
+    ninfer::pdl::enter();
     const std::int64_t at = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at >= n * (kSparkRank + 1)) { return; }
     const std::int64_t v = at / (kSparkRank + 1), r = at % (kSparkRank + 1);
@@ -1816,6 +2680,7 @@ __global__ void spark_table_kernel(const float* p, std::int64_t n, __nv_bfloat16
 
 __global__ void spark_head_inputs_kernel(const float* hidden_out, const float* bias, int hidden,
                                          int rank, float* out) {
+    ninfer::pdl::enter();
     const std::int64_t at = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at >= std::int64_t(rank + 1) * hidden) { return; }
     const std::int64_t r = at / hidden, k = at % hidden;
@@ -1825,44 +2690,63 @@ __global__ void spark_head_inputs_kernel(const float* hidden_out, const float* b
 // Block of eight warps, warp w output 8 blockIdx.x + w of the joint projection; the block's input
 // vector in shared memory.
 __global__ void __launch_bounds__(256) spark_joint_kernel(SparkStepArgs a) {
+    ninfer::pdl::enter();
     extern __shared__ float x[];
     const int k = 2 * kSparkRank + 2 * a.hidden_size;
-    const int prev = *a.prev;
-    const int sequence = a.sequences[0];
-    const int slot = (a.positions[0] - 1 + a.slots) % a.slots;
-    const float* context = a.ring + std::int64_t(sequence) * a.seq_stride +
-                           std::int64_t(slot) * a.hidden_size;
-    const float* hidden = a.hidden + std::int64_t(a.row) * a.hidden_size;
-    for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        float v = 0.0f;
-        if (i < kSparkRank) {
-            v = a.state[i];
-        } else if (i < 2 * kSparkRank) {
-            v = __bfloat162float(a.embed[std::int64_t(prev) * kSparkRank + i - kSparkRank]);
-        } else if (i < 2 * kSparkRank + a.hidden_size) {
-            v = hidden[i - 2 * kSparkRank];
-        } else {
-            v = context[i - 2 * kSparkRank - a.hidden_size];
+    const std::int64_t scratch = spark_scratch(a.vocab);
+    for (int j = 0; j < a.lanes; ++j) {
+        const int r0   = j * a.block;
+        const int prev = a.prev[j];
+        const int sequence = a.sequences[r0];
+        const int slot = (a.positions[r0] - 1 + a.slots) % a.slots;
+        const float* context = a.ring + std::int64_t(sequence) * a.seq_stride +
+                               std::int64_t(slot) * a.hidden_size;
+        const float* hidden = a.hidden + std::int64_t(r0 + a.row) * a.hidden_size;
+        const float* state  = a.state + j * kSparkRank;
+        for (int i = threadIdx.x; i < k; i += blockDim.x) {
+            float v = 0.0f;
+            if (i < kSparkRank) {
+                v = state[i];
+            } else if (i < 2 * kSparkRank) {
+                v = __bfloat162float(a.embed[std::int64_t(prev) * kSparkRank + i - kSparkRank]);
+            } else if (i < 2 * kSparkRank + a.hidden_size) {
+                v = hidden[i - 2 * kSparkRank];
+            } else {
+                v = context[i - 2 * kSparkRank - a.hidden_size];
+            }
+            x[j * k + i] = v;
         }
-        x[i] = v;
     }
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int o    = blockIdx.x * 8 + warp;
     if (o >= 3 * kSparkRank) { return; }
     const float4* w  = reinterpret_cast<const float4*>(a.weight + std::int64_t(o) * k);
-    const float4* x4 = reinterpret_cast<const float4*>(x);
-    float sum = 0.0f;
-    for (int i = lane; i < k / 4; i += 32) { sum += dot4(w[i], x4[i]); }
-    sum = warp_sum(sum);
-    if (lane == 0) { a.joint[o] = sum + a.bias[o]; }
+    float sum[kSparkMaxLanes] = {};
+    for (int i = lane; i < k / 4; i += 32) {
+        const float4 wi = w[i];
+#pragma unroll
+        for (int j = 0; j < kSparkMaxLanes; ++j) {
+            if (j < a.lanes) { sum[j] += dot4(wi, reinterpret_cast<const float4*>(x + j * k)[i]); }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < kSparkMaxLanes; ++j) {
+        if (j >= a.lanes) { break; }
+        const float total = warp_sum(sum[j]);
+        if (lane == 0) { a.joint[j * scratch + o] = total + a.bias[o]; }
+    }
 }
 
 // Block of eight warps, warp w vocabulary row 8 blockIdx.x + w: its soft-capped logit.
 __global__ void __launch_bounds__(256) spark_logits_kernel(SparkStepArgs a) {
-    __shared__ float latent[kSparkRank];
-    for (int r = threadIdx.x; r < kSparkRank; r += blockDim.x) {
-        latent[r] = tanhf(a.joint[2 * kSparkRank + r]);
+    ninfer::pdl::enter();
+    __shared__ float latent[kSparkMaxLanes][kSparkRank];
+    const std::int64_t scratch = spark_scratch(a.vocab);
+    for (int j = 0; j < a.lanes; ++j) {
+        for (int r = threadIdx.x; r < kSparkRank; r += blockDim.x) {
+            latent[j][r] = tanhf(a.joint[j * scratch + 2 * kSparkRank + r]);
+        }
     }
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -1870,16 +2754,20 @@ __global__ void __launch_bounds__(256) spark_logits_kernel(SparkStepArgs a) {
     if (v >= a.vocab) { return; }
     const uint4 word = reinterpret_cast<const uint4*>(a.m + v * kSparkRank)[lane];
     const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&word);
-    float dot = 0.0f;
+    const float cv = a.c[v];
+    for (int j = 0; j < a.lanes; ++j) {
+        float dot = 0.0f;
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const float2 f = __bfloat1622float2(pairs[j]);
-        dot += f.x * latent[8 * lane + 2 * j] + f.y * latent[8 * lane + 2 * j + 1];
-    }
-    dot = warp_sum(dot);
-    if (lane == 0) {
-        const float logit = a.base[std::int64_t(a.row) * a.vocab_stride + v] + a.c[v] + dot;
-        a.logits[v]       = a.cap * tanhf(logit * (1.0f / a.cap));
+        for (int q = 0; q < 4; ++q) {
+            const float2 f = __bfloat1622float2(pairs[q]);
+            dot += f.x * latent[j][8 * lane + 2 * q] + f.y * latent[j][8 * lane + 2 * q + 1];
+        }
+        dot = warp_sum(dot);
+        if (lane == 0) {
+            const float logit =
+                a.base[std::int64_t(j * a.block + a.row) * a.vocab_stride + v] + cv + dot;
+            (a.joint + j * scratch + 3 * kSparkRank)[v] = a.cap * tanhf(logit * (1.0f / a.cap));
+        }
     }
 }
 
@@ -1930,11 +2818,16 @@ __device__ Pick block_pick(Pick p) {
 }
 
 __global__ void __launch_bounds__(256) spark_pick_partials_kernel(SparkStepArgs a) {
+    ninfer::pdl::enter();
+    const int j = blockIdx.y;
+    const std::int64_t scratch = spark_scratch(a.vocab);
+    const float* logits = a.joint + j * scratch + 3 * kSparkRank;
+    float* partials     = a.joint + j * scratch + 3 * kSparkRank + a.vocab;
     const int per = (a.vocab + kSparkPartials - 1) / kSparkPartials;
     const int lo = blockIdx.x * per, hi = min(a.vocab, lo + per);
     Pick p;
     for (int v = lo + threadIdx.x; v < hi; v += blockDim.x) {
-        const float x = a.logits[v];
+        const float x = logits[v];
         if (x > p.top) {
             p.sum   = p.sum * expf(p.top - x) + 1.0f;
             p.top   = x;
@@ -1945,28 +2838,34 @@ __global__ void __launch_bounds__(256) spark_pick_partials_kernel(SparkStepArgs 
     }
     p = block_pick(p);
     if (threadIdx.x == 0) {
-        a.partials[3 * blockIdx.x]     = p.top;
-        a.partials[3 * blockIdx.x + 1] = __int_as_float(p.index);
-        a.partials[3 * blockIdx.x + 2] = p.sum;
+        partials[3 * blockIdx.x]     = p.top;
+        partials[3 * blockIdx.x + 1] = __int_as_float(p.index);
+        partials[3 * blockIdx.x + 2] = p.sum;
     }
 }
 
 __global__ void __launch_bounds__(kSparkPartials) spark_pick_final_kernel(SparkStepArgs a) {
+    ninfer::pdl::enter();
+    const int j = blockIdx.x;
+    const std::int64_t scratch = spark_scratch(a.vocab);
+    const float* joint    = a.joint + j * scratch;
+    const float* partials = joint + 3 * kSparkRank + a.vocab;
+    float* state          = a.state + j * kSparkRank;
     Pick p;
     const int b = threadIdx.x;
-    p.top   = a.partials[3 * b];
-    p.index = __float_as_int(a.partials[3 * b + 1]);
-    p.sum   = a.partials[3 * b + 2];
+    p.top   = partials[3 * b];
+    p.index = __float_as_int(partials[3 * b + 1]);
+    p.sum   = partials[3 * b + 2];
     p       = block_pick(p);
     if (threadIdx.x == 0) {
-        *a.prev                   = p.index;
-        a.drafts[a.row - 1]       = p.index;
-        a.confidence[a.row - 1]   = 1.0f / p.sum;
+        a.prev[j]                               = p.index;
+        a.drafts[j * a.block + a.row - 1]       = p.index;
+        a.confidence[j * a.block + a.row - 1]   = 1.0f / p.sum;
     }
     for (int r = threadIdx.x; r < kSparkRank; r += blockDim.x) {
-        const float gate      = sigmoidf(a.joint[r]);
-        const float candidate = tanhf(a.joint[kSparkRank + r]);
-        a.state[r]            = candidate + gate * (a.state[r] - candidate);
+        const float gate      = sigmoidf(joint[r]);
+        const float candidate = tanhf(joint[kSparkRank + r]);
+        state[r]              = candidate + gate * (state[r] - candidate);
     }
 }
 
@@ -1981,7 +2880,7 @@ void check_mix(const MixArgs& a) {
 void rms_norm(const float* x, const float* w, int hidden, int tokens, float eps,
               __nv_bfloat16* out, cudaStream_t stream, Q8Rows q, float* f32) {
     if (tokens <= 0) { return; }
-    rms_norm_kernel<<<tokens, row_threads(hidden), 0, stream>>>(x, w, hidden, eps, out, q, f32);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(tokens), dim3(row_threads(hidden)), std::size_t(0), stream}, rms_norm_kernel, x, w, hidden, eps, out, q, f32);
     check_launch("rms_norm");
 }
 
@@ -1999,11 +2898,11 @@ void mix_split_rows(const MixArgs& a, cudaStream_t stream) {
     const dim3 grid(unsigned(row_warps(a.hidden)), unsigned(a.tokens));
     const bool normed = a.out != nullptr || a.out_q.qs != nullptr || a.f32 != nullptr;
     if (a.raw != nullptr || normed) {
-        mix_split_rows_kernel<<<grid, 32, 0, stream>>>(a, false);
+        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(grid), dim3(32), std::size_t(0), stream}, mix_split_rows_kernel, a, false);
         check_launch("mix_split_rows");
     }
     if (normed) {
-        mix_split_rows_kernel<<<grid, 32, 0, stream>>>(a, true);
+        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(grid), dim3(32), std::size_t(0), stream}, mix_split_rows_kernel, a, true);
         check_launch("mix_split_rows");
     }
 }
@@ -2015,36 +2914,62 @@ void mix(const MixArgs& args, cudaStream_t stream) {
     row_threads(args.hidden);
     if (args.tokens <= 0 || args.query_count == 0) { return; }
     if (split_mix(args)) {
-        mix_split_terms_kernel<<<dim3(unsigned(row_warps(args.hidden)), unsigned(args.tokens)), 32,
-                                 0, stream>>>(args);
+        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(unsigned(row_warps(args.hidden)), unsigned(args.tokens))), dim3(32), std::size_t(0), stream}, mix_split_terms_kernel, args);
         check_launch("mix_split_terms");
         mix_split_rows(args, stream);
         return;
     }
-    mix_kernel<<<args.tokens, row_threads(args.hidden), 0, stream>>>(args);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(args.tokens), dim3(row_threads(args.hidden)), std::size_t(0), stream}, mix_kernel, args);
     check_launch("mix");
 }
 
+// f(std::integral_constant<int, n>) for n in 1..16.
+template <class F> void with_columns(int n, F&& f) {
+    switch (n) {
+    case 1: return f(std::integral_constant<int, 1>{});
+    case 2: return f(std::integral_constant<int, 2>{});
+    case 3: return f(std::integral_constant<int, 3>{});
+    case 4: return f(std::integral_constant<int, 4>{});
+    case 5: return f(std::integral_constant<int, 5>{});
+    case 6: return f(std::integral_constant<int, 6>{});
+    case 7: return f(std::integral_constant<int, 7>{});
+    case 8: return f(std::integral_constant<int, 8>{});
+    case 9: return f(std::integral_constant<int, 9>{});
+    case 10: return f(std::integral_constant<int, 10>{});
+    case 11: return f(std::integral_constant<int, 11>{});
+    case 12: return f(std::integral_constant<int, 12>{});
+    case 13: return f(std::integral_constant<int, 13>{});
+    case 14: return f(std::integral_constant<int, 14>{});
+    case 15: return f(std::integral_constant<int, 15>{});
+    default: return f(std::integral_constant<int, 16>{});
+    }
+}
+
+// vector_call: a decode call (the vector path's rows), whose 9..32 columns take the GEMV forms so a
+// row's sums do not depend on its batch; prompt chunks keep cuBLAS past 8 columns.
 void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, cudaStream_t stream,
-              std::int64_t x_stride, std::int64_t out_stride) {
+              std::int64_t x_stride, std::int64_t out_stride, bool vector_call) {
     if (m <= 0 || n <= 0) { return; }
     if (x_stride == 0) { x_stride = k; }
     if (out_stride == 0) { out_stride = m; }
-    if (n <= kGemvRows) {
-        const auto gemv = [&](auto tokens) {
-            gemv_kernel<decltype(tokens)::value>
-                <<<m, kGemvThreads, 0, stream>>>(w, x, m, k, x_stride, out, out_stride);
-        };
-        switch (n) {
-        case 1: gemv(std::integral_constant<int, 1>{}); break;
-        case 2: gemv(std::integral_constant<int, 2>{}); break;
-        case 3: gemv(std::integral_constant<int, 3>{}); break;
-        case 4: gemv(std::integral_constant<int, 4>{}); break;
-        case 5: gemv(std::integral_constant<int, 5>{}); break;
-        case 6: gemv(std::integral_constant<int, 6>{}); break;
-        case 7: gemv(std::integral_constant<int, 7>{}); break;
-        default: gemv(std::integral_constant<int, 8>{}); break;
+    if (vector_call && n > 2 * kGemvRows) {
+        // Past 16 columns: launches of at most 16 (the matrix is small; its later reads come from
+        // L2). Each column's sums are those of a narrower call.
+        const int parts = (n + 2 * kGemvRows - 1) / (2 * kGemvRows);
+        for (int i = 0, c0 = 0; i < parts; ++i) {
+            const int cols = (n - c0 + (parts - i) - 1) / (parts - i);
+            gemm_f32(m, cols, k, w, x + std::int64_t(c0) * x_stride, out + std::int64_t(c0) * out_stride,
+                     stream, x_stride, out_stride, true);
+            c0 += cols;
         }
+        return;
+    }
+    if (n <= kGemvRows || (vector_call && n <= 2 * kGemvRows)) {
+        // Up to 16 columns (a decode call of 16 lanes) in one launch; each column's sums are those
+        // of a narrower call.
+        with_columns(n, [&](auto tokens) {
+            (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(m), dim3(kGemvThreads), std::size_t(0), stream}, gemv_kernel<decltype(tokens)::value>, w, x, m, k, x_stride, out, out_stride);
+        });
         check_launch("gemv");
         return;
     }
@@ -2057,12 +2982,28 @@ void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, c
 }
 
 void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t stream,
-                    std::int64_t x_stride, std::int64_t out_stride) {
+                    std::int64_t x_stride, std::int64_t out_stride, bool vector_call) {
     if (batch.count < 0 || batch.count > kMaxGemvBatch) {
         throw std::invalid_argument("inkling2 gemm_f32_batch: at most 8 products");
     }
     if (m <= 0 || n <= 0 || batch.count == 0) { return; }
-    if (n > kGemvRows) {
+    if (x_stride == 0) { x_stride = k; }
+    if (out_stride == 0) { out_stride = m; }
+    if (vector_call && n > 2 * kGemvRows) {
+        const int parts = (n + 2 * kGemvRows - 1) / (2 * kGemvRows);
+        for (int i = 0, c0 = 0; i < parts; ++i) {
+            const int cols = (n - c0 + (parts - i) - 1) / (parts - i);
+            GemvBatch part = batch;
+            for (int e = 0; e < batch.count; ++e) {
+                part.x[e]   = batch.x[e] + std::int64_t(c0) * x_stride;
+                part.out[e] = batch.out[e] + std::int64_t(c0) * out_stride;
+            }
+            gemm_f32_batch(m, cols, k, part, stream, x_stride, out_stride, true);
+            c0 += cols;
+        }
+        return;
+    }
+    if (n > (vector_call ? 2 * kGemvRows : kGemvRows)) {
         for (int e = 0; e < batch.count; ++e) {
             gemm_f32(m, n, k, batch.w[e], batch.x[e], batch.out[e], stream, x_stride, out_stride);
         }
@@ -2074,47 +3015,45 @@ void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t st
     const auto launch = [&](auto tokens) {
         constexpr int N = decltype(tokens)::value;
         if (short_k) {
-            gemv_short_kernel<N><<<dim3(blocks_for(m, kShortRows), unsigned(batch.count)),
-                                   kGemvThreads, 0, stream>>>(batch, m, k, x_stride, out_stride);
+            (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(blocks_for(m, kShortRows), unsigned(batch.count))), dim3(kGemvThreads), std::size_t(0), stream}, gemv_short_kernel<N>, batch, m, k, x_stride, out_stride);
         } else {
-            gemv_batch_kernel<N><<<dim3(unsigned(m), unsigned(batch.count)), kGemvThreads, 0,
-                                   stream>>>(batch, k, x_stride, out_stride);
+            (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(unsigned(m), unsigned(batch.count))), dim3(kGemvThreads), std::size_t(0), stream}, gemv_batch_kernel<N>, batch, k, x_stride, out_stride);
         }
     };
-    switch (n) {
-    case 1: launch(std::integral_constant<int, 1>{}); break;
-    case 2: launch(std::integral_constant<int, 2>{}); break;
-    case 3: launch(std::integral_constant<int, 3>{}); break;
-    case 4: launch(std::integral_constant<int, 4>{}); break;
-    case 5: launch(std::integral_constant<int, 5>{}); break;
-    case 6: launch(std::integral_constant<int, 6>{}); break;
-    case 7: launch(std::integral_constant<int, 7>{}); break;
-    default: launch(std::integral_constant<int, 8>{}); break;
-    }
+    with_columns(n, launch);
     check_launch("gemv_batch");
 }
 
 void control_inputs(const ControlInputs& args, cudaStream_t stream) {
     if (args.count <= 0 || args.tokens <= 0) { return; }
-    control_inputs_kernel<<<dim3(args.tokens, args.count), row_threads(args.hidden), 0, stream>>>(args);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(args.tokens, args.count)), dim3(row_threads(args.hidden)), std::size_t(0), stream}, control_inputs_kernel, args);
     check_launch("control_inputs");
 }
 
 void control_apply(const ControlApply& args, cudaStream_t stream) {
     if (args.count <= 0 || args.tokens <= 0) { return; }
-    control_apply_kernel<<<dim3(args.tokens, args.count), row_threads(args.hidden), 0, stream>>>(args);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(args.tokens, args.count)), dim3(row_threads(args.hidden)), std::size_t(0), stream}, control_apply_kernel, args);
     check_launch("control_apply");
 }
 
 void query_post(const QueryArgs& args, cudaStream_t stream) {
     if (args.tokens <= 0) { return; }
-    query_post_kernel<<<dim3(args.tokens, args.heads), kD, 0, stream>>>(args);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(args.tokens, args.heads)), dim3(kD), std::size_t(0), stream}, query_post_kernel, args);
     check_launch("query_post");
+}
+
+void qkv_post(const QueryArgs& q, const KvArgs& kv, cudaStream_t stream) {
+    if (q.tokens != kv.rows.tokens) { throw std::invalid_argument("inkling2 qkv_post: tokens"); }
+    (void)ninfer::pdl::launch_consumer(
+        ninfer::pdl::LaunchConfig{dim3(q.tokens, q.heads + kv.kv_heads), dim3(kD), std::size_t(0),
+                                  stream},
+        qkv_post_kernel, q, kv);
+    check_launch("qkv_post");
 }
 
 void kv_post(const KvArgs& args, cudaStream_t stream) {
     if (args.rows.tokens <= 0) { return; }
-    kv_post_kernel<<<dim3(args.rows.tokens, args.kv_heads), kD, 0, stream>>>(args);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(args.rows.tokens, args.kv_heads)), dim3(kD), std::size_t(0), stream}, kv_post_kernel, args);
     check_launch("kv_post");
 }
 
@@ -2122,6 +3061,8 @@ std::size_t attention_workspace_floats(int rows, int query_heads, int splits) {
     const std::size_t n = std::size_t(rows) * query_heads * splits;
     return n * kD + 2 * n;
 }
+
+bool tc_prompt_attention() { return tc_attention_enabled(); }
 
 void attention(const AttentionArgs& args, cudaStream_t stream) {
     const int group = args.kv_heads > 0 ? args.query_heads / args.kv_heads : 0;
@@ -2135,19 +3076,29 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
     const int t = args.rows.tokens;
     if (t <= 0) { return; }
     if (args.uniform) {
-        if (args.rows.chunk || t > 8 || (args.splits > 1 && args.partial == nullptr)) {
-            throw std::invalid_argument("inkling2 attention: a uniform block of 1..8 decode rows");
+        if (args.rows.chunk || (t > 8 && t % 8 != 0) || (args.splits > 1 && args.partial == nullptr)) {
+            throw std::invalid_argument("inkling2 attention: uniform blocks of 1..8 decode rows, or "
+                                        "of eight rows each");
         }
-        attention_kernel<8><<<dim3(1, args.kv_heads, args.splits), 256, 0, stream>>>(args);
+        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3((t + 7) / 8, args.kv_heads, args.splits)), dim3(256), std::size_t(0), stream}, attention_kernel<8>, args);
         check_launch("attention");
         if (args.splits > 1) {
-            attention_combine_kernel<<<dim3(args.query_heads, t, 1), kCombineThreads, 0, stream>>>(args);
+            (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(args.query_heads, t, 1)), dim3(kCombineThreads), std::size_t(0), stream}, attention_combine_kernel, args);
             check_launch("attention_combine");
         }
         return;
     }
     if (args.rows.chunk) {
         if (args.splits != 1) { throw std::invalid_argument("inkling2 attention: chunk splits"); }
+        if (args.rows.starts == nullptr && args.far == nullptr && tc_attention_enabled()) {
+            // Prompt chunks on the tensor cores (any plane coding through kv128::chunk_word).
+            if (group == 1) { launch_attention_tc<1>(args, stream); }
+            else if (group == 2) { launch_attention_tc<2>(args, stream); }
+            else if (group == 3) { launch_attention_tc<3>(args, stream); }
+            else { launch_attention_tc<4>(args, stream); }
+            check_launch("attention_tc");
+            return;
+        }
         if (args.far != nullptr) {
             if (args.window != 0 || args.ring != 0) {
                 throw std::invalid_argument("inkling2 attention: a far field is a full visit's");
@@ -2170,16 +3121,29 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
         check_launch("attention");
         return;
     }
-    if (args.row_group < 1 || args.row_group > kMaxRowGroup ||
-        (args.row_group > 1 && (args.window != 0 || args.ring != 0)) || args.row_groups < 0) {
-        throw std::invalid_argument("inkling2 attention: row groups of 1..4 rows, a full visit's");
+    if (args.span > 0) {
+        // Span splits (fixed key positions a row's splits begin at) on the tensor cores, a
+        // verification's runs of one sequence a block each.
+        if (args.partial == nullptr || args.span % kDtKeys != 0 || group != 3) {
+            throw std::invalid_argument("inkling2 attention: span splits need partials, 32-key "
+                                        "spans and three query heads a key head");
+        }
+        const unsigned blocks = args.runs != nullptr
+                                    ? unsigned(args.run_count > 0 ? std::min(args.run_count, t) : t)
+                                    : unsigned(t);
+        launch_attention_dtc<3>(args, blocks, stream);
+    } else {
+        if (args.row_group < 1 || args.row_group > kMaxRowGroup ||
+            (args.row_group > 1 && (args.window != 0 || args.ring != 0)) || args.row_groups < 0) {
+            throw std::invalid_argument("inkling2 attention: row groups of 1..4 rows, a full visit's");
+        }
+        const int groups = args.row_group == 1 || args.row_groups == 0 ? t : std::min(t, args.row_groups);
+        attention_kernel<1><<<dim3(groups, args.kv_heads, args.splits), 128 * args.row_group, 0,
+                              stream>>>(args);
     }
-    const int groups = args.row_group == 1 || args.row_groups == 0 ? t : std::min(t, args.row_groups);
-    attention_kernel<1><<<dim3(groups, args.kv_heads, args.splits), 128 * args.row_group, 0,
-                          stream>>>(args);
     check_launch("attention");
-    if (args.splits > 1) {
-        attention_combine_kernel<<<dim3(args.query_heads, t, 1), kCombineThreads, 0, stream>>>(args);
+    if (args.splits > 1 || args.span > 0) {
+        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(args.query_heads, t, 1)), dim3(kCombineThreads), std::size_t(0), stream}, attention_combine_kernel, args);
         check_launch("attention_combine");
     }
 }
@@ -2196,26 +3160,25 @@ void residual(const ResidualArgs& args, cudaStream_t stream) {
     // A short call given the split scratch spreads its rows over one-warp blocks.
     if (args.mix.split != nullptr && args.rows.tokens <= kSplitRows &&
         (args.mix.query_count == 0 || args.mix.tokens == args.rows.tokens)) {
-        residual_split_kernel<<<dim3(unsigned(row_warps(args.hidden)), unsigned(args.rows.tokens)),
-                                32, 0, stream>>>(args);
+        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(unsigned(row_warps(args.hidden)), unsigned(args.rows.tokens))), dim3(32), std::size_t(0), stream}, residual_split_kernel, args);
         check_launch("residual_split");
         if (args.mix.query_count > 0) { mix_split_rows(args.mix, stream); }
         return;
     }
-    residual_kernel<<<args.rows.tokens, threads, 0, stream>>>(args);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(args.rows.tokens), dim3(threads), std::size_t(0), stream}, residual_kernel, args);
     check_launch("residual");
 }
 
 void keep_products(const ResidualArgs& args, int begin, int end, cudaStream_t stream) {
     if (end <= begin) { return; }
-    keep_products_kernel<<<end - begin, row_threads(args.hidden), 0, stream>>>(args, begin);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(end - begin), dim3(row_threads(args.hidden)), std::size_t(0), stream}, keep_products_kernel, args, begin);
     check_launch("keep_products");
 }
 
 void keep_history(const float* x, std::int64_t stride, int channels, const std::int32_t* positions,
                   int begin, int end, const History& history, int sequence, cudaStream_t stream) {
     if (end <= begin) { return; }
-    keep_history_kernel<<<end - begin, 256, 0, stream>>>(x, stride, channels, positions, begin,
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(end - begin), dim3(256), std::size_t(0), stream}, keep_history_kernel, x, stride, channels, positions, begin,
                                                          history, sequence);
     check_launch("keep_history");
 }
@@ -2227,21 +3190,83 @@ void route(const RouteArgs& args, cudaStream_t stream) {
     if (args.tokens <= 0) { return; }
     if (args.sorted.bounds != nullptr) {
         if (args.tokens > kSortedRouteRows || args.experts > kSortedRouteExperts) {
-            throw std::invalid_argument("inkling2 route: sorted pairs of at most 8 rows of 128 experts");
+            throw std::invalid_argument("inkling2 route: sorted pairs of at most 32 rows of 128 experts");
         }
-        route_sorted_kernel<<<1, args.tokens * kSortedRouteExperts, 0, stream>>>(args);
+        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(1), dim3(std::min(args.tokens, kSortedRouteBlockRows) * kSortedRouteExperts), std::size_t(0), stream}, route_sorted_kernel, args);
         check_launch("route_sorted");
         return;
     }
-    route_kernel<<<args.tokens, kRouteThreads, 0, stream>>>(args);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(args.tokens), dim3(kRouteThreads), std::size_t(0), stream}, route_kernel, args);
     check_launch("route");
+}
+
+namespace {
+
+// situ_rows then gguf::quantize_vector_activation in one kernel: each value is rounded to BF16
+// as situ_rows stores it, then quantized as that quantizer quantizes a BF16 column (q8_1 blocks
+// of 32 with the same butterfly max and sum), so the down product reads the same bytes. The
+// grid also zeroes `zero` (the fixed-point sums the down product adds into).
+__global__ void situ_quantize_kernel(const float* __restrict__ gu, std::int64_t stride, int width,
+                                     const float* __restrict__ pair_scale, float gate_cap,
+                                     float up_cap, std::int8_t* __restrict__ qs,
+                                     half2* __restrict__ ds, unsigned long long* __restrict__ zero,
+                                     std::int64_t zero_count) {
+    ninfer::pdl::enter();
+    {
+        const std::int64_t threads = std::int64_t(gridDim.x) * gridDim.y * blockDim.x;
+        for (std::int64_t i = (std::int64_t(blockIdx.x) * gridDim.y + blockIdx.y) * blockDim.x +
+                              threadIdx.x;
+             i < zero_count; i += threads) {
+            zero[i] = 0ULL;
+        }
+    }
+    const std::int64_t p = blockIdx.x;
+    const int r          = int(blockIdx.y) * kSituThreads + int(threadIdx.x);
+    if (r >= width) { return; } // whole warps: width and the block are whole groups of 32
+    const float s    = pair_scale[p];
+    const float* row = gu + p * stride;
+    const float g    = ops::silu_detail::mul(row[r], s);
+    const float u    = ops::silu_detail::mul(row[width + r], s);
+    const float xi   = __bfloat162float(__float2bfloat16(situ(g, u, gate_cap, up_cap)));
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset, 32));
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+    }
+    const float d          = amax / 127.0f;
+    qs[p * width + r]      = amax == 0.0f ? 0 : static_cast<std::int8_t>(roundf(xi / d));
+    if (r % 32 == 0) { ds[p * (width / 32) + r / 32] = make_half2(d, sum); }
+}
+
+} // namespace
+
+void situ_quantize(const float* gu, std::int64_t stride, int pairs, int width,
+                   const float* pair_scale, float gate_cap, float up_cap, void* activation,
+                   std::size_t scales_offset, unsigned long long* zero, std::int64_t zero_count,
+                   cudaStream_t stream) {
+    if (width % 32 != 0 || kSituThreads % 32 != 0) {
+        throw std::invalid_argument("inkling2 situ_quantize: whole 32-value groups");
+    }
+    if (pairs <= 0) { return; }
+    auto* base = static_cast<std::uint8_t*>(activation);
+    (void)ninfer::pdl::launch_consumer(
+        ninfer::pdl::LaunchConfig{dim3(pairs, blocks_for(width, kSituThreads)), dim3(kSituThreads),
+                                  std::size_t(0), stream},
+        situ_quantize_kernel, gu, stride, width, pair_scale, gate_cap, up_cap,
+        reinterpret_cast<std::int8_t*>(base), reinterpret_cast<half2*>(base + scales_offset), zero,
+        zero_count);
+    check_launch("situ_quantize");
 }
 
 void situ_rows(const float* gu, std::int64_t stride, int pairs, int width, const float* pair_scale,
                float gate_cap, float up_cap, __nv_bfloat16* out, cudaStream_t stream) {
     if (width % 32 != 0) { throw std::invalid_argument("inkling2 situ_rows: whole 32-value groups"); }
     if (pairs <= 0) { return; }
-    situ_rows_kernel<<<dim3(pairs, blocks_for(width, kSituThreads)), kSituThreads, 0, stream>>>(
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(pairs, blocks_for(width, kSituThreads))), dim3(kSituThreads), std::size_t(0), stream}, situ_rows_kernel, 
         gu, stride, width, pair_scale, gate_cap, up_cap, out);
     check_launch("situ_rows");
 }
@@ -2271,34 +3296,34 @@ void bf16_rows_f32(const __nv_bfloat16* table, int k, const std::int32_t* ids, i
 void softcap_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, float cap,
                   cudaStream_t stream) {
     if (n <= 0) { return; }
-    softcap_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(in, out, n, cap);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks_for(n, 256)), dim3(256), std::size_t(0), stream}, softcap_kernel, in, out, n, cap);
     check_launch("softcap");
 }
 
 void softcap_bf16(const float* in, std::int64_t in_stride, __nv_bfloat16* out,
                   std::int64_t out_stride, int width, int rows, float cap, cudaStream_t stream) {
     if (width <= 0 || rows <= 0) { return; }
-    softcap_rows_kernel<<<dim3(blocks_for(width, 256), rows), 256, 0, stream>>>(
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(blocks_for(width, 256), rows)), dim3(256), std::size_t(0), stream}, softcap_rows_kernel, 
         in, in_stride, out, out_stride, width, cap);
     check_launch("softcap rows");
 }
 
 void f32_to_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, cudaStream_t stream) {
     if (n <= 0) { return; }
-    f32_to_bf16_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(in, out, n);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks_for(n, 256)), dim3(256), std::size_t(0), stream}, f32_to_bf16_kernel, in, out, n);
     check_launch("f32_to_bf16");
 }
 
 void place_rows(const __nv_bfloat16* rows, int count, int hidden, float* h, cudaStream_t stream) {
     const std::int64_t n = std::int64_t(count) * hidden;
     if (n <= 0) { return; }
-    place_rows_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(rows, n, h);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks_for(n, 256)), dim3(256), std::size_t(0), stream}, place_rows_kernel, rows, n, h);
     check_launch("place_rows");
 }
 
 void ring_copy(const RingCopyArgs& a, cudaStream_t stream) {
     if (a.end <= a.begin) { return; }
-    ring_copy_kernel<<<dim3(a.end - a.begin, a.kv_heads, 1), 64, 0, stream>>>(a);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(a.end - a.begin, a.kv_heads, 1)), dim3(64), std::size_t(0), stream}, ring_copy_kernel, a);
     check_launch("ring_copy");
 }
 
@@ -2308,13 +3333,13 @@ void spark_mix(const SparkMixArgs& args, cudaStream_t stream) {
         args.context_count + 1 > kMaxSparkMixes || args.slots <= 0) {
         throw std::invalid_argument("inkling2 spark_mix: 1..8 taps and mixes");
     }
-    spark_mix_kernel<<<args.end - args.begin, row_threads(args.hidden), 0, stream>>>(args);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(args.end - args.begin), dim3(row_threads(args.hidden)), std::size_t(0), stream}, spark_mix_kernel, args);
     check_launch("spark_mix");
 }
 
 void spark_rotate(const SparkRotateArgs& args, cudaStream_t stream) {
     if (args.end <= args.begin || args.heads <= 0) { return; }
-    spark_rotate_kernel<<<dim3(args.end - args.begin, args.heads), kD, 0, stream>>>(args);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(args.end - args.begin, args.heads)), dim3(kD), std::size_t(0), stream}, spark_rotate_kernel, args);
     check_launch("spark_rotate");
 }
 
@@ -2322,21 +3347,21 @@ void add_rows(float* h, const float* y, std::int64_t y_stride, int hidden, int r
               cudaStream_t stream) {
     const std::int64_t n = std::int64_t(rows) * hidden;
     if (n <= 0) { return; }
-    add_rows_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(h, y, y_stride, hidden, n);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks_for(n, 256)), dim3(256), std::size_t(0), stream}, add_rows_kernel, h, y, y_stride, hidden, n);
     check_launch("add_rows");
 }
 
 void silu_mul(const float* gu, int width, int rows, __nv_bfloat16* out, cudaStream_t stream) {
     const std::int64_t n = std::int64_t(rows) * width;
     if (n <= 0) { return; }
-    silu_mul_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(gu, width, n, out);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks_for(n, 256)), dim3(256), std::size_t(0), stream}, silu_mul_kernel, gu, width, n, out);
     check_launch("silu_mul");
 }
 
 void spark_table(const float* p, int n, __nv_bfloat16* m, float* c, cudaStream_t stream) {
     const std::int64_t total = std::int64_t(n) * (kSparkRank + 1);
     if (total <= 0) { return; }
-    spark_table_kernel<<<blocks_for(total, 256), 256, 0, stream>>>(p, n, m, c);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks_for(total, 256)), dim3(256), std::size_t(0), stream}, spark_table_kernel, p, n, m, c);
     check_launch("spark_table");
 }
 
@@ -2344,34 +3369,46 @@ void spark_head_inputs(const float* hidden_out, const float* bias, int hidden, i
                        cudaStream_t stream) {
     if (rank != kSparkRank) { throw std::invalid_argument("inkling2 spark: a Markov rank of 256"); }
     const std::int64_t total = std::int64_t(rank + 1) * hidden;
-    spark_head_inputs_kernel<<<blocks_for(total, 256), 256, 0, stream>>>(hidden_out, bias, hidden,
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks_for(total, 256)), dim3(256), std::size_t(0), stream}, spark_head_inputs_kernel, hidden_out, bias, hidden,
                                                                          rank, out);
     check_launch("spark_head_inputs");
 }
 
-std::size_t spark_step_floats(int vocab) {
-    return std::size_t(3 * kSparkRank) + std::size_t(vocab) + 3 * kSparkPartials;
-}
+std::size_t spark_step_floats(int vocab) { return std::size_t(spark_scratch(vocab)); }
 
-void spark_step(const SparkStepArgs& a, cudaStream_t stream) {
-    if (a.row < 1 || a.vocab <= 0 || a.hidden_size % 4 != 0 || a.cap <= 0.0f) {
+void spark_step(const SparkStepArgs& args, cudaStream_t stream) {
+    SparkStepArgs a = args;
+    if (a.block == 0) { a.block = a.lanes == 1 ? 0 : -1; }
+    if (a.row < 1 || a.vocab <= 0 || a.hidden_size % 4 != 0 || a.cap <= 0.0f || a.lanes < 1 ||
+        a.lanes > kSparkMaxLanes || (a.lanes > 1 && a.block < 1)) {
         throw std::invalid_argument("inkling2 spark_step: invalid step");
     }
+    // The scratch layout is fixed per lane: joint (3 * 256), logits (vocab), partials.
+    if (a.logits != a.joint + 3 * kSparkRank || a.partials != a.logits + a.vocab) {
+        throw std::invalid_argument("inkling2 spark_step: scratch out of layout");
+    }
     const int k = 2 * kSparkRank + 2 * a.hidden_size;
-    spark_joint_kernel<<<3 * kSparkRank / 8, 256, std::size_t(k) * 4, stream>>>(a);
+    const std::size_t smem = std::size_t(k) * 4 * a.lanes;
+    static const bool configured = [k] {
+        CUDA_CHECK(cudaFuncSetAttribute(spark_joint_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        int(std::size_t(k) * 4 * kSparkMaxLanes)));
+        return true;
+    }();
+    (void)configured;
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(3 * kSparkRank / 8), dim3(256), smem, stream}, spark_joint_kernel, a);
     check_launch("spark_joint");
-    spark_logits_kernel<<<blocks_for(a.vocab, 8), 256, 0, stream>>>(a);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks_for(a.vocab, 8)), dim3(256), std::size_t(0), stream}, spark_logits_kernel, a);
     check_launch("spark_logits");
-    spark_pick_partials_kernel<<<kSparkPartials, 256, 0, stream>>>(a);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(kSparkPartials, a.lanes), dim3(256), std::size_t(0), stream}, spark_pick_partials_kernel, a);
     check_launch("spark_pick");
-    spark_pick_final_kernel<<<1, kSparkPartials, 0, stream>>>(a);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(a.lanes), dim3(kSparkPartials), std::size_t(0), stream}, spark_pick_final_kernel, a);
     check_launch("spark_pick_final");
 }
 
 void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,
                std::int64_t n, cudaStream_t stream) {
     if (n <= 0) { return; }
-    add_fixed_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks_for(n, 256)), dim3(256), std::size_t(0), stream}, add_fixed_kernel, 
         sums, static_cast<const unsigned long long*>(products), flag, n);
     check_launch("add_fixed");
 }

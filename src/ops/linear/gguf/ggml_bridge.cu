@@ -1,3 +1,4 @@
+#include "../../../core/pdl.cuh"
 // Entry points into the vendored ggml CUDA kernels and the vector kernel (ggml_bridge_vec.cuh). The
 // activation quantizers follow ggml's q8_1, reading BF16 and optionally gathering the input columns.
 
@@ -80,6 +81,7 @@ __launch_bounds__(kQuantizeThreads) __global__
     void quantize_vector_kernel(const __nv_bfloat16* __restrict__ x,
                                 const std::int32_t* __restrict__ input_columns,
                                 std::int8_t* __restrict__ qs, half2* __restrict__ ds, int k) {
+    ninfer::pdl::enter();
     const int i      = blockDim.x * blockIdx.x + threadIdx.x;
     const int column = blockIdx.y;
     if (i >= k) { return; }
@@ -95,6 +97,7 @@ __launch_bounds__(kQuantizeThreads) __global__
                                     const std::int32_t* __restrict__ source,
                                     const float* __restrict__ scale, std::int8_t* __restrict__ qs,
                                     half2* __restrict__ ds, int k) {
+    ninfer::pdl::enter();
     const int i      = blockDim.x * blockIdx.x + threadIdx.x;
     const int column = blockIdx.y;
     if (i >= k) { return; }
@@ -224,6 +227,7 @@ __launch_bounds__(kSortThreads) __global__
                          std::int32_t* __restrict__ small_count,
                          std::int32_t* __restrict__ large_tile_count,
                          std::int32_t* __restrict__ large_tiles) {
+    ninfer::pdl::enter();
     extern __shared__ int shared[];
     const bool split = small_active != nullptr; // uniform over the block
     int* count  = shared;
@@ -716,7 +720,7 @@ void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
     }
     auto* base = static_cast<std::uint8_t*>(out);
     const dim3 blocks((k + detail::kQuantizeThreads - 1) / detail::kQuantizeThreads, columns, 1);
-    detail::quantize_vector_kernel<<<blocks, detail::kQuantizeThreads, 0, stream>>>(
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks), dim3(detail::kQuantizeThreads), std::size_t(0), stream}, detail::quantize_vector_kernel, 
         x, input_columns, reinterpret_cast<std::int8_t*>(base),
         reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k);
     detail::check(cudaGetLastError(), "vector activation launch");
@@ -729,11 +733,211 @@ void quantize_vector_activation_f32(const float* x, int k, int columns, const st
     }
     auto* base = static_cast<std::uint8_t*>(out);
     const dim3 blocks((k + detail::kQuantizeThreads - 1) / detail::kQuantizeThreads, columns, 1);
-    detail::quantize_vector_f32_kernel<<<blocks, detail::kQuantizeThreads, 0, stream>>>(
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks), dim3(detail::kQuantizeThreads), std::size_t(0), stream}, detail::quantize_vector_f32_kernel, 
         x, source, scale, reinterpret_cast<std::int8_t*>(base),
         reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k);
     detail::check(cudaGetLastError(), "vector activation launch");
 }
+
+namespace detail {
+
+// ---- Q8_0 decode products on the int8 tensor cores -------------------------------------------
+// Inside a VectorMmaScope, a non-fused Q8_0 vector product of 1..64 columns: block (16-row tile),
+// four warps each a fixed quarter of the K blocks, mma.sync m16n8k32 s8 per 32-value block (the
+// block's integer sums exact), then each element's d_w d_a sum in K order within its quarter and
+// the quarters added in order. An element's value depends on its row and column alone, the same
+// at any column count.
+thread_local int g_vector_mma = 0;
+
+constexpr int kMmaWarps = 4;
+
+__device__ __forceinline__ std::uint32_t mma_u32_a2(const std::uint8_t* p) {
+    const auto* h = reinterpret_cast<const std::uint16_t*>(p);
+    return std::uint32_t(h[0]) | (std::uint32_t(h[1]) << 16);
+}
+
+__device__ __forceinline__ void mma_s8_16832(int (&c)[4], const std::uint32_t (&a)[4], std::uint32_t b0,
+                                             std::uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+                 "{%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+template <int NT>
+__global__ void __launch_bounds__(kMmaWarps * 32) q8_0_mma_kernel(VecArgs p, int columns) {
+    ninfer::pdl::enter_streaming();
+    int block = int(blockIdx.x);
+    const std::uint8_t* weight = p.weight;
+    std::int64_t row_bytes     = p.row_bytes;
+    int rows                   = p.rows;
+    const std::int8_t* act_qs  = p.qs;
+    const half2* act_ds        = p.ds;
+    VecStore out               = p.out;
+    if (p.more_count > 0) {
+        int seg = 0;
+        while (seg < p.more_count && block >= p.block_end[seg]) { ++seg; }
+        const int first = seg == 0 ? 0 : p.block_end[seg - 1];
+        block -= first;
+        if (seg > 0) {
+            weight    = p.more[seg - 1].weight;
+            row_bytes = p.more[seg - 1].row_bytes;
+            rows      = p.more[seg - 1].rows;
+            act_qs    = p.more[seg - 1].qs;
+            act_ds    = p.more[seg - 1].ds;
+            out       = p.more[seg - 1].out;
+        }
+    }
+    const int warp = int(threadIdx.x) >> 5, lane = int(threadIdx.x) & 31;
+    const int r = lane >> 2, q = lane & 3;
+    const int k = p.k, kb = k / 32;
+    const int row0 = block * 16;
+    const int ra = min(row0 + r, rows - 1), rb = min(row0 + r + 8, rows - 1);
+    const std::uint8_t* wa = weight + std::int64_t(ra) * row_bytes;
+    const std::uint8_t* wb = weight + std::int64_t(rb) * row_bytes;
+    const int per = (kb + kMmaWarps - 1) / kMmaWarps;
+    const int b_lo = warp * per, b_hi = min(kb, b_lo + per);
+    float acc[NT][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i) { acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f; }
+    int bcol[NT], dcol0[NT], dcol1[NT];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        bcol[nt]  = min(nt * 8 + r, columns - 1);
+        dcol0[nt] = min(nt * 8 + 2 * q, columns - 1);
+        dcol1[nt] = min(nt * 8 + 2 * q + 1, columns - 1);
+    }
+    for (int b = b_lo; b < b_hi; ++b) {
+        const std::uint8_t* ba = wa + std::int64_t(b) * 34;
+        const std::uint8_t* bb = wb + std::int64_t(b) * 34;
+        const float dwa = __half2float(*reinterpret_cast<const half*>(ba));
+        const float dwb = __half2float(*reinterpret_cast<const half*>(bb));
+        const std::uint32_t a[4] = {mma_u32_a2(ba + 2 + 4 * q), mma_u32_a2(bb + 2 + 4 * q),
+                                    mma_u32_a2(ba + 18 + 4 * q), mma_u32_a2(bb + 18 + 4 * q)};
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const auto* aq = reinterpret_cast<const std::uint32_t*>(act_qs + std::int64_t(bcol[nt]) * k + 32 * b);
+            int c[4] = {0, 0, 0, 0};
+            mma_s8_16832(c, a, aq[q], aq[4 + q]);
+            const float da0 = __low2float(act_ds[std::int64_t(dcol0[nt]) * kb + b]);
+            const float da1 = __low2float(act_ds[std::int64_t(dcol1[nt]) * kb + b]);
+            acc[nt][0] = __fadd_rn(acc[nt][0], __fmul_rn(__fmul_rn(dwa, da0), float(c[0])));
+            acc[nt][1] = __fadd_rn(acc[nt][1], __fmul_rn(__fmul_rn(dwa, da1), float(c[1])));
+            acc[nt][2] = __fadd_rn(acc[nt][2], __fmul_rn(__fmul_rn(dwb, da0), float(c[2])));
+            acc[nt][3] = __fadd_rn(acc[nt][3], __fmul_rn(__fmul_rn(dwb, da1), float(c[3])));
+        }
+    }
+    __shared__ float part[kMmaWarps][NT * 4][32];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { part[warp][nt * 4 + e][lane] = acc[nt][e]; }
+    }
+    __syncthreads();
+    if (warp != 0) { return; }
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            float v = part[0][nt * 4 + e][lane];
+#pragma unroll
+            for (int w = 1; w < kMmaWarps; ++w) { v = __fadd_rn(v, part[w][nt * 4 + e][lane]); }
+            const int row = row0 + r + 8 * (e >> 1), col = nt * 8 + 2 * q + (e & 1);
+            if (row < rows && col < columns) { vec_store(out, row, col, v); }
+        }
+    }
+}
+
+void q8_0_mma_launch(VecArgs a, int columns, cudaStream_t stream) {
+    const auto tiles = [](int rows) { return (rows + 15) / 16; };
+    int blocks = tiles(a.rows);
+    if (a.more_count > 0) {
+        a.block_end[0] = blocks;
+        for (int s = 0; s < a.more_count; ++s) {
+            blocks += tiles(a.more[s].rows);
+            a.block_end[s + 1] = blocks;
+        }
+    }
+    const ninfer::pdl::LaunchConfig config{dim3(blocks), dim3(kMmaWarps * 32), 0, stream};
+    switch ((columns + 7) / 8) {
+    case 1: (void)ninfer::pdl::launch_consumer(config, q8_0_mma_kernel<1>, a, columns); break;
+    case 2: (void)ninfer::pdl::launch_consumer(config, q8_0_mma_kernel<2>, a, columns); break;
+    case 3: (void)ninfer::pdl::launch_consumer(config, q8_0_mma_kernel<3>, a, columns); break;
+    case 4: (void)ninfer::pdl::launch_consumer(config, q8_0_mma_kernel<4>, a, columns); break;
+    case 5: (void)ninfer::pdl::launch_consumer(config, q8_0_mma_kernel<5>, a, columns); break;
+    case 6: (void)ninfer::pdl::launch_consumer(config, q8_0_mma_kernel<6>, a, columns); break;
+    case 7: (void)ninfer::pdl::launch_consumer(config, q8_0_mma_kernel<7>, a, columns); break;
+    default: (void)ninfer::pdl::launch_consumer(config, q8_0_mma_kernel<8>, a, columns); break;
+    }
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) {
+        throw std::runtime_error(std::string("q8_0 mma product launch: ") + cudaGetErrorString(e));
+    }
+}
+
+} // namespace detail
+
+VectorMmaScope::VectorMmaScope() { ++detail::g_vector_mma; }
+VectorMmaScope::~VectorMmaScope() { --detail::g_vector_mma; }
+
+namespace {
+
+// The widest vector form a launch takes (NINFER_VEC_MAX_COLUMNS, 1..8, default 8): wider calls go
+// as several launches over column slices; each column's sums are the same at any width.
+int vector_max_columns() {
+    static const int n = [] {
+        const char* v = std::getenv("NINFER_VEC_MAX_COLUMNS");
+        const int x   = v != nullptr ? std::atoi(v) : 8;
+        return x >= 1 && x <= 8 ? x : 8;
+    }();
+    return n;
+}
+
+// In-kernel column groups for an even call of 9..16 columns (NINFER_VEC_COLUMN_GROUPS=0: slices).
+bool column_groups_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_VEC_COLUMN_GROUPS");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+void vector_launch_sliced(GgmlType type, detail::VecArgs args, int columns, bool fused,
+                          cudaStream_t stream) {
+    if (detail::g_vector_mma > 0 && type == GgmlType::Q8_0 && !fused && columns >= 1 &&
+        columns <= 64 && args.k % 32 == 0) {
+        return detail::q8_0_mma_launch(args, columns, stream);
+    }
+    const int step = vector_max_columns();
+    if (columns <= step) { return detail::vector_launch(type)(args, columns, fused, stream); }
+    if (column_groups_enabled() && columns <= 8 * step) {
+        // G groups of T columns in one launch (the last possibly short): the rows come from
+        // memory once.
+        const int groups = (columns + step - 1) / step;
+        const int t      = (columns + groups - 1) / groups;
+        args.column_groups = groups;
+        args.last_columns  = columns - t * (groups - 1) == t ? 0 : columns - t * (groups - 1);
+        return detail::vector_launch(type)(args, t, fused, stream);
+    }
+    const auto slice = [&](detail::VecStore& o, int c0) {
+        if (o.bf16 != nullptr) { o.bf16 += std::int64_t(c0) * o.column_stride; }
+        if (o.f32 != nullptr) { o.f32 += std::int64_t(c0) * o.column_stride; }
+        if (o.gate != nullptr) { o.gate += std::int64_t(c0) * o.gate_column_stride; }
+    };
+    for (int c0 = 0; c0 < columns; c0 += step) {
+        detail::VecArgs a = args;
+        a.qs += std::int64_t(c0) * a.k;
+        a.ds += std::int64_t(c0) * (a.k / 32);
+        slice(a.out, c0);
+        for (int s = 0; s < a.more_count; ++s) {
+            a.more[s].qs += std::int64_t(c0) * a.k;
+            a.more[s].ds += std::int64_t(c0) * (a.k / 32);
+            slice(a.more[s].out, c0);
+        }
+        detail::vector_launch(type)(a, std::min(step, columns - c0), fused, stream);
+    }
+}
+
+} // namespace
 
 void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                     const void* activation, int columns, const VectorOutput& out,
@@ -745,9 +949,42 @@ void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
     const detail::VecStore store{out.bf16,     out.f32,  out.column_stride,
                                  out.epilogue, out.gate, out.gate_column_stride,
                                  static_cast<int>(out.activation)};
-    detail::vector_launch(type)(
+    vector_launch_sliced(type,
         detail::vector_args(weight, row_bytes, rows, k, activation, columns, store), columns,
         false, stream);
+}
+
+void vector_product_segments(GgmlType type, int k, int columns, const VectorSegment* segments,
+                             int count, cudaStream_t stream) {
+    if (count < 1 || count > kMaxVectorSegments || segments == nullptr) {
+        throw std::invalid_argument("gguf vector product: 1..4 segments");
+    }
+    const auto store_of = [](const VectorOutput& out) {
+        if ((out.bf16 == nullptr) == (out.f32 == nullptr) ||
+            (out.epilogue == Epilogue::GateProduct && out.gate == nullptr)) {
+            throw std::invalid_argument("gguf vector product: invalid output");
+        }
+        return detail::VecStore{out.bf16,     out.f32,  out.column_stride,
+                                out.epilogue, out.gate, out.gate_column_stride,
+                                static_cast<int>(out.activation)};
+    };
+    for (int i = 0; i < count; ++i) {
+        if (segments[i].rows <= 0 || segments[i].weight == nullptr) {
+            throw std::invalid_argument("gguf vector product: empty segment");
+        }
+    }
+    const VectorSegment& s0 = segments[0];
+    detail::VecArgs args = detail::vector_args(s0.weight, s0.row_bytes, s0.rows, k, s0.activation,
+                                               columns, store_of(s0.out));
+    args.more_count = count - 1;
+    for (int i = 1; i < count; ++i) {
+        const VectorSegment& s = segments[i];
+        const detail::VecArgs one = detail::vector_args(s.weight, s.row_bytes, s.rows, k,
+                                                        s.activation, columns, store_of(s.out));
+        args.more[i - 1] = detail::VecSegment{one.weight, one.row_bytes, one.rows,
+                                              one.qs,     one.ds,        one.out};
+    }
+    vector_launch_sliced(type, args, columns, false, stream);
 }
 
 void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
@@ -757,7 +994,7 @@ void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, in
     const detail::VecStore store{out,     nullptr, out_column_stride,
                                  Epilogue::Store, nullptr, 0,
                                  static_cast<int>(gate_activation)};
-    detail::vector_launch(type)(
+    vector_launch_sliced(type,
         detail::vector_args(weight, row_bytes, rows, k, activation, columns, store), columns,
         true, stream);
 }
@@ -792,7 +1029,7 @@ MoeSplitRouting sort_routes(const std::int32_t* ids, int pairs, int experts, int
     std::int32_t* small_count  = split ? small_active + experts : nullptr;
     std::int32_t* large_count  = split ? small_count + 1 : nullptr;
     std::int32_t* large_tiles  = split ? large_count + detail::kMoeTileWidths : nullptr;
-    detail::moe_sort_kernel<<<1, detail::kSortThreads, 2 * experts * sizeof(int), stream>>>(
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(1), dim3(detail::kSortThreads), std::size_t(2 * experts * sizeof(int)), stream}, detail::moe_sort_kernel, 
         ids, pairs, experts, bounds, sorted, active, active_count, tile_count, tiles, capacity,
         vector_pairs, small_active, small_count, large_count, large_tiles);
     detail::check(cudaGetLastError(), "moe routing launch");

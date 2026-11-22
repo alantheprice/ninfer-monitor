@@ -88,6 +88,29 @@ void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
                     const void* activation, int columns, const VectorOutput& out,
                     cudaStream_t stream);
 
+// Up to four vector products of one type, K and column count in one launch: each segment its own
+// weight, activation and output, every row's sums those of vector_product's bit for bit.
+struct VectorSegment {
+    const void* weight       = nullptr;
+    std::int64_t row_bytes   = 0;
+    int rows                 = 0;
+    const void* activation   = nullptr;
+    VectorOutput out;
+};
+inline constexpr int kMaxVectorSegments = 4;
+// While one lives on the calling thread, non-fused Q8_0 vector products of 1..64 columns run on
+// the int8 tensor cores (each column's values the same at any column count, though not the vector
+// kernel's bits): a model's decode calls, whose rows must not depend on their batch.
+struct VectorMmaScope {
+    VectorMmaScope();
+    ~VectorMmaScope();
+    VectorMmaScope(const VectorMmaScope&)            = delete;
+    VectorMmaScope& operator=(const VectorMmaScope&) = delete;
+};
+
+void vector_product_segments(GgmlType type, int k, int columns, const VectorSegment* segments,
+                             int count, cudaStream_t stream);
+
 // out[r, c] = act(gate_r . x_c) * (up_r . x_c) where gate row r and up row r are rows r and
 // rows + r of one parent of this type.
 void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,

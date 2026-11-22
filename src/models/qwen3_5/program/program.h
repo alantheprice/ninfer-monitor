@@ -856,14 +856,14 @@ public:
 private:
     const void* owner_         = nullptr;
     std::uint64_t transaction_ = 0;
-    std::array<SequenceHandle, kMaximumConcurrency> rows_{};
+    std::array<SequenceHandle, kMaximumFamilyConcurrency> rows_{};
     std::size_t row_count_ = 0;
     std::span<const TokenId> tokens_;
     std::span<const std::int32_t> row_counts_;
     std::span<const runtime::RawTokenLogprob> logprobs_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
-    std::array<bool, kMaximumConcurrency> numerical_faults_{};
+    std::array<bool, kMaximumFamilyConcurrency> numerical_faults_{};
 
     friend struct detail::RuntimeContractAccess;
 };
@@ -984,10 +984,10 @@ struct CommitRowResult {
 };
 
 struct CommitResult {
-    std::array<CommitRowResult, kMaximumConcurrency> rows{};
+    std::array<CommitRowResult, kMaximumFamilyConcurrency> rows{};
     // A prompt-frontier capture becomes valid only after the generated Begin token is committed.
     // Keeping the move-only capability row-aligned avoids exposing provisional prompt state.
-    std::array<std::optional<CaptureOffer>, kMaximumConcurrency> captures{};
+    std::array<std::optional<CaptureOffer>, kMaximumFamilyConcurrency> captures{};
     std::size_t row_count = 0;
     runtime::ExecutionTiming timing;
 };
@@ -1428,7 +1428,7 @@ struct RuntimeContractAccess {
                  std::span<const TokenId> tokens, std::span<const std::int32_t> row_counts,
                  std::span<const runtime::RawTokenLogprob> logprobs, std::uint32_t row_stride,
                  runtime::ExecutionTiming timing,
-                 const std::array<bool, kMaximumConcurrency>& numerical_faults) {
+                 const std::array<bool, kMaximumFamilyConcurrency>& numerical_faults) {
         PendingBatch out;
         out.owner_       = owner;
         out.transaction_ = transaction;

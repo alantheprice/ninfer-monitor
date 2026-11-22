@@ -38,6 +38,8 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -120,6 +122,14 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     const SpeculativeOptions& speculative = options.speculative;
     const bool dspine = speculative.backend == SpeculativeBackend::DSpine;
     const bool dspark = speculative.backend == SpeculativeBackend::DSpark;
+    // Known issue: with more than 16 lanes, a DSpark server restoring prefix images from the host
+    // tier sometimes decodes from a corrupted state (sampled outputs change between identical
+    // runs; one in a few streams renders no text). Not yet root-caused (compute-sanitizer memcheck
+    // clean; not FP8 KV, not host-tier eviction); refused until it is.
+    if (dspark && options.max_concurrency > 16) {
+        throw std::invalid_argument("Inkling 2: --spec dspark supports at most 16 lanes "
+                                    "(--max-concurrency); serve more lanes with --spec none");
+    }
     if (speculative.backend != SpeculativeBackend::None && !dspine && !dspark) {
         throw std::invalid_argument("Inkling 2 drafts with its DSpark drafter (--spec dspark), a "
                                     "DSpine drafter (--spec dspine --draft-model) or by context "
@@ -228,12 +238,16 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     models::inkling2::ExecutorOptions executor;
     executor.max_context   = options.max_context;
-    executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
+    executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, kMaximumConcurrency);
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.kv_cache      = options.kv_cache;
     executor.draft_tokens  = dspine ? speculative.draft_tokens : lookup_drafts;
     executor.dspine        = dspine;
     executor.dspark        = dspark;
+    executor.kv_fp8        = options.kv_cache == KvCacheStorage::Fp8E4M3Row256;
+    if (const char* w = std::getenv("NINFER_INKLING_DRAFT_WINDOW"); w != nullptr) {
+        executor.draft_window = std::uint32_t(std::strtoul(w, nullptr, 10));
+    }
     if (dspark) {
         // The drafter's block less its anchor a round, or fewer with --draft-tokens; a round of a
         // context lookup's may verify as many as the lookup proposes.
@@ -635,6 +649,21 @@ struct Inkling2Core::Impl {
     // Host copies of an image each way, about PCIe 4.0 x16's; and the prefill time per token.
     static constexpr double kImageCopyBytesPerSecond = 12e9;
     static constexpr double kPrefillSecondsPerToken  = 2e-4;
+    // NINFER_INKLING_BATCH_DRAFT=0: DSpark drafts only for a lone decoding request.
+    // NINFER_INKLING_BATCH_ROWS (2..64, default 32): a multi-request round's rows.
+    const std::size_t kBatchRoundRows = [] {
+        const char* v = std::getenv("NINFER_INKLING_BATCH_ROWS");
+        const int n   = v != nullptr ? std::atoi(v) : 32;
+        return std::size_t(n >= 2 && n <= 64 ? n : 32);
+    }();
+    const bool batch_drafting = [] {
+        const char* v = std::getenv("NINFER_INKLING_BATCH_DRAFT");
+        return v == nullptr || std::string(v) != "0";
+    }();
+    // The request whose prompt chunk runs on the executor's second stream, and its slot (a later
+    // request taking the slot waits for the chunk first).
+    std::shared_ptr<Request> side_request;
+    std::uint32_t side_slot = UINT32_MAX;
     std::uint32_t decode_run                = 0;
     std::uint32_t decode_rounds_per_prefill = 1;
 
@@ -1335,6 +1364,8 @@ struct Inkling2Core::Impl {
                                "prepared prompt exceeds Engine max_context");
         }
         r.admitted           = Clock::now();
+        // A second-stream chunk may still write this sequence.
+        if (s == side_slot) { executor.side_join(); }
         // Resume from the sequence's live state when the prompt continues it, else from its
         // checkpoint at the end of its last prompt when the prompt continues that, else from the
         // longest prefix the store keeps; what the sequence held goes to the store first.
@@ -1371,10 +1402,8 @@ struct Inkling2Core::Impl {
                     r.reuse_path = path;
                 }
             } else if (anchored > live) {
-                if (slot.fed != slot.anchor && !slot.disposable &&
-                    slot.anchor_path != PrefixReusePath::PrivateResponseReplay) {
-                    store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
-                }
+                // The conversation continues in place: what the sequence held past its anchor was
+                // this conversation's own last answer, not worth a host image.
                 executor.restore(s, slot.snapshot);
                 slot.fed     = slot.anchor;
                 slot.media   = slot.anchor_media;
@@ -1384,6 +1413,11 @@ struct Inkling2Core::Impl {
                 reused       = live;
                 r.reuse_path = PrefixReusePath::PrivateEndpoint;
             }
+        }
+        if (std::getenv("NINFER_INKLING_ADMIT_LOG") != nullptr) {
+            std::fprintf(stderr, "admit slot %u prompt %u reused %u | slot fed %zu anchor %zu | host store %llu MiB\n",
+                         s, prompt_n, reused, slot.fed.size(), slot.anchor.size(),
+                         static_cast<unsigned long long>(store.host_used() >> 20));
         }
         if (reused == 0) {
             if (reuse_prefixes) { retire(s); }
@@ -1443,6 +1477,9 @@ struct Inkling2Core::Impl {
     // One prompt chunk or one decode round; false when there was nothing to run (every active
     // request waits for its grammar mask).
     bool step() {
+        auto& executor = *instance.executor;
+        // A prompt chunk on the executor's second stream: done once the stream has passed it.
+        if (side_request && executor.side_idle()) { side_request.reset(); }
         std::shared_ptr<Request> prefilling;
         bool decoding = false;
         for (const Slot& slot : slots) {
@@ -1450,12 +1487,38 @@ struct Inkling2Core::Impl {
             if (slot.request->decoding) {
                 // A request runs a decode step unless its kept logits still wait for their mask.
                 decoding = decoding || !slot.request->awaiting_sample || mask_ready(*slot.request);
-            } else if (!prefilling || prefills_before(*slot.request, *prefilling)) {
+            } else if (slot.request != side_request &&
+                       (!prefilling || prefills_before(*slot.request, *prefilling))) {
                 prefilling = slot.request;
             }
         }
-        if (prefilling && (!decoding || decode_run >= decode_rounds_before(*prefilling))) {
+        // Beside decoding requests, a prompt's inner chunk runs on the second stream while the
+        // decode rounds go on.
+        if (prefilling && decoding && !side_request && side_eligible(*prefilling)) {
+            executor.side_begin();
+            try {
+                prefill_step(prefilling);
+            } catch (...) {
+                executor.side_end();
+                side_request = prefilling;
+                side_slot    = prefilling->slot;
+                fail(prefilling, std::current_exception());
+                return true;
+            }
+            executor.side_end();
+            side_request = prefilling;
+            side_slot    = prefilling->slot;
+            decode_step();
+            return true;
+        }
+        // On the main stream a prefill step waits for a second-stream chunk to finish unless it
+        // is short (the vector kernels; no cuBLAS shared with the chunk).
+        const bool main_prefill_ok =
+            prefilling && (!side_request || prefill_step_tokens(*prefilling) <= 8);
+        if (prefilling && main_prefill_ok &&
+            (!decoding || decode_run >= decode_rounds_before(*prefilling))) {
             decode_run = 0;
+            executor.side_join();
             try {
                 prefill_step(prefilling);
             } catch (...) { fail(prefilling, std::current_exception()); }
@@ -1464,6 +1527,24 @@ struct Inkling2Core::Impl {
         if (!decoding) { return false; }
         decode_run += decode_run != UINT32_MAX;
         decode_step();
+        return true;
+    }
+
+    // Whether the request's next prefill step may run on the executor's second stream: an inner
+    // chunk of more than 8 tokens (the final one leaves logits), after the prompt's first step
+    // (which may restore an image from the host store), without media, branches or a shared
+    // prefix image at its end (host pages stay on one stream).
+    [[nodiscard]] bool side_eligible(const Request& r) const {
+        if (!instance.executor->overlap() || r.branches || r.prefilled == 0 || r.cancelled.load()) {
+            return false;
+        }
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const std::uint32_t n = prefill_step_tokens(r);
+        if (n <= 8 || r.prefilled + n >= prompt_n) { return false; }
+        if (std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled + n)) { return false; }
+        for (const MediaMark& mark : r.media) {
+            if (mark.begin < r.prefilled + n && mark.begin + mark.count > r.prefilled) { return false; }
+        }
         return true;
     }
 
@@ -2217,7 +2298,16 @@ struct Inkling2Core::Impl {
     // one) sets the same bounds here.
     // The DSpark drafter drafts for one request at a time.
     [[nodiscard]] std::uint32_t round_drafts(std::size_t decoding) const noexcept {
-        if (spark_drafts != 0) { return decoding == 1 ? drafts : 0U; }
+        if (spark_drafts != 0) {
+            if (decoding == 1) { return drafts; }
+            // Several decoding requests draft together, each round's rows (drafts and bonus) within
+            // the executor's 32 decode rows.
+            if (!batch_drafting || decoding == 0) { return 0U; }
+            // A single draft a request does not pay for its round's extra rows (12 requests at
+            // 38K tokens: 40.5 tok/s each against 41.7 without).
+            const std::size_t width = kBatchRoundRows / decoding;
+            return width >= 3 ? std::min<std::uint32_t>(drafts, std::uint32_t(width - 1)) : 0U;
+        }
         return decoding == 1 ? drafts : decoding <= 3 ? 1U : 0U;
     }
 
@@ -3038,7 +3128,11 @@ Inkling2Core::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
         const auto prompt_n  = static_cast<std::uint32_t>(request->prompt_tokens.size());
         request->reusable   = identity.reusable;
         request->disposable = data.tap_hints.disposable;
-        request->anchor_at  = prompt_n;
+        // The anchor: the state where the prompt's last user turn closes, or (no such frontier)
+        // before the prompt's last token, so the conversation's next turn, or the same prompt
+        // again, resumes in this sequence even when the next turn's rendering of this answer
+        // differs from the tokens sampled. A branched read anchors at its prompt's end itself.
+        request->anchor_at  = !options.execution.branches && prompt_n >= 2 ? prompt_n - 1 : prompt_n;
         if (identity.rewrite_checkpoint &&
             identity.rewrite_checkpoint->kind ==
                 models::qwen3_5::RewriteCheckpointKind::TurnClosure &&

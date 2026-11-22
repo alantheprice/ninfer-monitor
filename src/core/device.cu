@@ -246,10 +246,15 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
                 throw std::runtime_error(
                     cuda_error_message("cudaGetDeviceProperties failed", err));
             }
-            err = cudaStreamCreateWithFlags(&endpoint.stream, cudaStreamNonBlocking);
+            // The compute stream at the greatest priority: work a model puts on streams of its own
+            // beside it (Inkling 2's prompt chunks beside decoding) yields to it.
+            int least_priority = 0, greatest_priority = 0;
+            err = cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
+            if (err != cudaSuccess) { greatest_priority = 0; }
+            err = cudaStreamCreateWithPriority(&endpoint.stream, cudaStreamNonBlocking, greatest_priority);
             if (err != cudaSuccess) {
                 throw std::runtime_error(
-                    cuda_error_message("cudaStreamCreateWithFlags(stream) failed", err));
+                    cuda_error_message("cudaStreamCreateWithPriority(stream) failed", err));
             }
             err = cudaStreamCreateWithFlags(&endpoint.transfer_stream, cudaStreamNonBlocking);
             if (err != cudaSuccess) {

@@ -29,7 +29,7 @@ PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
     PendingTransaction transaction;
     transaction.id   = next_transaction_id_++;
     transaction.size = lanes.size();
-    std::array<SequenceHandle, kMaximumConcurrency> handles{};
+    std::array<SequenceHandle, kMaximumFamilyConcurrency> handles{};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending) {
@@ -42,7 +42,7 @@ PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
     }
     pending_transaction_ = transaction;
     // A decode round's faults; a Begin round has none (its fault throws before it is wrapped).
-    const std::array<bool, kMaximumConcurrency> faults = std::exchange(numerical_faults, {});
+    const std::array<bool, kMaximumFamilyConcurrency> faults = std::exchange(numerical_faults, {});
     return ContractAccess::make_pending(
         this, transaction.id, std::span<const SequenceHandle>(handles.data(), lanes.size()),
         round.tokens, round.row_counts, round.logprobs, round.row_stride, round.timing, faults);
@@ -219,7 +219,7 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> members,
         budgets.size() != members.size()) {
         throw std::invalid_argument("decode membership is invalid");
     }
-    std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+    std::array<std::uint32_t, kMaximumFamilyConcurrency> lanes{};
     for (std::size_t row = 0; row < members.size(); ++row) {
         if (!valid_sequence(members[row])) {
             throw std::logic_error("decode sequence capability is invalid");
@@ -296,7 +296,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
         throw std::invalid_argument("forced-token membership is invalid");
     }
 
-    std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+    std::array<std::uint32_t, kMaximumFamilyConcurrency> lanes{};
     for (std::size_t row = 0; row < members.size(); ++row) {
         if (!valid_sequence(members[row])) {
             throw std::logic_error("forced-token sequence capability is invalid");
@@ -488,19 +488,19 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
                                  runtime::CommitObservation observation,
                                  runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
-    std::array<SequenceHandle, kMaximumConcurrency> members{};
+    std::array<SequenceHandle, kMaximumFamilyConcurrency> members{};
     const auto input_rows       = ContractAccess::rows(pending);
     const std::size_t row_count = input_rows.size();
     for (std::size_t row = 0; row < row_count; ++row) { members[row] = input_rows[row]; }
     const bool valid = valid_pending(pending);
     ContractAccess::consume(pending);
 
-    std::array<std::uint32_t, kMaximumConcurrency> lanes{};
-    std::array<GenerationTimings, kMaximumConcurrency> timings{};
-    std::array<SpeculativeStats, kMaximumConcurrency> speculative{};
-    std::array<PendingKind, kMaximumConcurrency> pending_kinds{};
+    std::array<std::uint32_t, kMaximumFamilyConcurrency> lanes{};
+    std::array<GenerationTimings, kMaximumFamilyConcurrency> timings{};
+    std::array<SpeculativeStats, kMaximumFamilyConcurrency> speculative{};
+    std::array<PendingKind, kMaximumFamilyConcurrency> pending_kinds{};
     const auto release_members = [&]() noexcept {
-        std::array<std::uint32_t, kMaximumConcurrency> failed_lanes{};
+        std::array<std::uint32_t, kMaximumFamilyConcurrency> failed_lanes{};
         std::size_t failed_count = 0;
         for (std::size_t row = 0; row < row_count; ++row) {
             if (ContractAccess::owner(members[row]) != this) { continue; }
@@ -518,11 +518,11 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
             decisions.size() != row_count) {
             throw std::logic_error("pending transaction capability or decision shape is invalid");
         }
-        std::array<std::uint32_t, kMaximumConcurrency> accepted{};
-        std::array<std::uint8_t, kMaximumConcurrency> terminal{};
-        std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
-        std::array<std::optional<std::uint32_t>, kMaximumConcurrency> prefix_execution_splits{};
-        std::array<std::optional<std::uint32_t>, kMaximumConcurrency> stop_holds{};
+        std::array<std::uint32_t, kMaximumFamilyConcurrency> accepted{};
+        std::array<std::uint8_t, kMaximumFamilyConcurrency> terminal{};
+        std::array<std::uint8_t, kMaximumFamilyConcurrency> cancelled{};
+        std::array<std::optional<std::uint32_t>, kMaximumFamilyConcurrency> prefix_execution_splits{};
+        std::array<std::optional<std::uint32_t>, kMaximumFamilyConcurrency> stop_holds{};
         for (std::size_t row = 0; row < row_count; ++row) {
             const std::uint32_t lane                = ContractAccess::lane(members[row]).value;
             lanes[row]                              = lane;
@@ -643,12 +643,12 @@ DiscardResult ProgramImpl::abort_pending(PendingBatch&& pending) noexcept {
     DiscardResult out;
     const auto rows  = ContractAccess::rows(pending);
     const bool valid = valid_pending(pending);
-    out.row_count    = std::min<std::size_t>(rows.size(), kMaximumConcurrency);
-    std::array<SequenceHandle, kMaximumConcurrency> members{};
+    out.row_count    = std::min<std::size_t>(rows.size(), kMaximumFamilyConcurrency);
+    std::array<SequenceHandle, kMaximumFamilyConcurrency> members{};
     for (std::size_t row = 0; row < out.row_count; ++row) { members[row] = rows[row]; }
     ContractAccess::consume(pending);
     if (!valid) { return out; }
-    std::array<std::uint32_t, kMaximumConcurrency> failed_lanes{};
+    std::array<std::uint32_t, kMaximumFamilyConcurrency> failed_lanes{};
     for (std::size_t row = 0; row < out.row_count; ++row) {
         failed_lanes[row] = ContractAccess::lane(members[row]).value;
     }

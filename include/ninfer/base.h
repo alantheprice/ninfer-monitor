@@ -9,7 +9,10 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-inline constexpr std::uint32_t kMaximumConcurrency               = 8;
+// The engine's lane ceiling. Inkling 2 decodes up to 32 lanes; every other family stays at
+// kMaximumFamilyConcurrency (engine.cpp refuses more).
+inline constexpr std::uint32_t kMaximumConcurrency               = 32;
+inline constexpr std::uint32_t kMaximumFamilyConcurrency         = 8;
 
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 

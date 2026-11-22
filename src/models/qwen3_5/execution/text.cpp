@@ -1324,7 +1324,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                                         ops::CausalAttentionExecutionEnvelope envelope,
                                         Tensor& hidden, Tensor& logits) {
     const std::int32_t batch = ids.ne[0];
-    if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+    if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumFamilyConcurrency)) {
         throw std::invalid_argument("ordinary decode batch size must be in [1,8]");
     }
     require_tensor_shape(ids, DType::I32, {batch}, "ordinary decode ids");
@@ -1375,7 +1375,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashVerifyMaximumWidth) || batch <= 0 ||
-        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        batch > static_cast<std::int32_t>(kMaximumFamilyConcurrency)) {
         throw std::invalid_argument("target verify batch shape is outside the supported domain");
     }
     const std::int32_t columns = width * batch;
@@ -1461,7 +1461,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kMtpVerifyMaximumWidth) || batch <= 0 ||
-        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        batch > static_cast<std::int32_t>(kMaximumFamilyConcurrency)) {
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
     require_tensor_shape(ids, DType::I32, {width, batch}, "MTP decode batch ids");
@@ -3328,7 +3328,7 @@ PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegme
         };
         columns += length;
     }
-    if (sample_rows.size() > kMaximumConcurrency) {
+    if (sample_rows.size() > kMaximumFamilyConcurrency) {
         throw std::invalid_argument("batched prefill samples more rows than lanes");
     }
 

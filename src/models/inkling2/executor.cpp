@@ -26,7 +26,10 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <array>
+#include <cstdlib>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -166,6 +169,7 @@ struct VisitPlan {
     // [sequences][kv heads][slots] addressing, one row of codes and one of scales per slot.
     KvArea k_codes, k_scales, v_codes, v_scales;
     int slots = 0, ring = 0;
+    int window = 0; // a drafter ring's own attention window (0: the drafter's sliding window)
     std::int64_t seq_stride = 0, head_stride = 0;
     std::vector<DeviceBuffer> checkpoint; // sliding: every sequence's rings, K then V
 };
@@ -283,6 +287,10 @@ struct Executor::Impl {
     std::size_t workspace_bytes = 0;
     std::uint64_t kv_bytes      = 0;
     int decode_splits_full = 1, decode_splits_sliding = 1;
+    // Span splits of decode and verification calls (kernels::AttentionArgs::span): the span and
+    // the most splits a block covers, full-attention and sliding visits; span 0 is off
+    // (NINFER_INKLING_SPAN=0: the earlier per-call splits, verification rows one block each).
+    int span_full = 0, span_sliding = 0, span_splits_full = 1, span_splits_sliding = 1;
     std::map<std::uint32_t, GraphEntry> graphs;
     std::vector<std::uint32_t> verify_widths;
     std::unique_ptr<dspine::Runtime> spine;
@@ -292,6 +300,68 @@ struct Executor::Impl {
     DeviceBuffer d_patches, d_image_rows;
 
     static constexpr int kR = Executor::kHistory;
+
+    // The second stream's context (Executor::side_begin): what a call's enqueued work owns.
+    struct SideContext {
+        cudaStream_t stream = nullptr;
+        std::unique_ptr<WorkspaceArena> workspace;
+        DeviceBuffer d_tokens, d_positions, d_sequences, d_starts, staging_k, staging_v;
+        std::unique_ptr<PinnedHostBuffer> h_staging;
+        std::unique_ptr<CudaCompletionEvent> staged;
+        cudaEvent_t done = nullptr, mark = nullptr;
+        bool in = false;
+        // A side call is captured and launched as one graph: launching its ~1,500 kernels one by
+        // one would fill the launch queue and hold the host until the GPU drained them. Executable
+        // graphs by node count, updated in place for each call of the same shape.
+        std::map<std::size_t, cudaGraphExec_t> execs;
+    };
+    bool capturing = false;
+    std::unique_ptr<SideContext> side;
+
+    void swap_side() {
+        SideContext& c = *side;
+        std::swap(stream, c.stream);
+        std::swap(workspace, c.workspace);
+        std::swap(d_tokens, c.d_tokens);
+        std::swap(d_positions, c.d_positions);
+        std::swap(d_sequences, c.d_sequences);
+        std::swap(d_starts, c.d_starts);
+        std::swap(staging_k, c.staging_k);
+        std::swap(staging_v, c.staging_v);
+        std::swap(h_staging, c.h_staging);
+        std::swap(staged, c.staged);
+    }
+
+    void plan_side() {
+        if (const char* v = std::getenv("NINFER_INKLING_OVERLAP"); v != nullptr && std::string(v) == "0") {
+            return;
+        }
+        if (delivery || cpu_experts || model.expert_parallel() || spine) { return; }
+        std::size_t free_bytes = 0, total_bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        const std::size_t need = workspace_bytes + staging_k.bytes + staging_v.bytes + (64u << 20);
+        if (need + kGraphReserve + unbacked() > free_bytes) { return; }
+        auto c = std::make_unique<SideContext>();
+        int least = 0, greatest = 0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&c->stream, cudaStreamNonBlocking, least));
+        c->workspace   = std::make_unique<WorkspaceArena>(workspace_bytes);
+        c->d_tokens    = DeviceBuffer(d_tokens.bytes);
+        c->d_positions = DeviceBuffer(d_positions.bytes);
+        c->d_sequences = DeviceBuffer(d_sequences.bytes);
+        c->d_starts    = DeviceBuffer(d_starts.bytes);
+        if (staging_k.bytes > 0) {
+            c->staging_k = DeviceBuffer(staging_k.bytes);
+            c->staging_v = DeviceBuffer(staging_v.bytes);
+            c->staging_k.fill(0);
+            c->staging_v.fill(0);
+        }
+        c->h_staging = std::make_unique<PinnedHostBuffer>(h_staging->size());
+        c->staged    = std::make_unique<CudaCompletionEvent>(device);
+        CUDA_CHECK(cudaEventCreateWithFlags(&c->done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&c->mark, cudaEventDisableTiming));
+        side = std::move(c);
+    }
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(o), config(m.config()) {
@@ -484,6 +554,13 @@ struct Executor::Impl {
         decode_splits_full =
             std::clamp((32 * sms + kv_heads - 1) / std::max(1, kv_heads), 1, 512);
         decode_splits_sliding = 16;
+        if (const char* v = std::getenv("NINFER_INKLING_SPAN"); v == nullptr || std::string(v) != "0") {
+            const auto up16 = [](std::int64_t x) { return int((x + 31) / 32 * 32); }; // 32-key tiles
+            span_full        = std::max(256, up16((std::int64_t(options.max_context) + 239) / 240));
+            span_splits_full = int((std::int64_t(options.max_context) + span_full - 1) / span_full) + 1;
+            span_sliding        = 64;
+            span_splits_sliding = (window + kMaxDecodeRows + 16 + span_sliding - 1) / span_sliding + 1;
+        }
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, sequences);
         d_tokens    = DeviceBuffer(rows * 4);
         d_positions = DeviceBuffer(rows * 4);
@@ -536,6 +613,7 @@ struct Executor::Impl {
         if (options.dspine) { make_spine(); }
         allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
+        plan_side();
     }
 
     LayerPlan plan_layer(std::uint32_t i) {
@@ -806,14 +884,24 @@ struct Executor::Impl {
 
     // A drafter layer's caches: a sliding layer's ring (the window and kR slots past it, like the
     // target's) with its checkpoint, a full layer's every position.
+    // A drafter layer's ring: its own window (a windowed full layer) or the sliding one.
+    [[nodiscard]] bool spark_windowed(bool full) const {
+        return full && options.draft_window > 0 && options.draft_window + kR < options.max_context;
+    }
+    [[nodiscard]] int spark_window_ring() const {
+        return int(round_up(options.draft_window + kR, 256));
+    }
+
     [[nodiscard]] std::size_t spark_planned_bytes() const {
         const DSparkConfig& dc = *model.dspark_config();
         const std::size_t kv = 2 * std::size_t(dc.num_key_value_heads) * dc.head_dim * sizeof(__half) *
                                options.sequences;
         std::size_t bytes = 0;
         for (const bool full : dc.full_attention) {
-            bytes += full ? std::size_t(round_up(options.max_context + 1, 256)) * kv
-                          : (options.checkpoints ? 2 : 1) * std::size_t(ring) * kv;
+            const int slots = spark_windowed(full) ? spark_window_ring() : ring;
+            bytes += full && !spark_windowed(full)
+                         ? std::size_t(round_up(options.max_context + 1, 256)) * kv
+                         : (options.checkpoints ? 2 : 1) * std::size_t(slots) * kv;
         }
         bytes += (options.checkpoints ? 2 : 1) * std::size_t(options.sequences) * kR *
                  config.hidden_size * 4;
@@ -887,9 +975,11 @@ struct Executor::Impl {
             l.key_norm         = fp32(model, lw.key_norm, kD);
             l.context_key_norm = fp32(model, lw.context_key_norm, kD);
             VisitPlan& c   = l.cache;
-            c.full         = dc.full_attention[i];
-            c.slots        = c.full ? global_slots : ring;
-            c.ring         = c.full ? 0 : ring;
+            const bool windowed = spark_windowed(dc.full_attention[i]);
+            c.full         = dc.full_attention[i] && !windowed;
+            c.window       = windowed ? int(options.draft_window) : 0;
+            c.slots        = c.full ? global_slots : windowed ? spark_window_ring() : ring;
+            c.ring         = c.full ? 0 : c.slots;
             c.head_stride  = std::int64_t(c.slots) * kD;
             c.seq_stride   = c.head_stride * kv_heads;
             for (KvArea* area : {&c.k, &c.v}) {
@@ -916,12 +1006,14 @@ struct Executor::Impl {
         }
         d->table_m = DeviceBuffer(std::size_t(vocab) * rank * 2);
         d->table_c = DeviceBuffer(std::size_t(vocab) * 4);
-        d->state   = DeviceBuffer(std::size_t(rank) * 4);
-        d->prev    = DeviceBuffer(4);
-        d->drafts  = DeviceBuffer(std::size_t(d->block) * 4);
-        d->confidence = DeviceBuffer(std::size_t(d->block) * 4);
+        // A round's state for up to kernels::kSparkMaxLanes sequences drafting together.
+        const std::size_t lanes = kernels::kSparkMaxLanes;
+        d->state   = DeviceBuffer(std::size_t(rank) * 4 * lanes);
+        d->prev    = DeviceBuffer(4 * lanes);
+        d->drafts  = DeviceBuffer(std::size_t(d->block) * 4 * lanes);
+        d->confidence = DeviceBuffer(std::size_t(d->block) * 4 * lanes);
         d->bytes += d->table_m.bytes + d->table_c.bytes;
-        d->host   = std::make_unique<PinnedHostBuffer>(std::size_t(d->block) * 8);
+        d->host   = std::make_unique<PinnedHostBuffer>(std::size_t(d->block) * 8 * lanes);
         d->copied = std::make_unique<CudaCompletionEvent>(device);
         spark = std::move(d);
     }
@@ -1015,7 +1107,9 @@ struct Executor::Impl {
             ra.x           = kv;
             ra.stride      = 2 * kvd;
             ra.heads       = kv_heads;
-            ra.begin       = layer.cache.full ? 0 : std::max(0, n - d.window);
+            ra.begin       = layer.cache.full
+                                 ? 0
+                                 : std::max(0, n - (layer.cache.window ? layer.cache.window : d.window));
             ra.end         = n;
             ra.norm        = layer.context_key_norm;
             ra.eps         = dc.rms_norm_eps;
@@ -1033,17 +1127,19 @@ struct Executor::Impl {
     // positions): its layers over the context and the block (every row seeing the anchor's window
     // and the whole block), the final norm, the head's products, then `k` steps of the recurrent
     // head, their drafts and probabilities copied to the pinned buffer.
-    void spark_pass(int k) {
+    // The DSpark pass of `n` sequences' blocks (rows j * block .. of sequence j), `k` drafts each.
+    void spark_pass(int n, int k) {
         Spark& d = *spark;
         const DSparkConfig& dc = *d.config;
-        const int b = d.block, q = query_heads * kD, w = int(dc.intermediate_size);
+        const int bl = d.block, b = n * bl, q = query_heads * kD, w = int(dc.intermediate_size);
         const float deps = dc.rms_norm_eps;
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * hidden * 4).data);
-        table_rows(embedding, static_cast<const std::int32_t*>(d_tokens.p), 1, h, hidden, stream);
-        kernels::rms_norm(h, embedding_norm, hidden, 1, eps, nullptr, stream, {}, h);
-        for (int i = 1; i < b; ++i) {
+        table_rows(embedding, static_cast<const std::int32_t*>(d_tokens.p), n == 1 ? 1 : b, h, hidden, stream);
+        kernels::rms_norm(h, embedding_norm, hidden, n == 1 ? 1 : b, eps, nullptr, stream, {}, h);
+        for (int i = 0; i < b; ++i) {
+            if (i % bl == 0) { continue; }
             CUDA_CHECK(cudaMemcpyAsync(h + std::int64_t(i) * hidden, d.mask_embedding,
                                        std::size_t(hidden) * 4, cudaMemcpyDeviceToDevice, stream));
         }
@@ -1096,7 +1192,7 @@ struct Executor::Impl {
             aa.seq_stride  = l.cache.seq_stride;
             aa.head_stride = l.cache.head_stride;
             aa.ring        = l.cache.ring;
-            aa.window      = l.cache.full ? 0 : d.window + b;
+            aa.window      = l.cache.full ? 0 : (l.cache.window ? l.cache.window : d.window) + bl;
             aa.query_heads = query_heads;
             aa.kv_heads    = kv_heads;
             aa.scale       = 1.0f / std::sqrt(float(kD));
@@ -1117,23 +1213,29 @@ struct Executor::Impl {
         }
         auto* final_rows = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * hidden * 4).data);
         kernels::rms_norm(h, d.final_norm, hidden, b, deps, nullptr, stream, {}, final_rows);
-        // The head's products of the rows the k steps read (1..k), in their rows of `base`.
+        // The head's products of the rows the k steps read (1..k of each block; every row after
+        // the first with several blocks), in their rows of `base`.
+        const int head_rows = n == 1 ? k : b - 1;
         auto* base = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * vocab * 4).data);
         if (head.qtype == QType::BF16) {
             auto* head_in = static_cast<__nv_bfloat16*>(
-                workspace->alloc_bytes(std::size_t(k) * hidden * 2).data);
-            kernels::rms_norm(h + hidden, d.final_norm, hidden, k, deps, head_in, stream);
-            project_f32(Tensor(head_in, DType::BF16, {hidden, k}), head_tiles, base + vocab, vocab);
+                workspace->alloc_bytes(std::size_t(head_rows) * hidden * 2).data);
+            kernels::rms_norm(h + hidden, d.final_norm, hidden, head_rows, deps, head_in, stream);
+            project_f32(Tensor(head_in, DType::BF16, {hidden, head_rows}), head_tiles, base + vocab, vocab);
         } else {
-            const Q8Act head_in = alloc_q8(hidden, k);
-            kernels::rms_norm(h + hidden, d.final_norm, hidden, k, deps, nullptr, stream,
+            const Q8Act head_in = alloc_q8(hidden, head_rows);
+            kernels::rms_norm(h + hidden, d.final_norm, hidden, head_rows, deps, nullptr, stream,
                               head_in.rows);
-            vector_f32(head_in.base, head, k, base + vocab, vocab);
+            vector_f32(head_in.base, head, head_rows, base + vocab, vocab);
         }
         auto* scratch = static_cast<float*>(
-            workspace->alloc_bytes(kernels::spark_step_floats(vocab) * 4).data);
-        CUDA_CHECK(cudaMemsetAsync(d.state.p, 0, d.state.bytes, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d.prev.p, d_tokens.p, 4, cudaMemcpyDeviceToDevice, stream));
+            workspace->alloc_bytes(kernels::spark_step_floats(vocab) * 4 * std::size_t(n)).data);
+        CUDA_CHECK(cudaMemsetAsync(d.state.p, 0, std::size_t(n) * dc.markov_rank * 4, stream));
+        for (int j = 0; j < n; ++j) {
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(d.prev.p) + j,
+                                       static_cast<const std::int32_t*>(d_tokens.p) + j * bl, 4,
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
         kernels::SparkStepArgs sa;
         sa.weight       = d.joint;
         sa.bias         = d.joint_bias;
@@ -1158,43 +1260,71 @@ struct Executor::Impl {
         sa.joint        = scratch;
         sa.logits       = scratch + 3 * dc.markov_rank;
         sa.partials     = sa.logits + vocab;
+        sa.lanes        = n;
+        sa.block        = bl;
         for (int i = 1; i <= k; ++i) {
             sa.row = i;
             kernels::spark_step(sa, stream);
         }
+        // Host: drafts [n][block], then confidence [n][block].
         auto* host = static_cast<std::uint8_t*>(d.host->data());
-        CUDA_CHECK(cudaMemcpyAsync(host, d.drafts.p, std::size_t(k) * 4, cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(host + std::size_t(d.block) * 4, d.confidence.p, std::size_t(k) * 4,
-                                   cudaMemcpyDeviceToHost, stream));
+        const std::size_t bytes = std::size_t(b) * 4;
+        CUDA_CHECK(cudaMemcpyAsync(host, d.drafts.p, bytes, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(host + bytes, d.confidence.p, bytes, cudaMemcpyDeviceToHost, stream));
     }
 
     void spark_draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
                      std::span<float> confidence) {
+        spark_draft_lanes({&sequence, 1}, {&anchor, 1}, drafts, confidence);
+    }
+
+    // DSpark drafts of up to kSparkMaxLanes sequences in one pass: drafts.size() / sequences
+    // each, sequence j's at j * k.
+    void spark_draft_lanes(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
+                           std::span<std::int32_t> drafts, std::span<float> confidence) {
         if (!spark) { throw std::logic_error("inkling2: an executor without the DSpark drafter"); }
         Spark& d    = *spark;
         const int b = d.block;
-        const int k = int(drafts.size());
-        if (sequence >= options.sequences || k < 1 || k > b - 1 ||
-            confidence.size() != drafts.size() || anchor < 0 || anchor >= vocab) {
+        const int n = int(sequences.size());
+        if (n < 1 || n > kernels::kSparkMaxLanes || anchors.size() != sequences.size() ||
+            drafts.size() % sequences.size() != 0 || confidence.size() != drafts.size()) {
             throw std::invalid_argument("inkling2 draft: invalid call");
         }
-        const std::uint32_t first = positions[sequence];
-        if (first == 0 || first + std::uint32_t(b) > options.max_context) {
-            throw std::invalid_argument("inkling2 draft: a block needs a committed token before it "
-                                        "and room in the context");
+        const int k = int(drafts.size()) / n;
+        if (k < 1 || k > b - 1) { throw std::invalid_argument("inkling2 draft: invalid call"); }
+        std::vector<std::int32_t> tokens(std::size_t(n) * b, 0), pos(std::size_t(n) * b),
+            seq(std::size_t(n) * b);
+        for (int j = 0; j < n; ++j) {
+            const std::uint32_t sequence = sequences[j];
+            if (sequence >= options.sequences || anchors[j] < 0 || anchors[j] >= vocab ||
+                std::count(sequences.begin(), sequences.begin() + j, sequence) != 0) {
+                throw std::invalid_argument("inkling2 draft: invalid call");
+            }
+            const std::uint32_t first = positions[sequence];
+            if (first == 0 || first + std::uint32_t(b) > options.max_context) {
+                throw std::invalid_argument("inkling2 draft: a block needs a committed token before it "
+                                            "and room in the context");
+            }
+            tokens[std::size_t(j) * b] = anchors[j];
+            for (int i = 0; i < b; ++i) {
+                pos[std::size_t(j) * b + i] = std::int32_t(first) + i;
+                seq[std::size_t(j) * b + i] = std::int32_t(sequence);
+            }
         }
         prepare_spark();
-        back(sequence, first + std::uint32_t(b));
-        std::vector<std::int32_t> tokens(b, 0), pos(b), seq(b, std::int32_t(sequence));
-        tokens[0] = anchor;
-        for (int i = 0; i < b; ++i) { pos[i] = std::int32_t(first) + i; }
+        for (int j = 0; j < n; ++j) { back(sequences[j], positions[sequences[j]] + std::uint32_t(b)); }
         stage(tokens, pos, seq);
-        run_graph(48 + std::uint32_t(k), [&] { spark_pass(k); });
+        run_graph(n == 1 ? 48 + std::uint32_t(k) : 1024 + std::uint32_t(n) * 16 + std::uint32_t(k),
+                  [&] { spark_pass(n, k); });
         d.copied->record(stream);
         d.copied->synchronize();
         const auto* host = static_cast<const std::uint8_t*>(d.host->data());
-        std::memcpy(drafts.data(), host, std::size_t(k) * 4);
-        std::memcpy(confidence.data(), host + std::size_t(b) * 4, std::size_t(k) * 4);
+        const std::size_t plane = std::size_t(n) * b * 4;
+        for (int j = 0; j < n; ++j) {
+            std::memcpy(drafts.data() + std::size_t(j) * k, host + std::size_t(j) * b * 4, std::size_t(k) * 4);
+            std::memcpy(confidence.data() + std::size_t(j) * k, host + plane + std::size_t(j) * b * 4,
+                        std::size_t(k) * 4);
+        }
     }
 
     // ---- Expert delivery -------------------------------------------------------------------------
@@ -1395,6 +1525,15 @@ struct Executor::Impl {
 
     ~Impl() {
         if (delivery || growing) { ninfer::wait_for_stream(stream); }
+        if (side) {
+            if (side->in) { swap_side(); }
+            (void)cudaStreamSynchronize(side->stream);
+            side->workspace.reset();
+            for (auto& [n, exec] : side->execs) { (void)cudaGraphExecDestroy(exec); }
+            (void)cudaEventDestroy(side->done);
+            (void)cudaEventDestroy(side->mark);
+            (void)cudaStreamDestroy(side->stream);
+        }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
@@ -1411,8 +1550,12 @@ struct Executor::Impl {
 
     static constexpr int kHeadRows = 64; // LM-head columns per FP32 plane pass
 
+    // Rows of one decode call: every active lane's next token. The vector products take 8
+    // columns a group, so a call of 9..32 lanes runs them in up to four column groups.
+    static constexpr int kMaxDecodeRows = 64;
+
     [[nodiscard]] int decode_rows() const {
-        return std::min<int>(gguf::kMaxVectorColumns,
+        return std::min<int>(kMaxDecodeRows,
                              std::max<int>(int(options.sequences), int(options.draft_tokens) + 1));
     }
 
@@ -1645,7 +1788,15 @@ struct Executor::Impl {
             return;
         }
         if (act != nullptr && t <= gguf::kMaxVectorColumns) {
-            const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
+            static const int chunk_override = [] {
+                const char* v = std::getenv("NINFER_INKLING_MOE_CHUNK");
+                return v != nullptr ? std::atoi(v) : 0;
+            }();
+            // Two columns a pass at any width: with 8 of 128 experts a token, an expert of a call of
+            // up to 8 tokens holds one or two of its pairs, and the wider forms' registers cost more
+            // occupancy than their shared weight loads save (RTX PRO 6000, 8 requests: 622 tok/s
+            // at 2 against 517 at 8, the same sums at any width).
+            const int chunk = chunk_override > 0 ? std::min(chunk_override, 8) : t <= 1 ? 1 : 2;
             void* act2      = space.alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, on));
             // Another rank's pairs keep zero rows; their middles are never read.
@@ -1813,12 +1964,54 @@ struct Executor::Impl {
                     column_stride, row);
     }
 
+    // A vector call's query, key and value products in one launch, when they share a block type
+    // and K (each row's sums are the separate launches' bit for bit). NINFER_INKLING_QKV_SEGMENTS=0
+    // keeps them apart.
+    bool projections_in_one_launch(Call& c, const LayerPlan& lp, int ki, int vi, int t, float* qgr,
+                                   float* kv) {
+        static const bool enabled = [] {
+            const char* v = std::getenv("NINFER_INKLING_QKV_SEGMENTS");
+            return v == nullptr || v[0] != '0';
+        }();
+        if (!enabled || !c.q8 || lp.query.size() + 2 > std::size_t(gguf::kMaxVectorSegments)) {
+            return false;
+        }
+        const auto same = [&](const Weight& w) {
+            return w.qtype == lp.key.qtype && w.k == lp.key.k;
+        };
+        if (!same(lp.value)) { return false; }
+        for (const Weight& w : lp.query) {
+            if (!same(w)) { return false; }
+        }
+        std::array<gguf::VectorSegment, gguf::kMaxVectorSegments> segments{};
+        int n = 0;
+        const auto add = [&](const Weight& w, const void* x, float* out, int stride) {
+            gguf::VectorSegment& s = segments[std::size_t(n++)];
+            s.weight               = w.qdata;
+            s.row_bytes            = row_bytes(w);
+            s.rows                 = w.n;
+            s.activation           = x;
+            s.out.f32              = out;
+            s.out.column_stride    = stride;
+        };
+        for (std::size_t i = 0, row = 0; i < lp.query.size(); row += lp.query[i].n, ++i) {
+            add(lp.query[i], input_q(c, 0), qgr + row, lp.query_rows);
+        }
+        add(lp.key, input_q(c, ki), kv, 2 * kvd);
+        add(lp.value, input_q(c, vi), kv + kvd, 2 * kvd);
+        gguf::vector_product_segments(ops::detail::gguf_type(lp.key.qtype), lp.key.k, t,
+                                      segments.data(), n, stream);
+        return true;
+    }
+
     static constexpr std::size_t kStagingRegions = 4;
 
     // Tokens, positions, and when given sequences and branch starts, to the device.
     void stage(std::span<const std::int32_t> a, std::span<const std::int32_t> b,
                std::span<const std::int32_t> c, std::span<const std::int32_t> g = {}) {
-        staged->synchronize();
+        // A captured side call runs after the previous one finished (side_idle), so its staging
+        // is free; the event cannot be waited on inside a capture.
+        if (!capturing) { staged->synchronize(); }
         auto* host = static_cast<std::int32_t*>(h_staging->data());
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, options.sequences);
         if (a.size() > rows || b.size() > rows || c.size() > rows || g.size() > rows) {
@@ -1839,7 +2032,7 @@ struct Executor::Impl {
             CUDA_CHECK(cudaMemcpyAsync(d_starts.p, host + 3 * rows, g.size() * 4,
                                        cudaMemcpyHostToDevice, stream));
         }
-        staged->record(stream);
+        if (!capturing) { staged->record(stream); }
     }
 
     // ---- The forward pass ------------------------------------------------------------------------
@@ -1854,6 +2047,11 @@ struct Executor::Impl {
         int kept  = 0;              // a prompt chunk's rows the sequence keeps
         bool keep = false;          // a decode or verification call keeps its rows' history
         int row_group = 1;          // a verification's rows a full visit's attention block takes
+        // A verification call's runs of rows (kernels::AttentionArgs::runs; null: none) and their
+        // count; and (span splits) a power-of-two bound on the call's keys, which sizes the grid.
+        const std::int32_t* runs = nullptr;
+        int run_count = 0;
+        std::int64_t key_bound = 0;
         kernels::Rows rows;
         States states;
         // The attention's three normed inputs (input 0 alone when `distinct` is 1): BF16 rows,
@@ -2016,8 +2214,8 @@ struct Executor::Impl {
         }
         down.count = count;
         up.count   = 2 * count;
-        kernels::gemm_f32_batch(r, t, 2 * hidden, down, stream);
-        kernels::gemm_f32_batch(hidden, t, r, up, stream);
+        kernels::gemm_f32_batch(r, t, 2 * hidden, down, stream, 0, 0, c.q8);
+        kernels::gemm_f32_batch(hidden, t, r, up, stream, 0, 0, c.q8);
         ca.eps          = eps;
         ca.query_stride = c.plane;
         set_outputs(c, ca.out, ca.out_q, ca.f32, ca.q8_stride, out_bf16, out_q, q_stride, out_f32);
@@ -2179,25 +2377,27 @@ struct Executor::Impl {
         auto* qgr = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * lp.query_rows * 4).data);
         auto* kv  = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 4).data);
         auto* sinks = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * 4).data);
-        for (std::size_t i = 0, row = 0; i < lp.query.size(); row += lp.query[i].n, ++i) {
-            product(lp.query[i], input_q(c, 0), bf16_in(0), t, qgr, lp.query_rows, int(row));
+        if (!projections_in_one_launch(c, lp, ki, vi, t, qgr, kv)) {
+            for (std::size_t i = 0, row = 0; i < lp.query.size(); row += lp.query[i].n, ++i) {
+                product(lp.query[i], input_q(c, 0), bf16_in(0), t, qgr, lp.query_rows, int(row));
+            }
+            product(lp.key, input_q(c, ki), bf16_in(ki), t, kv, 2 * kvd, 0);
+            product(lp.value, input_q(c, vi), bf16_in(vi), t, kv, 2 * kvd, kvd);
         }
-        product(lp.key, input_q(c, ki), bf16_in(ki), t, kv, 2 * kvd, 0);
-        product(lp.value, input_q(c, vi), bf16_in(vi), t, kv, 2 * kvd, kvd);
-        kernels::gemm_f32(query_heads, t, hidden, lp.sinks, f32_in(0), sinks, stream);
+        kernels::gemm_f32(query_heads, t, hidden, lp.sinks, f32_in(0), sinks, stream, 0, 0, c.q8);
         float* taps = nullptr;
         const int tap_columns = 2 * kv_heads * kTaps;
         if (lp.full) {
             taps = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * tap_columns * 4).data);
             kernels::gemm_f32(kv_heads * kTaps, t, hidden, lp.key_taps, f32_in(ki), taps, stream, 0,
-                              tap_columns);
+                              tap_columns, c.q8);
             kernels::gemm_f32(kv_heads * kTaps, t, hidden, lp.value_taps, f32_in(vi),
-                              taps + kv_heads * kTaps, stream, 0, tap_columns);
+                              taps + kv_heads * kTaps, stream, 0, tap_columns, c.q8);
         }
         auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
         auto* r = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * rel * 4).data);
+        kernels::QueryArgs qa;
         {
-            kernels::QueryArgs qa;
             qa.qgr             = qgr;
             qa.stride          = lp.query_rows;
             qa.relative_column = 2 * q_floats;
@@ -2213,8 +2413,14 @@ struct Executor::Impl {
             qa.positions       = c.rows.positions;
             qa.q_out           = q;
             qa.r_out           = r;
-            kernels::query_post(qa, stream);
         }
+        // A decode call's query and key/value epilogues go in one launch below.
+        static const bool merged_post = [] {
+            const char* v = std::getenv("NINFER_INKLING_MERGED_POST");
+            return v == nullptr || v[0] != '0';
+        }();
+        const bool merge_post = merged_post && !c.chunk;
+        if (!merge_post) { kernels::query_post(qa, stream); }
         // K and V into the cache: a prompt chunk's sliding visit attends over the staging ring
         // (the window before the chunk comes over from the sequence's ring, the chunk's keys land
         // there, and the window that ends the chunk's kept rows goes back). A full visit of an
@@ -2294,7 +2500,12 @@ struct Executor::Impl {
             ka.head_stride = vp.head_stride;
             ka.ring        = vp.ring;
         }
-        kernels::kv_post(ka, stream);
+        if (merge_post && !(quantized && kvfmt.staged())) {
+            kernels::qkv_post(qa, ka, stream);
+        } else {
+            if (merge_post) { kernels::query_post(qa, stream); }
+            kernels::kv_post(ka, stream);
+        }
         if (quantized && kvfmt.staged()) {
             for (const auto& [src, plane] :
                  {std::pair{ka.k_cache, k_view}, std::pair{ka.v_cache, v_view}}) {
@@ -2342,19 +2553,29 @@ struct Executor::Impl {
             aa.kv_heads    = kv_heads;
             aa.scale       = 1.0f / std::sqrt(float(kD));
             aa.splits      = c.chunk ? 1 : (lp.full ? decode_splits_full : decode_splits_sliding);
-            // A prompt chunk far enough into a full visit runs its far field on tensor cores.
-            if (c.chunk && lp.full && ka.ring == 0 &&
-                c.first > int(config.relative_extent)) {
+            // A prompt chunk far enough into a full visit runs its far field on tensor cores (when
+            // the whole chunk does not: kernels::tc_prompt_attention).
+            if (c.chunk && lp.full && ka.ring == 0 && c.first > int(config.relative_extent) &&
+                (c.rows.starts != nullptr || !kernels::tc_prompt_attention())) {
                 aa.far = static_cast<float*>(workspace->alloc_bytes(
                     kernels::attention_workspace_floats(t, query_heads, 1) * 4).data);
             }
-            if (!c.chunk && lp.full && ka.ring == 0 && c.row_group > 1) {
+            if (!c.chunk && span_full > 0) {
+                aa.span      = lp.full ? span_full : span_sliding;
+                aa.splits    = lp.full ? int(std::min<std::int64_t>(
+                                             span_splits_full,
+                                             c.key_bound > 0 ? (c.key_bound + span_full - 1) / span_full + 1
+                                                             : span_splits_full))
+                                       : span_splits_sliding;
+                aa.runs      = c.runs;
+                aa.run_count = c.run_count;
+            } else if (!c.chunk && lp.full && ka.ring == 0 && c.row_group > 1) {
                 // The groups: at most ceil(t / row_group), one more for each further sequence.
                 aa.row_group  = c.row_group;
                 aa.row_groups = std::min(t, (t + c.row_group - 1) / c.row_group +
                                                 std::min(t, int(options.sequences)) - 1);
             }
-            if (!c.chunk && aa.splits > 1) {
+            if (!c.chunk && (aa.splits > 1 || aa.span > 0)) {
                 aa.partial = static_cast<float*>(workspace->alloc_bytes(
                     kernels::attention_workspace_floats(t, query_heads, aa.splits) * 4).data);
             }
@@ -2440,7 +2661,7 @@ struct Executor::Impl {
         auto* weights    = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * 4).data);
         auto* pair_scale = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * 4).data);
         auto* logits     = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * e * 4).data);
-        kernels::gemm_f32(e, t, hidden, p.router, c.ffn_f32, logits, stream);
+        kernels::gemm_f32(e, t, hidden, p.router, c.ffn_f32, logits, stream, 0, 0, c.q8);
         kernels::RouteArgs route;
         route.hidden        = hidden;
         route.tokens        = t;
@@ -2456,7 +2677,10 @@ struct Executor::Impl {
         route.pair_scale    = pair_scale;
         // A short call's route kernel also groups its pairs by expert.
         void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
-        const bool sorted = t <= kernels::kSortedRouteRows && e <= kernels::kSortedRouteExperts;
+        // The sorted route's tile lists hold one tile an expert, right for the matrix kernels only
+        // while no expert has more than 8 pairs: past 8 rows only a vector call takes it.
+        const bool sorted = (t <= kernels::kSortedRouteBlockRows || c.q8) &&
+                            t <= kernels::kSortedRouteRows && e <= kernels::kSortedRouteExperts;
         gguf::MoeRouting routing;
         if (sorted) {
             routing = gguf::moe_sorted_routes(routing_space, pairs, e);
@@ -2498,11 +2722,18 @@ struct Executor::Impl {
         auto* gu = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
         if (vector) {
-            const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
+            static const int chunk_override = [] {
+                const char* v = std::getenv("NINFER_INKLING_MOE_CHUNK");
+                return v != nullptr ? std::atoi(v) : 0;
+            }();
+            // Two columns a pass at any width: with 8 of 128 experts a token, an expert of a call of
+            // up to 8 tokens holds one or two of its pairs, and the wider forms' registers cost more
+            // occupancy than their shared weight loads save (RTX PRO 6000, 8 requests: 622 tok/s
+            // at 2 against 517 at 8, the same sums at any width).
+            const int chunk = chunk_override > 0 ? std::min(chunk_override, 8) : t <= 1 ? 1 : 2;
             void* act2  = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             auto* fixed = static_cast<unsigned long long*>(
                 workspace->alloc_bytes(std::size_t(t) * hidden * 8).data);
-            CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
             gguf::MoeOutput rows;
             rows.f32 = gu;
             gguf::MoeOutput out;
@@ -2516,6 +2747,24 @@ struct Executor::Impl {
                 gguf::moe_vector_product(p.down_type, down, part, max_active, 1, k, act2, pairs,
                                          out, chunk, stream);
             };
+            static const bool fused_situ = [] {
+                const char* v = std::getenv("NINFER_INKLING_FUSED_SITU");
+                return v == nullptr || v[0] != '0';
+            }();
+            if (!call && fused_situ) {
+                // The memset, SiTU and quantization in one kernel between the two products.
+                gguf::moe_vector_product(p.gate_up_type, gate_up, routing, max_active, k, k, act, t,
+                                         rows, chunk, stream);
+                kernels::situ_quantize(gu, 2 * std::int64_t(width), pairs, width, pair_scale,
+                                       config.gate_cap, config.up_cap, act2,
+                                       gguf::vector_activation_scales_offset(width, pairs), fixed,
+                                       std::int64_t(t) * hidden, stream);
+                gguf::moe_vector_product(p.down_type, down, routing, max_active, 1, k, act2, pairs,
+                                         out, chunk, stream);
+                ra.fixed = fixed;
+                return;
+            }
+            CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
             if (call) {
                 // Both stages add to the same exact fixed-point sum, each over its experts of the
                 // call's sorted routes. The middles of the other stage's pairs come from zero rows
@@ -2761,12 +3010,36 @@ struct Executor::Impl {
     // `keep` (a decode step) each row's drafter taps go into its sequence's lane; a verification
     // keeps them for commit(). Both keep every row's convolution history (positions a later call
     // rewrites when commit() keeps fewer).
-    void decode_body(int b, bool keep, int row_group = 1) {
+    // A power of two (at least 4096) at or above `keys`: the key bound of span splits, which
+    // keys the call's graph.
+    static std::int64_t key_bound_of(std::int64_t keys) {
+        std::int64_t b = 4096;
+        while (b < keys) { b *= 2; }
+        return b;
+    }
+    static std::uint32_t bound_index(std::int64_t bound) {
+        std::uint32_t i = 0;
+        while ((std::int64_t(4096) << i) < bound) { ++i; }
+        return i;
+    }
+
+    void decode_body(int b, bool keep, int row_group = 1, int runs = 0, std::int64_t key_bound = 0) {
+        // Q8_0 products on the tensor cores (NINFER_INKLING_DENSE_MMA=1; off by default: this first
+        // form is latency-bound below 8 columns, C=1 321 -> 285 tok/s, C=8 64 -> 67).
+        static const bool dense_mma = [] {
+            const char* v = std::getenv("NINFER_INKLING_DENSE_MMA");
+            return v != nullptr && std::string(v) == "1";
+        }();
+        std::optional<gguf::VectorMmaScope> mma;
+        if (dense_mma) { mma.emplace(); }
         workspace->reset();
         auto scope = workspace->scope();
         Call c;
         c.t              = b;
         c.row_group      = row_group;
+        c.runs           = runs > 0 && span_full > 0 ? static_cast<const std::int32_t*>(d_starts.p) : nullptr;
+        c.run_count      = runs;
+        c.key_bound      = key_bound;
         c.q8             = !bf16_rows;
         c.keep           = true;
         c.rows.positions = static_cast<const std::int32_t*>(d_positions.p);
@@ -2809,7 +3082,7 @@ struct Executor::Impl {
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
         const int b = int(sequences.size());
         if (b <= 0 || std::uint32_t(b) > options.sequences || tokens.size() != sequences.size() ||
-            b > gguf::kMaxVectorColumns) {
+            b > kMaxDecodeRows) {
             throw std::invalid_argument("inkling2 decode: invalid batch");
         }
         std::vector<std::int32_t> pos(b), seq(b);
@@ -2826,7 +3099,11 @@ struct Executor::Impl {
         }
         for (int i = 0; i < b; ++i) { back(sequences[i], positions[sequences[i]] + 1); }
         stage(tokens, pos, seq);
-        run_graph(std::uint32_t(b), [&] { decode_body(b, true); });
+        std::int64_t keys = 0;
+        for (int i = 0; i < b; ++i) { keys = std::max<std::int64_t>(keys, pos[i] + 1); }
+        const std::int64_t bound = span_full > 0 ? key_bound_of(keys) : 0;
+        run_graph(span_full > 0 ? (1U << 16) | (bound_index(bound) << 8) | std::uint32_t(b) : std::uint32_t(b),
+                  [&] { decode_body(b, true, 1, 0, bound); });
         for (int i = 0; i < b; ++i) { positions[sequences[i]] += 1; }
     }
 
@@ -2849,7 +3126,7 @@ struct Executor::Impl {
             }
             rows += int(w);
         }
-        if (std::size_t(rows) != tokens.size() || rows > gguf::kMaxVectorColumns) {
+        if (std::size_t(rows) != tokens.size() || rows > kMaxDecodeRows) {
             throw std::invalid_argument("inkling2 verify: invalid width");
         }
         std::vector<std::int32_t> pos(rows), seq(rows);
@@ -2868,10 +3145,21 @@ struct Executor::Impl {
             }
         }
         for (int j = 0; j < n; ++j) { back(sequences[j], positions[sequences[j]] + row_widths[j]); }
-        stage(tokens, pos, seq);
-        // A full visit's attention reads each key tile once for up to four rows of a sequence.
-        run_graph(16 + std::uint32_t(rows),
-                  [&] { decode_body(rows, false, std::min(rows, kernels::kMaxRowGroup)); });
+        // With span splits each sequence's rows are one run of the verification's attention;
+        // without, a full visit's attention reads each key tile once for up to four rows.
+        std::vector<std::int32_t> runs(std::size_t(rows) + 1, rows);
+        for (int j = 0, at = 0; j < n; at += int(row_widths[j++])) { runs[j] = at; }
+        stage(tokens, pos, seq, runs);
+        std::int64_t keys = 0;
+        for (int i = 0; i < rows; ++i) { keys = std::max<std::int64_t>(keys, pos[i] + 1); }
+        if (span_full > 0) {
+            const std::int64_t bound = key_bound_of(keys);
+            run_graph((2U << 24) | (bound_index(bound) << 16) | (std::uint32_t(n) << 8) | std::uint32_t(rows),
+                      [&] { decode_body(rows, false, 1, n, bound); });
+        } else {
+            run_graph(64 + std::uint32_t(rows),
+                      [&] { decode_body(rows, false, std::min(rows, kernels::kMaxRowGroup)); });
+        }
         verify_widths = std::move(row_widths);
     }
 
@@ -2902,9 +3190,25 @@ struct Executor::Impl {
                 confidence.size() != drafts.size()) {
                 throw std::invalid_argument("inkling2 draft: invalid call");
             }
-            for (std::size_t j = 0; j < sequences.size(); ++j) {
-                spark_draft(sequences[j], anchors[j], drafts.subspan(j * k, k),
-                            confidence.subspan(j * k, k));
+            const std::size_t group = std::size_t(kernels::kSparkMaxLanes);
+            for (std::size_t j = 0; j < sequences.size(); j += group) {
+                const std::size_t m = std::min(group, sequences.size() - j);
+                spark_draft_lanes(sequences.subspan(j, m), anchors.subspan(j, m),
+                                  drafts.subspan(j * k, m * k), confidence.subspan(j * k, m * k));
+            }
+            static const bool check = std::getenv("NINFER_INKLING_SPARK_CHECK") != nullptr;
+            if (check && sequences.size() > 1) {
+                std::size_t differ = 0;
+                for (std::size_t j = 0; j < sequences.size(); ++j) {
+                    std::vector<std::int32_t> one(k);
+                    std::vector<float> conf(k);
+                    spark_draft(sequences[j], anchors[j], one, conf);
+                    for (std::size_t i = 0; i < k; ++i) {
+                        differ += one[i] != drafts[j * k + i] || conf[i] != confidence[j * k + i];
+                    }
+                }
+                std::fprintf(stderr, "spark check: %zu lanes x %u drafts, %zu differ\n",
+                             sequences.size(), unsigned(k), differ);
             }
             return;
         }
@@ -3257,6 +3561,65 @@ Tensor Executor::logits(std::uint32_t rows) const {
 }
 
 cudaStream_t Executor::head_stream() const noexcept { return impl_->stream; }
+
+bool Executor::overlap() const noexcept { return impl_->side != nullptr; }
+
+void Executor::side_begin() {
+    auto& i = *impl_;
+    if (!i.side || i.side->in) { throw std::logic_error("inkling2: no side context free"); }
+    CUDA_CHECK(cudaEventRecord(i.side->mark, i.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(i.side->stream, i.side->mark, 0));
+    i.swap_side();
+    i.side->in = true;
+    CUDA_CHECK(cudaStreamBeginCapture(i.stream, cudaStreamCaptureModeRelaxed));
+    i.capturing = true;
+}
+
+void Executor::side_end() {
+    auto& i = *impl_;
+    if (!i.side || !i.side->in) { throw std::logic_error("inkling2: side_end without side_begin"); }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ended = cudaStreamEndCapture(i.stream, &graph);
+    i.capturing = false;
+    const cudaStream_t side_stream = i.stream;
+    i.swap_side();
+    i.side->in = false;
+    if (ended != cudaSuccess || graph == nullptr) {
+        (void)cudaGetLastError();
+        if (graph != nullptr) { (void)cudaGraphDestroy(graph); }
+        throw std::runtime_error("inkling2: a side call's capture failed");
+    }
+    std::size_t nodes = 0;
+    CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &nodes));
+    cudaGraphExec_t& exec = i.side->execs[nodes];
+    if (exec != nullptr) {
+        cudaGraphExecUpdateResultInfo info{};
+        if (cudaGraphExecUpdate(exec, graph, &info) != cudaSuccess) {
+            (void)cudaGetLastError();
+            (void)cudaGraphExecDestroy(exec);
+            exec = nullptr;
+        }
+    }
+    if (exec == nullptr) { CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0)); }
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaGraphLaunch(exec, side_stream));
+    CUDA_CHECK(cudaEventRecord(i.side->done, side_stream));
+}
+
+bool Executor::side_idle() const {
+    const auto& i = *impl_;
+    if (!i.side) { return true; }
+    const cudaError_t e = cudaEventQuery(i.side->done);
+    if (e == cudaErrorNotReady) { return false; }
+    CUDA_CHECK(e);
+    return true;
+}
+
+void Executor::side_join() {
+    auto& i = *impl_;
+    if (!i.side) { return; }
+    CUDA_CHECK(cudaStreamWaitEvent(i.stream, i.side->done, 0));
+}
 
 std::uint32_t Executor::draft_tokens() const noexcept { return impl_->options.draft_tokens; }
 

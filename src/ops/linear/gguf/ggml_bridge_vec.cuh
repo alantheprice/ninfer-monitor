@@ -1,5 +1,18 @@
 #pragma once
 
+// Blocks a multiprocessor must fit of the MoE vector kernel: its register budget. 6 measured
+// +3% over the unbounded form on an RTX PRO 6000 at 1, 8 and 16 requests (more resident warps;
+// the kernel is latency-bound at its 72-96 registers).
+// The same for the dense vector kernel.
+#ifndef NINFER_VEC_MIN_BLOCKS
+#define NINFER_VEC_MIN_BLOCKS 1
+#endif
+#ifndef NINFER_MOE_MIN_BLOCKS
+#define NINFER_MOE_MIN_BLOCKS 6
+#endif
+
+#include "../../../core/pdl.cuh"
+
 // The vector kernel: products of a GGUF matrix with one to eight q8 activation columns. A warp owns
 // two rows; lane l takes the 32-value slices l, l + 32, ... of each. Every slice of a row is decoded
 // once into eight int8x4 words in value order (word i holds values 4i..4i+3) plus the factors of its
@@ -14,6 +27,7 @@
 #include "../../common/device_route_lookup.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <type_traits>
 
 namespace ninfer::ops::gguf::detail {
@@ -773,7 +787,32 @@ struct Decoder<GGML_TYPE_IQ1_M> {
 // KS: the static K the slice loop unrolls over, or 0 for the runtime K. Fused: the weight is one
 // [gate; up] parent and each output row is silu(gate row) * up row.
 template <ggml_type type, int T, bool Fused, int KS, bool Cooperative = false>
-__launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
+__launch_bounds__(kVecWarps * 32, NINFER_VEC_MIN_BLOCKS) __global__ void kernel(VecArgs p) {
+    ninfer::pdl::enter_streaming();
+    // A multi-segment launch: this block's segment, and its blocks within it.
+    int block = int(blockIdx.x), blocks = int(gridDim.x);
+    // Kept in locals: writing into p would move the whole parameter block to local memory.
+    const std::uint8_t* weight = p.weight;
+    std::int64_t row_bytes     = p.row_bytes;
+    int rows                   = p.rows;
+    const std::int8_t* act_qs  = p.qs;
+    const half2* act_ds        = p.ds;
+    VecStore out               = p.out;
+    if (p.more_count > 0) {
+        int seg = 0;
+        while (seg < p.more_count && block >= p.block_end[seg]) { ++seg; }
+        const int first = seg == 0 ? 0 : p.block_end[seg - 1];
+        blocks          = p.block_end[seg] - first;
+        block -= first;
+        if (seg > 0) {
+            weight    = p.more[seg - 1].weight;
+            row_bytes = p.more[seg - 1].row_bytes;
+            rows      = p.more[seg - 1].rows;
+            act_qs    = p.more[seg - 1].qs;
+            act_ds    = p.more[seg - 1].ds;
+            out       = p.more[seg - 1].out;
+        }
+    }
     using D                 = Decoder<type>;
     constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
     constexpr int kPerBlock = D::kBlockElems / 32;
@@ -792,78 +831,91 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
     const std::int64_t lane_offset = std::int64_t(lane / kPerBlock) * D::kBlockBytes;
     const int sub                  = lane % kPerBlock;
 
-    for (int row0 = (blockIdx.x * kVecWarps + warp) * step; row0 < p.rows;
-         row0 += gridDim.x * kVecWarps * step) {
+    for (int row0 = (block * kVecWarps + warp) * step; row0 < rows;
+         row0 += blocks * kVecWarps * step) {
         const std::uint8_t* rowp[kRows];
         if constexpr (Fused) {
-            rowp[0] = p.weight + std::int64_t(row0) * p.row_bytes + lane_offset;
-            rowp[1] = p.weight + std::int64_t(p.rows + row0) * p.row_bytes + lane_offset;
+            rowp[0] = weight + std::int64_t(row0) * row_bytes + lane_offset;
+            rowp[1] = weight + std::int64_t(rows + row0) * row_bytes + lane_offset;
         } else {
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
-                rowp[r] = p.weight + std::int64_t(min(row0 + r, p.rows - 1)) * p.row_bytes + lane_offset;
+                rowp[r] = weight + std::int64_t(min(row0 + r, rows - 1)) * row_bytes + lane_offset;
             }
         }
-        float acc[kRows][T];
-#pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-            for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
-        }
-        const auto slice = [&](int it) {
-            const int s = lane + 32 * it;
-            int a[T][8];
-            float d[T], sum[T];
-#pragma unroll
-            for (int j = 0; j < T; ++j) {
-                const float2 ds = __half22float2(p.ds[std::int64_t(j) * slices + s]);
-                d[j]            = ds.x;
-                sum[j]          = ds.y;
-                const auto* q   = reinterpret_cast<const int4*>(p.qs + std::int64_t(j) * k + 32 * s);
-                const int4 v0 = q[0], v1 = q[1];
-                a[j][0] = v0.x; a[j][1] = v0.y; a[j][2] = v0.z; a[j][3] = v0.w;
-                a[j][4] = v1.x; a[j][5] = v1.y; a[j][6] = v1.z; a[j][7] = v1.w;
-            }
-#pragma unroll
+        // Column groups: the same rows against T more columns, the rows' bytes now in L1.
+        for (int g = 0; g < p.column_groups; ++g) {
+        const std::int8_t* gqs = act_qs + std::int64_t(g) * T * k;
+        const half2* gds       = act_ds + std::int64_t(g) * T * slices;
+        // A short last group: its missing columns read column 0 and are never stored.
+        const int ncols = p.last_columns > 0 && g + 1 == p.column_groups ? p.last_columns : T;
+            float acc[kRows][T];
+    #pragma unroll
             for (int r = 0; r < kRows; ++r) {
-                Slice sl;
-                const auto* block = rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes;
-                decode_words<D, Cooperative>(block, sub, table, sl);
-#pragma unroll
-                for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
+    #pragma unroll
+                for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
             }
-        };
-        if constexpr (KS != 0) {
-            static_assert(KS % 1024 == 0);
-#pragma unroll
-            for (int it = 0; it < KS / 1024; ++it) { slice(it); }
-        } else {
-            for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
-        }
-#pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-            for (int j = 0; j < T; ++j) {
-#pragma unroll
-                for (int o = 16; o > 0; o >>= 1) {
-                    acc[r][j] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][j], o);
+            const auto slice = [&](int it) {
+                const int s = lane + 32 * it;
+                int a[T][8];
+                float d[T], sum[T];
+    #pragma unroll
+                for (int j = 0; j < T; ++j) {
+                    const int jj    = j < ncols ? j : 0;
+                    const float2 ds = __half22float2(gds[std::int64_t(jj) * slices + s]);
+                    d[j]            = ds.x;
+                    sum[j]          = ds.y;
+                    const auto* q   = reinterpret_cast<const int4*>(gqs + std::int64_t(jj) * k + 32 * s);
+                    const int4 v0 = q[0], v1 = q[1];
+                    a[j][0] = v0.x; a[j][1] = v0.y; a[j][2] = v0.z; a[j][3] = v0.w;
+                    a[j][4] = v1.x; a[j][5] = v1.y; a[j][6] = v1.z; a[j][7] = v1.w;
                 }
-            }
-        }
-        if (lane == 0) {
-            if constexpr (Fused) {
-#pragma unroll
-                for (int j = 0; j < T; ++j) { vec_store(p.out, row0, j, vec_gate(acc[0][j], p.out.activation) * acc[1][j]); }
-            } else {
-#pragma unroll
+    #pragma unroll
                 for (int r = 0; r < kRows; ++r) {
-                    if (row0 + r < p.rows) {
+                    Slice sl;
+                    const auto* block = rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes;
+                    decode_words<D, Cooperative>(block, sub, table, sl);
+    #pragma unroll
+                    for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
+                }
+            };
+            if constexpr (KS != 0 && KS % 1024 == 0) {
 #pragma unroll
-                        for (int j = 0; j < T; ++j) { vec_store(p.out, row0 + r, j, acc[r][j]); }
+                for (int it = 0; it < KS / 1024; ++it) { slice(it); }
+            } else if constexpr (KS != 0) {
+                // A last round of fewer than 32 slices: unrolled, its idle lanes predicated off.
+#pragma unroll
+                for (int it = 0; it < (KS / 32 + 31) / 32; ++it) {
+                    if (lane + 32 * it < slices) { slice(it); }
+                }
+            } else {
+                for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
+            }
+    #pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+    #pragma unroll
+                for (int j = 0; j < T; ++j) {
+    #pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) {
+                        acc[r][j] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][j], o);
                     }
                 }
             }
-        }
+            if (lane == 0) {
+                if constexpr (Fused) {
+    #pragma unroll
+                    for (int j = 0; j < T; ++j) { if (j < ncols) { vec_store(out, row0, g * T + j, vec_gate(acc[0][j], out.activation) * acc[1][j]); } }
+                } else {
+    #pragma unroll
+                    for (int r = 0; r < kRows; ++r) {
+                        if (row0 + r < rows) {
+    #pragma unroll
+                            for (int j = 0; j < T; ++j) { if (j < ncols) { vec_store(out, row0 + r, g * T + j, acc[r][j]); } }
+                        }
+                    }
+                }
+            }
+        } // column groups
     }
 }
 
@@ -877,14 +929,44 @@ void launch(const VecArgs& args, cudaStream_t stream) {
         return std::max(blocks, 1);
     }();
     const int per_block = kVecWarps * (Fused ? 1 : 2);
-    const int groups    = (args.rows + per_block - 1) / per_block;
-    const int blocks    = std::min(groups, resident * device_facts().sm_count);
-    kernel<type, T, Fused, KS, Cooperative><<<blocks, kVecWarps * 32, 0, stream>>>(args);
+    const int cap       = resident * device_facts().sm_count;
+    const auto blocks_for_rows = [&](int rows) {
+        return std::min((rows + per_block - 1) / per_block, cap);
+    };
+    int blocks = blocks_for_rows(args.rows);
+    VecArgs a  = args;
+    if (a.more_count > 0) {
+        a.block_end[0] = blocks;
+        for (int s = 0; s < a.more_count; ++s) {
+            blocks += blocks_for_rows(a.more[s].rows);
+            a.block_end[s + 1] = blocks;
+        }
+    }
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks), dim3(kVecWarps * 32), std::size_t(0), stream}, kernel<type, T, Fused, KS, Cooperative>, a);
     check(cudaGetLastError(), "vector product launch");
+}
+
+// Static K for Inkling 2's attention and head widths (NINFER_VEC_STATIC_K=0: runtime K).
+inline bool vec_static_k_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_VEC_STATIC_K");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
 }
 
 template <ggml_type type, int T, bool Fused, bool Cooperative = false>
 void launch_k(const VecArgs& args, cudaStream_t stream) {
+    if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q5_K ||
+                  type == GGML_TYPE_NVFP4) {
+        if (vec_static_k_enabled()) {
+            switch (args.k) {
+            case 2304: return launch<type, T, Fused, 2304, Cooperative>(args, stream);
+            case 3072: return launch<type, T, Fused, 3072, Cooperative>(args, stream);
+            default: break;
+            }
+        }
+    }
     if constexpr (kVecStaticK<type>) {
         switch (args.k) {
         case 5120: return launch<type, T, Fused, 5120, Cooperative>(args, stream);
@@ -918,28 +1000,41 @@ void launch_columns(const VecArgs& args, int columns, cudaStream_t stream) {
 // column's arithmetic is the same at any T. A pair's activation column is pair / column_group.
 // Fused: the first table holds the gate rows and the second the up rows, and each output row is
 // silu(gate) * up.
-template <ggml_type type, int T, bool Fused, bool Cooperative = false>
-__launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
+//
+// R > 2 (not Fused, not Cooperative): K's slices are 32 m + 32 / R, so a warp takes R rows and the
+// last round's 32 / R leftover slices of each of them fill the warp once; each leftover product
+// goes back by shuffle to the lane that would have computed it and is added last, as there. Every
+// sum is the R = 2 form's, bit for bit (the same additions in the same order), while no lane idles
+// through a part-empty round (K = 1152: 36 slices, 9 rounds instead of 2 x 2 with 4 lanes busy).
+// KS: K fixed at compile time (0: p.k), so the rounds unroll and their loads issue together.
+template <ggml_type type, int T, bool Fused, bool Cooperative = false, int R = 2, int KS = 0>
+__launch_bounds__(kVecWarps * 32, NINFER_MOE_MIN_BLOCKS) __global__ void moe_kernel(MoeVecArgs p) {
+    ninfer::pdl::enter_streaming();
     using D                 = Decoder<type>;
     constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
     constexpr int kPerBlock = D::kBlockElems / 32;
-    constexpr int kRows     = 2;
-    // Uniform per block, so it may leave before the barrier below.
-    if (int(blockIdx.y) >= *p.active_count) { return; }
+    constexpr int kRows     = Fused ? 2 : R;
+    constexpr bool kTail    = !Fused && R > 2;
+    static_assert(!kTail || !Cooperative, "balanced tails decode each lane's slice alone");
+    // Uniform per block, so it may leave before the barrier below. Blocks stride over the active
+    // experts when the grid has fewer expert columns than the call may route to.
+    const int active_count = *p.active_count;
+    if (int(blockIdx.y) >= active_count) { return; }
     __shared__ __align__(16) std::uint32_t table[kTable];
     if constexpr (D::kTableWords > 0) {
         const std::uint32_t* src = D::table();
         for (int i = threadIdx.x; i < D::kTableWords; i += kVecWarps * 32) { table[i] = src[i]; }
         __syncthreads();
     }
-    const int expert               = p.active[blockIdx.y];
+    for (int slot = int(blockIdx.y); slot < active_count; slot += int(gridDim.y)) {
+    const int expert               = p.active[slot];
     const int begin                = p.bounds[expert];
     const int end                  = p.bounds[expert + 1];
     const std::uint8_t* first      = p.first[expert];
     const std::uint8_t* second     = Fused ? p.second[expert] : nullptr;
     const int warp                 = threadIdx.x >> 5;
     const int lane                 = threadIdx.x & 31;
-    const int k                    = p.k;
+    const int k                    = KS != 0 ? KS : p.k;
     const int slices               = k / 32;
     const int step                 = Fused ? 1 : kRows;
     const std::int64_t lane_offset = std::int64_t(lane / kPerBlock) * D::kBlockBytes;
@@ -972,7 +1067,10 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
 #pragma unroll
                 for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
             }
-            for (int it = 0; lane + 32 * it < slices; ++it) {
+            const int rounds_end = kTail ? 32 * (slices / 32) : slices;
+#pragma unroll
+            for (int it = 0; it < (KS != 0 ? (KS / 32 + 31) / 32 : 64); ++it) {
+                if (lane + 32 * it >= rounds_end) { break; }
                 const int s = lane + 32 * it;
                 int a[T][8];
                 float d[T], sum[T];
@@ -1003,6 +1101,37 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
                     for (int j = 0; j < T; ++j) {
                         if (j >= n) { break; }
                         acc[r][j] += D::dot(sl, a[j], d[j], sum[j]);
+                    }
+                }
+            }
+            if constexpr (kTail) {
+                // The leftover round: lane i computes slice 32 m + i % rem of row i / rem.
+                const int rem = slices % 32;
+                const int rb = lane / rem, sb = slices - rem + lane % rem;
+                const std::uint8_t* tail_row =
+                    first + std::int64_t(min(row0 + rb, p.rows - 1)) * p.row_bytes +
+                    std::int64_t(sb / kPerBlock) * D::kBlockBytes;
+                Slice sl;
+                decode_words<D, false>(tail_row, sb % kPerBlock, table, sl);
+                float vb[T];
+#pragma unroll
+                for (int j = 0; j < T; ++j) { vb[j] = 0.0f; }
+#pragma unroll
+                for (int j = 0; j < T; ++j) {
+                    if (j >= n) { break; }
+                    const float2 ds = __half22float2(p.ds[std::int64_t(column[j]) * slices + sb]);
+                    const auto* q =
+                        reinterpret_cast<const int4*>(p.qs + std::int64_t(column[j]) * k + 32 * sb);
+                    const int4 v0 = q[0], v1 = q[1];
+                    const int a[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+                    vb[j] = D::dot(sl, a, ds.x, ds.y);
+                }
+#pragma unroll
+                for (int r = 0; r < kRows; ++r) {
+#pragma unroll
+                    for (int j = 0; j < T; ++j) {
+                        const float x = __shfl_sync(0xFFFFFFFFu, vb[j], r * rem + lane % rem);
+                        if (j < n && lane < rem) { acc[r][j] += x; }
                     }
                 }
             }
@@ -1048,14 +1177,97 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
             }
         }
     }
+    } // expert slots
+}
+
+// Balanced tails (moe_kernel's R) are on unless NINFER_VEC_BALANCED_TAIL=0.
+inline bool balanced_tail_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_VEC_BALANCED_TAIL");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+// The rows a warp takes for K: 4 when K's slices leave 8 over whole rounds of 32 (K = 2304), else
+// 2. Eight rows for a remainder of 4 (K = 1152) measured slower on an RTX PRO 6000 (14.2 against
+// 13.5 us for Inkling 2's NVFP4 down banks): a quarter of the warps, at 96 registers.
+// With many experts in one call (a batch of tokens) there are blocks enough that 8 rows a warp at
+// a remainder of 4 no longer starves the GPU of warps: from NINFER_VEC_TAIL8_MIN_EXPERTS active
+// experts (default 16: calls of 2+ tokens) K = 1152 takes 8. With the register budget and the static-K
+// form this measured +1.5% at 8 requests and +2.3% at 16, -1.3% for one token (so it waits for 16).
+inline int balanced_tail_min_experts() {
+    static const int n = [] {
+        const char* v = std::getenv("NINFER_VEC_TAIL8_MIN_EXPERTS");
+        return v != nullptr ? std::atoi(v) : 16;
+    }();
+    return n;
+}
+
+inline int balanced_tail_rows(int k, int max_active = 1) {
+    const int rem = (k / 32) % 32;
+    if (!balanced_tail_enabled() || k % 32 != 0) { return 2; }
+    if (rem == 4 && balanced_tail_min_experts() > 0 && max_active >= balanced_tail_min_experts()) {
+        return 8;
+    }
+    return rem == 8 ? 4 : 2;
+}
+
+// Expert columns of a MoE vector launch: the call's bound on its active experts, at most
+// NINFER_MOE_EXPERT_COLUMNS (default 0: no cap); blocks loop over the rest. A wide batch bounds
+// its active experts by its pairs, which can be twice the experts it routes to: without a cap
+// half its blocks only find no expert and leave.
+inline int moe_expert_columns(int max_active) {
+    static const int cap = [] {
+        const char* v = std::getenv("NINFER_MOE_EXPERT_COLUMNS");
+        return v != nullptr ? std::atoi(v) : 0;
+    }();
+    return cap > 0 ? std::min(max_active, cap) : max_active;
+}
+
+// Static K for the expert widths the kernel unrolls (NINFER_MOE_STATIC_K=0: always runtime K).
+inline bool moe_static_k_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_MOE_STATIC_K");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+template <ggml_type type, int T, bool Fused, bool Cooperative, int R, int KS>
+void moe_launch_rows_k(const MoeVecArgs& args, int max_active, cudaStream_t stream) {
+    const int per_block = kVecWarps * (Fused ? 1 : R);
+    const int groups    = (args.rows + per_block - 1) / per_block;
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(groups, moe_expert_columns(max_active), 1), dim3(kVecWarps * 32), std::size_t(0), stream}, moe_kernel<type, T, Fused, Cooperative, R, KS>, args);
+    check(cudaGetLastError(), "moe product launch");
+}
+
+template <ggml_type type, int T, bool Fused, bool Cooperative, int R>
+void moe_launch_rows(const MoeVecArgs& args, int max_active, cudaStream_t stream) {
+    if constexpr (!Fused && !Cooperative && Decoder<type>::kBlockElems <= 64) {
+        if (moe_static_k_enabled()) {
+            // Inkling 2's expert widths: [gate; up] over the hidden 2304, down over 1152.
+            if (args.k == 2304 && (R == 4 || balanced_tail_rows(2304, max_active) == 2)) {
+                return moe_launch_rows_k<type, T, Fused, Cooperative, R, 2304>(args, max_active, stream);
+            }
+            if (args.k == 1152) {
+                return moe_launch_rows_k<type, T, Fused, Cooperative, R, 1152>(args, max_active, stream);
+            }
+        }
+    }
+    moe_launch_rows_k<type, T, Fused, Cooperative, R, 0>(args, max_active, stream);
 }
 
 template <ggml_type type, int T, bool Fused, bool Cooperative = false>
 void moe_launch_chunk(const MoeVecArgs& args, int max_active, cudaStream_t stream) {
-    const int per_block = kVecWarps * (Fused ? 1 : 2);
-    const int groups    = (args.rows + per_block - 1) / per_block;
-    moe_kernel<type, T, Fused, Cooperative><<<dim3(groups, max_active, 1), kVecWarps * 32, 0, stream>>>(args);
-    check(cudaGetLastError(), "moe product launch");
+    if constexpr (!Fused && !Cooperative && Decoder<type>::kBlockElems <= 64) {
+        switch (balanced_tail_rows(args.k, max_active)) {
+        case 8: return moe_launch_rows<type, T, Fused, Cooperative, 8>(args, max_active, stream);
+        case 4: return moe_launch_rows<type, T, Fused, Cooperative, 4>(args, max_active, stream);
+        default: break;
+        }
+    }
+    moe_launch_rows<type, T, Fused, Cooperative, 2>(args, max_active, stream);
 }
 
 template <ggml_type type, bool Fused, bool Cooperative = false>

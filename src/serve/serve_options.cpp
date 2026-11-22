@@ -212,7 +212,7 @@ std::string serve_usage_text(const char* argv0) {
            "MODEL & CONTEXT\n"
            "  --max-context N               logical context ceiling of each request (default\n"
            "                                8192)\n"
-           "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
+           "  --max-concurrency N           requests decoded together, 1..8 (1..32 for Inkling 2; default 1)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024; 4096 for native MoE experts\n"
            "                                in host memory or files; 2048 for\n"
@@ -2015,7 +2015,7 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
                                       "--kv-capacity must be at least --max-context");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("--max-concurrency must be in [1,8]");
+        throw std::invalid_argument("--max-concurrency must be in [1,32] (above 8: Inkling 2 only)");
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");

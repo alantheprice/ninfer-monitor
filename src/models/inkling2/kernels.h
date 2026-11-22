@@ -97,7 +97,7 @@ void mix(const MixArgs& args, cudaStream_t stream);
 // apart, k when 0), out rows `out_stride` apart (m when 0): up to eight rows by the GEMV kernel (a
 // fixed grid, so CUDA graphs replay it), more by cuBLAS SGEMM.
 void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, cudaStream_t stream,
-              std::int64_t x_stride = 0, std::int64_t out_stride = 0);
+              std::int64_t x_stride = 0, std::int64_t out_stride = 0, bool vector_call = false);
 
 // Up to kMaxGemvBatch products of one shape, out[b] = w[b] x[b] as gemm_f32 computes each of them
 // (the same values), in one launch for up to eight rows: k <= 128 a warp per output row.
@@ -109,7 +109,7 @@ struct GemvBatch {
     int count = 0;
 };
 void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t stream,
-                    std::int64_t x_stride = 0, std::int64_t out_stride = 0);
+                    std::int64_t x_stride = 0, std::int64_t out_stride = 0, bool vector_call = false);
 
 // The loop controllers of up to four inputs: concat[i][t] = [rms(x_i[t]); rms(message_i[t])]
 // (kMixEps, no weight), [count][T][2 hidden] FP32.
@@ -203,6 +203,8 @@ struct KvArgs {
     // at slot `position`, and k_cache / v_cache are unused.
     KvPlaneView k_plane, v_plane;
 };
+// query_post and kv_post in one launch (the same rows).
+void qkv_post(const QueryArgs& q, const KvArgs& kv, cudaStream_t stream);
 void kv_post(const KvArgs& args, cudaStream_t stream);
 
 // The attention of each row's heads (128 values, `query_heads / kv_heads` query heads per key and
@@ -251,6 +253,15 @@ struct AttentionArgs {
     // query_heads, 1) for the far field's softmax states, computed on tensor cores first: the keys
     // before the chunk at least `extent` before every row of a group of 32 rows. Null: none.
     float* far = nullptr;
+    // Decode and verification calls with `span` > 0 split every row's keys at the positions
+    // s * span (16-aligned tiles within), the same for a row whatever rows run beside it, so
+    // a row's output does not depend on its call; `splits` is then the most splits a block
+    // spans. With `runs` ([tokens + 1] row offsets, a sequence's consecutive rows each, entries
+    // past the last run equal to tokens), one block of each run's up to eight rows reads each
+    // key and value tile once for all of them.
+    int span = 0;
+    const std::int32_t* runs = nullptr;
+    int run_count = 0; // blocks of runs (the first run_count entries of runs)
     const float* gate = nullptr;
     std::int64_t gate_stride = 0;
     __nv_bfloat16* out = nullptr;
@@ -258,6 +269,9 @@ struct AttentionArgs {
 };
 [[nodiscard]] std::size_t attention_workspace_floats(int rows, int query_heads, int splits);
 void attention(const AttentionArgs& args, cudaStream_t stream);
+// Whether prompt chunks without branches run attention_tc (NINFER_INKLING_TC_ATTENTION=0: off),
+// with no far field to compute first.
+[[nodiscard]] bool tc_prompt_attention();
 
 // The residual update of a product y (FP32 rows [T][hidden]; or a MoE's output, the 2^-32
 // fixed-point sums `fixed` [T][hidden] or its pairs' FP32 rows [T * top_k][hidden] weighted by
@@ -330,7 +344,8 @@ struct RouteArgs {
     // gguf::moe_sorted_routes's view of the same workspace), in the same launch.
     RouteSort sorted;
 };
-inline constexpr int kSortedRouteRows    = 8;
+inline constexpr int kSortedRouteRows    = 32;
+inline constexpr int kSortedRouteBlockRows = 8; // rows of threads in its block
 inline constexpr int kSortedRouteExperts = 128;
 void route(const RouteArgs& args, cudaStream_t stream);
 
@@ -354,6 +369,13 @@ void bf16_expert_rows(const void* const* table, int rows, int k, const std::int3
 // Rows ids[0, rows) of a BF16 table [*][k] as FP32 rows `out_stride` apart, exactly.
 void bf16_rows_f32(const __nv_bfloat16* table, int k, const std::int32_t* ids, int rows,
                    float* out, std::int64_t out_stride, cudaStream_t stream);
+// situ_rows into BF16 then the q8_1 vector activation of those rows (gguf's layout: int8 values
+// at 0, half2 scales at `scales_offset`), bit for bit as the two steps; the grid also zeroes
+// `zero_count` words of `zero`.
+void situ_quantize(const float* gu, std::int64_t stride, int pairs, int width,
+                   const float* pair_scale, float gate_cap, float up_cap, void* activation,
+                   std::size_t scales_offset, unsigned long long* zero, std::int64_t zero_count,
+                   cudaStream_t stream);
 
 // out = bf16(cap tanh(in / cap)) for `n` logits.
 void softcap_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, float cap,
@@ -471,8 +493,13 @@ struct SparkStepArgs {
     float* joint = nullptr;
     float* logits = nullptr;
     float* partials = nullptr;
+    // Several sequences' blocks at once: `lanes` blocks of `block` rows (lane j's rows
+    // j * block ..), lane j's state, prev, drafts and confidence at j * 256, j, j * block and
+    // j * block, its scratch at j * spark_step_floats(vocab), hidden and base rows j * block + row.
+    int lanes = 1, block = 0;
 };
 [[nodiscard]] std::size_t spark_step_floats(int vocab);
+constexpr int kSparkMaxLanes = 4;
 void spark_step(const SparkStepArgs& args, cudaStream_t stream);
 
 // sums[i] += products[i] for i < n when *flag is nonzero: the 2^-32 fixed-point sums of the
