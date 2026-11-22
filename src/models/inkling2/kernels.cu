@@ -506,10 +506,13 @@ __device__ __forceinline__ void gemv_row(const float* __restrict__ w, const floa
         const auto* w4  = reinterpret_cast<const float4*>(wr);
         // The thread's quads i, i + 256, ... in order, the loads of up to kGemvAhead of them
         // issued before their products.
-        for (int i = threadIdx.x; i < quads; i += kGemvAhead * kGemvThreads) {
-            float4 wv[kGemvAhead], xv[kGemvAhead][N];
+        // Fewer loads in flight past 8 columns keep the registers; the products stay in order
+        // (quads i, i + 256, ... whatever the depth), so the sums do not change.
+        constexpr int kAhead = N > 8 ? 2 : kGemvAhead;
+        for (int i = threadIdx.x; i < quads; i += kAhead * kGemvThreads) {
+            float4 wv[kAhead], xv[kAhead][N];
 #pragma unroll
-            for (int a = 0; a < kGemvAhead; ++a) {
+            for (int a = 0; a < kAhead; ++a) {
                 const int at = i + a * kGemvThreads;
                 if (at >= quads) { continue; }
                 wv[a] = w4[at];
@@ -519,7 +522,7 @@ __device__ __forceinline__ void gemv_row(const float* __restrict__ w, const floa
                 }
             }
 #pragma unroll
-            for (int a = 0; a < kGemvAhead; ++a) {
+            for (int a = 0; a < kAhead; ++a) {
                 if (i + a * kGemvThreads >= quads) { continue; }
 #pragma unroll
                 for (int t = 0; t < N; ++t) { dot[t] += dot4(wv[a], xv[a][t]); }
@@ -1666,35 +1669,40 @@ void mix(const MixArgs& args, cudaStream_t stream) {
     check_launch("mix");
 }
 
+// f(std::integral_constant<int, n>) for n in 1..16.
+template <class F> void with_columns(int n, F&& f) {
+    switch (n) {
+    case 1: return f(std::integral_constant<int, 1>{});
+    case 2: return f(std::integral_constant<int, 2>{});
+    case 3: return f(std::integral_constant<int, 3>{});
+    case 4: return f(std::integral_constant<int, 4>{});
+    case 5: return f(std::integral_constant<int, 5>{});
+    case 6: return f(std::integral_constant<int, 6>{});
+    case 7: return f(std::integral_constant<int, 7>{});
+    case 8: return f(std::integral_constant<int, 8>{});
+    case 9: return f(std::integral_constant<int, 9>{});
+    case 10: return f(std::integral_constant<int, 10>{});
+    case 11: return f(std::integral_constant<int, 11>{});
+    case 12: return f(std::integral_constant<int, 12>{});
+    case 13: return f(std::integral_constant<int, 13>{});
+    case 14: return f(std::integral_constant<int, 14>{});
+    case 15: return f(std::integral_constant<int, 15>{});
+    default: return f(std::integral_constant<int, 16>{});
+    }
+}
+
 void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, cudaStream_t stream,
               std::int64_t x_stride, std::int64_t out_stride) {
     if (m <= 0 || n <= 0) { return; }
     if (x_stride == 0) { x_stride = k; }
     if (out_stride == 0) { out_stride = m; }
-    if (n <= kGemvRows) {
-        const auto gemv = [&](auto tokens) {
-            (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(m), dim3(kGemvThreads), std::size_t(0), stream}, gemv_kernel<decltype(tokens)::value>, w, x, m, k, x_stride, out, out_stride);
-        };
-        switch (n) {
-        case 1: gemv(std::integral_constant<int, 1>{}); break;
-        case 2: gemv(std::integral_constant<int, 2>{}); break;
-        case 3: gemv(std::integral_constant<int, 3>{}); break;
-        case 4: gemv(std::integral_constant<int, 4>{}); break;
-        case 5: gemv(std::integral_constant<int, 5>{}); break;
-        case 6: gemv(std::integral_constant<int, 6>{}); break;
-        case 7: gemv(std::integral_constant<int, 7>{}); break;
-        default: gemv(std::integral_constant<int, 8>{}); break;
-        }
-        check_launch("gemv");
-        return;
-    }
     if (n <= 2 * kGemvRows) {
-        // A decode call of 9..16 rows: the vector form over column slices, so every row's sums are
-        // those it gets in a call of at most 8.
-        for (int c0 = 0; c0 < n; c0 += kGemvRows) {
-            gemm_f32(m, std::min(kGemvRows, n - c0), k, w, x + std::int64_t(c0) * x_stride,
-                     out + std::int64_t(c0) * out_stride, stream, x_stride, out_stride);
-        }
+        // Up to 16 columns (a decode call of 16 lanes) in one launch; each column's sums are those
+        // of a narrower call.
+        with_columns(n, [&](auto tokens) {
+            (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(m), dim3(kGemvThreads), std::size_t(0), stream}, gemv_kernel<decltype(tokens)::value>, w, x, m, k, x_stride, out, out_stride);
+        });
+        check_launch("gemv");
         return;
     }
     const cublasHandle_t handle = blas_handle();
@@ -1713,18 +1721,7 @@ void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t st
     if (m <= 0 || n <= 0 || batch.count == 0) { return; }
     if (x_stride == 0) { x_stride = k; }
     if (out_stride == 0) { out_stride = m; }
-    if (n > kGemvRows && n <= 2 * kGemvRows) {
-        for (int c0 = 0; c0 < n; c0 += kGemvRows) {
-            GemvBatch slice = batch;
-            for (int e = 0; e < batch.count; ++e) {
-                slice.x[e]   = batch.x[e] + std::int64_t(c0) * x_stride;
-                slice.out[e] = batch.out[e] + std::int64_t(c0) * out_stride;
-            }
-            gemm_f32_batch(m, std::min(kGemvRows, n - c0), k, slice, stream, x_stride, out_stride);
-        }
-        return;
-    }
-    if (n > kGemvRows) {
+    if (n > 2 * kGemvRows) {
         for (int e = 0; e < batch.count; ++e) {
             gemm_f32(m, n, k, batch.w[e], batch.x[e], batch.out[e], stream, x_stride, out_stride);
         }
@@ -1741,16 +1738,7 @@ void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t st
             (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(unsigned(m), unsigned(batch.count))), dim3(kGemvThreads), std::size_t(0), stream}, gemv_batch_kernel<N>, batch, k, x_stride, out_stride);
         }
     };
-    switch (n) {
-    case 1: launch(std::integral_constant<int, 1>{}); break;
-    case 2: launch(std::integral_constant<int, 2>{}); break;
-    case 3: launch(std::integral_constant<int, 3>{}); break;
-    case 4: launch(std::integral_constant<int, 4>{}); break;
-    case 5: launch(std::integral_constant<int, 5>{}); break;
-    case 6: launch(std::integral_constant<int, 6>{}); break;
-    case 7: launch(std::integral_constant<int, 7>{}); break;
-    default: launch(std::integral_constant<int, 8>{}); break;
-    }
+    with_columns(n, launch);
     check_launch("gemv_batch");
 }
 
