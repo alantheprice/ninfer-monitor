@@ -1596,6 +1596,35 @@ void q6k_mma_case(std::mt19937& rng) {
             }
         }
     }
+    if (std::getenv("NINFER_TEST_Q8_TIMING") != nullptr) {
+        for (const auto& [vr, kk] : std::vector<std::pair<int, int>>{{6016, 2304}, {2304, 3072}, {1152 * 2, 2304}}) {
+            const std::int64_t rb = std::int64_t(kk / 32) * 34;
+            DeviceBuffer big(std::size_t(vr) * rb), bo(std::size_t(max_cols) * vr * 4),
+                ax(std::size_t(max_cols) * kk * 2), aq(gguf::vector_activation_bytes(kk, max_cols));
+            check(cudaMemset(big.p, 0x11, std::size_t(vr) * rb), "fill");
+            check(cudaMemset(ax.p, 0x22, std::size_t(max_cols) * kk * 2), "fill");
+            for (const int cols : {1, 6, 29}) {
+                gguf::quantize_vector_activation(as<bf16>(ax), kk, cols, nullptr, aq.p, nullptr);
+                gguf::VectorOutput o;
+                o.column_stride = vr;
+                o.f32 = as<float>(bo);
+                for (int form = 0; form < 2; ++form) {
+                    std::optional<gguf::VectorMmaScope> scope;
+                    if (form == 1) { scope.emplace(); }
+                    cudaEvent_t e0, e1;
+                    cudaEventCreate(&e0); cudaEventCreate(&e1);
+                    for (int it = 0; it < 3; ++it) { gguf::vector_product(gguf::GgmlType::Q8_0, big.p, rb, vr, kk, aq.p, cols, o, nullptr); }
+                    cudaEventRecord(e0);
+                    for (int it = 0; it < 50; ++it) { gguf::vector_product(gguf::GgmlType::Q8_0, big.p, rb, vr, kk, aq.p, cols, o, nullptr); }
+                    cudaEventRecord(e1);
+                    cudaEventSynchronize(e1);
+                    float ms = 0;
+                    cudaEventElapsedTime(&ms, e0, e1);
+                    std::printf("q8_0 %dx%d %s %d columns: %.1f us\n", vr, kk, form ? "mma" : "vec", cols, 1000 * ms / 50);
+                }
+            }
+        }
+    }
     report(worst < 1e-5 && same, "Q6_K tensor-core products, 1..64 columns: vs vector kernel " +
                                      num(worst) + (same ? ", column 0 the same bits at every width"
                                                         : ", column 0 DIFFERS across widths"));

@@ -16,7 +16,7 @@ constexpr std::int32_t kSparseBatchedMaxDrafts = 31;
 constexpr std::int32_t kSparseCandidates       = 16;
 constexpr std::int32_t kSparsePhysicalRows     = 248320;
 constexpr std::int32_t kSparseTokenDomain      = 248077;
-constexpr std::int32_t kSparseMaxBatch         = 8;
+constexpr std::int32_t kSparseMaxBatch         = 16;
 
 std::size_t speculative_workspace_row_bytes(std::int32_t token_domain, std::int32_t min_drafts,
                                             std::int32_t max_drafts) {
@@ -161,7 +161,7 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
     const std::int32_t batch = drafts.ne[1];
     if (k < 1 || batch < 1 || batch > static_cast<std::int32_t>(kMaximumFamilyConcurrency)) {
         throw std::invalid_argument(
-            "speculative_overlay_copy_proposals: K must be >=1 and B must be in [1,8]");
+            "speculative_overlay_copy_proposals: K must be >=1 and B must be in [1,16]");
     }
     require_vector(copy_rows, DType::I32, batch, op, "copy_rows");
     require_matrix(copy_drafts, DType::I32, k, batch, op, "copy_drafts");
@@ -259,7 +259,7 @@ void speculative_accept_sparse_drafts(
     const std::int32_t columns = k + 1;
     const std::int32_t batch   = drafts.ne[1];
     if (batch < 1 || batch > kSparseMaxBatch) {
-        throw std::invalid_argument("speculative_accept_sparse_drafts: B must be 1..8");
+        throw std::invalid_argument("speculative_accept_sparse_drafts: B must be 1..16");
     }
     if (k > kSparseBatchedMaxDrafts && batch != 1) {
         throw std::invalid_argument("speculative_accept_sparse_drafts: K>31 requires B=1");

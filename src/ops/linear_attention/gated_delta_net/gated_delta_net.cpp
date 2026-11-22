@@ -118,7 +118,7 @@ Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const
                                          const Tensor& g, const Tensor& beta, float scale,
                                          const Tensor& ssm_states, const Tensor& source_state_slots,
                                          const Tensor& destination_state_slots, const Tensor& out) {
-    constexpr std::int32_t kMaximumBatch = 8;
+    constexpr std::int32_t kMaximumBatch = 16;
     require_dtype(q, DType::BF16, "q must be BF16");
     require_dtype(k, DType::BF16, "k must be BF16");
     require_dtype(v, DType::BF16, "v must be BF16");
@@ -132,7 +132,7 @@ Geometry validate_recurrent_batch_update(const Tensor& q, const Tensor& k, const
     const Geometry geometry  = require_geometry(q, v);
     const std::int32_t batch = q.ne[3];
     if (batch <= 0 || batch > kMaximumBatch || geometry.tokens != 1) {
-        throw std::invalid_argument("gated_delta_net: batch update requires B=1..8 and W=1");
+        throw std::invalid_argument("gated_delta_net: batch update requires B=1..16 and W=1");
     }
     require_shape(q, detail::gated_delta_net::kStateDim, geometry.qk_heads, geometry.tokens, batch,
                   "q");

@@ -300,7 +300,7 @@ int main() {
     }
 
     int failures = 0;
-    for (const auto [batch, width] : {std::pair{2, 17}, {8, 32}, {2, 64}, {1, 65}, {9, 2}}) {
+    for (const auto [batch, width] : {std::pair{2, 17}, {8, 32}, {2, 64}, {1, 65}, {17, 2}}) {
         Tensor q(nullptr, DType::BF16, {128, 16, width, batch});
         Tensor v(nullptr, DType::BF16, {128, 48, width, batch});
         Tensor empty;

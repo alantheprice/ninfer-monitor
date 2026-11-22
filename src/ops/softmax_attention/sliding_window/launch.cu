@@ -55,9 +55,9 @@ sliding_window_attention_resolve_plan(std::uint32_t window, SlidingWindowMask ma
     if (window != 2048 && window != 4096 && window != 8192) {
         throw std::invalid_argument("sliding_window_attention plan: unsupported window");
     }
-    if (tokens < 1 || tokens > 16 || batch < 1 || batch > 8) {
+    if (tokens < 1 || tokens > 16 || batch < 1 || batch > 16) {
         throw std::invalid_argument(
-            "sliding_window_attention plan: T must be 1..16 and B must be 1..8");
+            "sliding_window_attention plan: T must be 1..16 and B must be 1..16");
     }
     if (envelope.min_context > envelope.max_context) {
         throw std::invalid_argument("sliding_window_attention plan: invalid envelope");

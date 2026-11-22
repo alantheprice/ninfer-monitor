@@ -41,7 +41,7 @@ bool unified_route(LinearPolicy policy, std::int32_t tokens) {
 
 Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t tokens,
                                              std::int32_t batch_size) {
-    if (tokens <= 0 || batch_size <= 0 || batch_size > 8) {
+    if (tokens <= 0 || batch_size <= 0 || batch_size > 16) {
         throw std::invalid_argument("nvfp4 gdn conv: invalid B/T domain");
     }
     if (!valid_linear_policy(policy)) {

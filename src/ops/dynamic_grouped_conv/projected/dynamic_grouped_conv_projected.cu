@@ -81,8 +81,8 @@ void dynamic_grouped_conv(const Tensor& x, const Tensor& coefficients, const Ten
     const std::int32_t hidden = x.ne[0], width = x.ne[1], batch = x.ne[2];
     require(side == 0 || side == 1, "side must be 0 or 1");
     require(hidden > 0 && hidden % kGroupWidth == 0, "H must be a positive multiple of 16");
-    require(width >= 1 && width <= 16 && batch >= 1 && batch <= 8,
-            "W must be in [1,16] and B in [1,8]");
+    require(width >= 1 && width <= 16 && batch >= 1 && batch <= 16,
+            "W must be in [1,16] and B in [1,16]");
     require((x.dtype == DType::BF16 || x.dtype == DType::FP32) &&
                 contiguous(x, hidden, width, batch),
             "x must be contiguous BF16 or FP32 [H,W,B]");

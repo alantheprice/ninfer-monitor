@@ -119,7 +119,17 @@ EngineOptions with_expert_disk_reads(EngineOptions options) {
 EngineOptions with_family_attention(EngineOptions options) {
     if (options.max_concurrency > kMaximumFamilyConcurrency &&
         !runtime::is_inkling2_artifact(options.artifact_path)) {
-        throw std::invalid_argument("--max-concurrency above 8 applies to Inkling 2 artifacts");
+        throw std::invalid_argument("--max-concurrency above 16 applies to Inkling 2 artifacts");
+    }
+    // Sixteen lanes are the Qwen3.5 Program's (its validators audited for them); the other
+    // families' own executors keep eight.
+    if (options.max_concurrency > 8 && !runtime::is_inkling2_artifact(options.artifact_path) &&
+        (runtime::is_gemma4_artifact(options.artifact_path) ||
+         runtime::is_flint_artifact(options.artifact_path) ||
+         runtime::is_qwen4_exp_artifact(options.artifact_path) ||
+         runtime::is_deepseek_v41_artifact(options.artifact_path))) {
+        throw std::invalid_argument("--max-concurrency above 8 applies to Qwen3.5-family and "
+                                    "Inkling 2 artifacts");
     }
     // Flash-Next stores FP32 keys and values once in F16; Gemma 4, Flint and Inkling 2 keep F16
     // caches under either name; DeepSeek-V4.1 refuses it in its core. The Qwen3.5 Program's

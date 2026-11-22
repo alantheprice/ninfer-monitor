@@ -79,7 +79,7 @@ void require_nonoverlap(const Tensor& candidate_ids, const Tensor& unary_scores,
 std::size_t candidate_selector_path_workspace_capacity_bytes(int min_steps, int max_steps,
                                                              int min_batch, int max_batch) {
     if (min_steps < 1 || max_steps > 15 || max_steps < min_steps || min_batch < 1 ||
-        max_batch > 8 || max_batch < min_batch)
+        max_batch > 16 || max_batch < min_batch)
         throw std::invalid_argument("selector workspace: invalid K/B interval");
     WorkspaceLayoutBuilder layout;
     for (int k = min_steps; k <= max_steps; ++k)
@@ -102,8 +102,8 @@ void select_path(const Tensor& candidate_ids, const Tensor& unary_scores,
     const std::int32_t kSteps     = candidate_ids.ne[1];
     if (kSteps < 1 || kSteps > 15)
         throw std::invalid_argument("candidate_selector_path: K must be in [1,15]");
-    if (batch_size < 1 || batch_size > 8) {
-        throw std::invalid_argument("candidate_selector_path: B must be in [1,8]");
+    if (batch_size < 1 || batch_size > 16) {
+        throw std::invalid_argument("candidate_selector_path: B must be in [1,16]");
     }
     require_tensor(candidate_ids, DType::I32, kCandidates, kSteps, batch_size, 1, "candidate_ids");
     require_tensor(unary_scores, DType::FP32, kCandidates, kSteps, batch_size, 1, "unary_scores");

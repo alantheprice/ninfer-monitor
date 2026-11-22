@@ -80,7 +80,7 @@ struct ConvGeometry {
 };
 
 ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
-    constexpr std::int32_t kMaximumBatch = 8;
+    constexpr std::int32_t kMaximumBatch = 16;
     constexpr std::int32_t kMaximumWidth = 16;
     const std::int32_t width             = x.ne[1];
     const std::int32_t batch             = x.ne[2];
@@ -92,7 +92,7 @@ ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
 }
 
 ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden) {
-    constexpr std::int32_t kMaximumBatch = 8;
+    constexpr std::int32_t kMaximumBatch = 16;
     constexpr std::int32_t kMinimumWidth = 2;
     constexpr std::int32_t kMaximumWidth = 64;
     const std::int32_t width             = x.ne[1];
@@ -247,7 +247,7 @@ void require_parent_nonoverlap(const Weight& weight,
 
 void require_snapshot_capacity_domain(std::int32_t batch_size, std::int32_t min_width,
                                       std::int32_t max_width) {
-    constexpr std::int32_t kMaximumBatch = 8;
+    constexpr std::int32_t kMaximumBatch = 16;
     constexpr std::int32_t kMaximumWidth = 16;
     if (batch_size <= 0 || batch_size > kMaximumBatch || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumWidth)) {
@@ -257,7 +257,7 @@ void require_snapshot_capacity_domain(std::int32_t batch_size, std::int32_t min_
 
 void require_record_capacity_domain(std::int32_t batch_size, std::int32_t min_width,
                                     std::int32_t max_width) {
-    constexpr std::int32_t kMaximumBatch = 8;
+    constexpr std::int32_t kMaximumBatch = 16;
     constexpr std::int32_t kMinimumWidth = 2;
     constexpr std::int32_t kMaximumWidth = 64;
     if (batch_size <= 0 || batch_size > kMaximumBatch || min_width < kMinimumWidth ||
@@ -474,7 +474,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
 // At T=5 that was 4.8 ms of a four-draft-token MTP round.
 void require_q4_q5_conv_admitted(std::int32_t tokens, std::int32_t batch_size) {
     if (!detail::q4_q5_gdn_input_admits({5120, 4096, 12288, 10240, 6144, 5120, tokens}) ||
-        batch_size <= 0 || batch_size > 8) {
+        batch_size <= 0 || batch_size > 16) {
         throw std::invalid_argument(
             "Q4/Q5 GDN input conv: exact problem or column count is not admitted");
     }

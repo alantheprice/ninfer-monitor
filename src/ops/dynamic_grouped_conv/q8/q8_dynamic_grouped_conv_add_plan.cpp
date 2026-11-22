@@ -14,7 +14,7 @@ struct Plan {
 Plan resolve_plan(int input_rows, int width, int batch) {
     if (input_rows != 4096 && input_rows != 17408)
         throw std::invalid_argument("linear dynamic grouped conv add: C must be 4096 or 17408");
-    if (width < 2 || width > 16 || batch < 1 || batch > 8)
+    if (width < 2 || width > 16 || batch < 1 || batch > 16)
         throw std::invalid_argument("linear dynamic grouped conv add: invalid W/B profile");
     const int columns = width * batch;
     using S           = Q8DynamicConvAddSchedule;
@@ -26,7 +26,7 @@ Plan resolve_plan(int input_rows, int width, int batch) {
 std::size_t q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     int input_rows, int min_width, int max_width, int min_batch, int max_batch) {
     if (min_width < 2 || max_width > 16 || min_width > max_width || min_batch < 1 ||
-        max_batch > 8 || min_batch > max_batch)
+        max_batch > 16 || min_batch > max_batch)
         throw std::invalid_argument(
             "linear dynamic grouped conv add workspace: invalid W/B interval");
     // Every route shares one projected BF16 matrix; its capacity is monotonic in W and B.

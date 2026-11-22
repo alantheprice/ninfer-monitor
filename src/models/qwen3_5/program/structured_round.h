@@ -19,7 +19,7 @@ namespace ninfer::models::qwen3_5 {
 // DFlash on a host node that collects the jobs.
 class StructuredRound {
 public:
-    static constexpr std::uint32_t kMaximumLanes = 8;
+    static constexpr std::uint32_t kMaximumLanes = 16;
 
     StructuredRound(Tensor masks, std::uint32_t vocab, std::uint32_t width, std::uint32_t lanes,
                     bool dflash);

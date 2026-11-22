@@ -19,7 +19,7 @@ struct alignas(16) GdnReplayFoldKernelRow {
 };
 
 struct alignas(16) GdnReplayFoldKernelRows {
-    GdnReplayFoldKernelRow row[8];
+    GdnReplayFoldKernelRow row[16];
 };
 
 void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

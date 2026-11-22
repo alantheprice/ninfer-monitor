@@ -82,7 +82,7 @@ Q8GdnInputPlan q8_gdn_input_resolve_plan(const Q8GdnInputProblem& problem) {
 
 Q8GdnInputConvPlan q8_gdn_input_conv_resolve_plan(const Q8GdnInputProblem& problem,
                                                   std::int32_t batch_size) {
-    if (!q8_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 8) {
+    if (!q8_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 16) {
         throw std::invalid_argument(
             "Q8 GDN input conv: exact problem or column count is not admitted");
     }

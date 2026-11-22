@@ -16,7 +16,7 @@ namespace {
 
 static_assert(sizeof(GdnReplayFoldKernelRow) == 16);
 static_assert(alignof(GdnReplayFoldKernelRow) == 16);
-static_assert(sizeof(GdnReplayFoldKernelRows) == 128);
+static_assert(sizeof(GdnReplayFoldKernelRows) == 256);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 

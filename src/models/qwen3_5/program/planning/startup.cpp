@@ -1450,15 +1450,20 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumFamilyConcurrency) {
-        throw std::invalid_argument("max_concurrency must be in [1,8]");
+        throw std::invalid_argument("max_concurrency must be in [1,16]");
     }
     // Decode and verify rounds run the target's projections with the prefill's Linear policies, one
     // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
     // would put a weight-sized scratch into every round workspace and change decode numerics -- so
     // the widest round sits at or below the floor no device profile moves its width gate past.
-    static_assert(kMaximumFamilyConcurrency * kMtpDecodeMaximumWidth <=
-                      static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens),
-                  "the widest decode/verify round must stay below the cuBLAS prefill width gate");
+    if (options.max_concurrency *
+            (std::max(options.speculative.draft_tokens, options.speculative.ngram_draft_tokens) + 1U) >
+        static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens)) {
+        throw std::invalid_argument(
+            "the widest decode/verify round (max_concurrency x (the widest draft or copy window + 1)) "
+            "must stay at or below " + std::to_string(ops::kCublasPrefillFloorTokens) +
+            " columns, the cuBLAS prefill width gate");
+    }
     if (parameters.text.rank_count != device.size()) {
         throw std::invalid_argument("the model is split over " +
                                     std::to_string(parameters.text.rank_count) +
