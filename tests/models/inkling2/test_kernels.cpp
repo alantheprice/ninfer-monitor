@@ -325,6 +325,43 @@ void gemm_case(int m, int n, int k_, std::int64_t x_stride, std::int64_t out_str
                                num(e.rel()));
 }
 
+// Wide decode calls (vector_call, past 16 columns, the parts in one launch): every column the bits
+// of a one-column call, alone and batched.
+void gemm_wide_case(int m, int n, int k_, int count, std::mt19937& rng) {
+    std::vector<DeviceBuffer> w, x, out;
+    k::GemvBatch b;
+    for (int e = 0; e < count; ++e) {
+        w.push_back(upload(normal(std::size_t(m) * k_, 0.05f, rng)));
+        x.push_back(upload(normal(std::size_t(n) * k_, 1.0f, rng)));
+        out.emplace_back(std::size_t(n) * m * 4);
+        b.w[e] = as<float>(w[e]); b.x[e] = as<float>(x[e]); b.out[e] = as<float>(out[e]);
+    }
+    b.count = count;
+    DeviceBuffer single(std::size_t(n) * m * 4), one(std::size_t(m) * 4);
+    int differ = 0;
+    for (int e = 0; e < count; ++e) {
+        k::gemm_f32(m, n, k_, b.w[e], b.x[e], as<float>(single), nullptr, 0, 0, true);
+        sync("gemm_f32 wide");
+        const auto wide = download<float>(single, std::size_t(n) * m);
+        for (int c = 0; c < n; ++c) {
+            k::gemm_f32(m, 1, k_, b.w[e], b.x[e] + std::int64_t(c) * k_, as<float>(one), nullptr, 0, 0, true);
+            sync("gemm_f32 one");
+            const auto col = download<float>(one, std::size_t(m));
+            if (!same_bits(col, std::vector<float>(wide.begin() + std::int64_t(c) * m, wide.begin() + std::int64_t(c + 1) * m))) { ++differ; }
+        }
+    }
+    k::gemm_f32_batch(m, n, k_, b, nullptr, 0, 0, true);
+    sync("gemm_f32_batch wide");
+    for (int e = 0; e < count; ++e) {
+        k::gemm_f32(m, n, k_, b.w[e], b.x[e], as<float>(single), nullptr, 0, 0, true);
+        sync("gemm_f32 wide");
+        if (!same_bits(download<float>(out[e], std::size_t(n) * m), download<float>(single, std::size_t(n) * m))) { ++differ; }
+    }
+    report(differ == 0, "wide decode gemm_f32 " + std::to_string(m) + "x" + std::to_string(k_) + " over " +
+                            std::to_string(n) + " columns (" + std::to_string(count) + " batched): " +
+                            std::to_string(differ) + " column(s)/product(s) differ from narrower calls");
+}
+
 // gemm_f32_batch: each product's bits those of gemm_f32 (the GEMV kernel, the short-k kernel by
 // warps, cuBLAS past eight rows).
 void gemm_batch_case(int m, int n, int k_, int count, std::mt19937& rng) {
@@ -1649,6 +1686,9 @@ int main() {
         gemm_case(256, 24, kHidden, 0, 0, rng);
         // The controllers' shapes: down 64 x 2 hidden, forget and gain hidden x 64.
         for (const int n : {1, 4, 8}) {
+            gemm_wide_case(64, 40, 4608, 3, rng);
+            gemm_wide_case(2304, 33, 64, 6, rng);
+            gemm_wide_case(128, 17, 2304, 2, rng);
             gemm_batch_case(64, n, 2 * kHidden, 3, rng);
             gemm_batch_case(kHidden, n, 64, 6, rng);
         }

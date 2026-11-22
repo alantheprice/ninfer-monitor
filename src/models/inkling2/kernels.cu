@@ -491,7 +491,8 @@ constexpr int kGemvAhead   = 4; // float4 steps whose loads a thread issues befo
 template <int N>
 __device__ __forceinline__ void gemv_row(const float* __restrict__ w, const float* __restrict__ x,
                                          int row, int k, std::int64_t x_stride,
-                                         float* __restrict__ out, std::int64_t out_stride) {
+                                         float* __restrict__ out, std::int64_t out_stride,
+                                         int cols = N) {
     __shared__ float part[kGemvThreads / 32][N];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const float* wr = w + std::int64_t(row) * k;
@@ -513,7 +514,8 @@ __device__ __forceinline__ void gemv_row(const float* __restrict__ w, const floa
                 wv[a] = w4[at];
 #pragma unroll
                 for (int t = 0; t < N; ++t) {
-                    xv[a][t] = reinterpret_cast<const float4*>(x + std::int64_t(t) * x_stride)[at];
+                    xv[a][t] = t < cols ? reinterpret_cast<const float4*>(x + std::int64_t(t) * x_stride)[at]
+                                        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                 }
             }
 #pragma unroll
@@ -526,7 +528,9 @@ __device__ __forceinline__ void gemv_row(const float* __restrict__ w, const floa
     } else {
         for (int i = threadIdx.x; i < k; i += kGemvThreads) {
 #pragma unroll
-            for (int t = 0; t < N; ++t) { dot[t] += wr[i] * x[std::int64_t(t) * x_stride + i]; }
+            for (int t = 0; t < N; ++t) {
+                if (t < cols) { dot[t] += wr[i] * x[std::int64_t(t) * x_stride + i]; }
+            }
         }
     }
 #pragma unroll
@@ -536,11 +540,45 @@ __device__ __forceinline__ void gemv_row(const float* __restrict__ w, const floa
         for (int t = 0; t < N; ++t) { part[warp][t] = dot[t]; }
     }
     __syncthreads();
-    if (threadIdx.x < N) {
+    if (int(threadIdx.x) < cols) {
         float s = 0.0f;
         for (int w2 = 0; w2 < kGemvThreads / 32; ++w2) { s += part[w2][threadIdx.x]; }
         out[std::int64_t(threadIdx.x) * out_stride + row] = s;
     }
+}
+
+// Columns c0 .. c0 + cols of part `part` when n columns split into `parts` (the host's split).
+__device__ __forceinline__ void column_part(int n, int parts, int part, int& c0, int& cols) {
+    c0 = 0;
+    for (int i = 0;; ++i) {
+        cols = (n - c0 + (parts - i) - 1) / (parts - i);
+        if (i == part) { return; }
+        c0 += cols;
+    }
+}
+
+// Block (m, part[, b]): output row m of the part's columns (of product b). One launch for every
+// part of a wide vector call; a column's sums are those of the part's own narrower call.
+template <int N>
+__global__ void gemv_parts_kernel(const float* __restrict__ w, const float* __restrict__ x, int k,
+                                  std::int64_t x_stride, float* __restrict__ out,
+                                  std::int64_t out_stride, int n, int parts) {
+    ninfer::pdl::enter();
+    int c0, cols;
+    column_part(n, parts, int(blockIdx.y), c0, cols);
+    gemv_row<N>(w, x + std::int64_t(c0) * x_stride, int(blockIdx.x), k, x_stride,
+                out + std::int64_t(c0) * out_stride, out_stride, cols);
+}
+
+template <int N>
+__global__ void gemv_batch_parts_kernel(GemvBatch b, int k, std::int64_t x_stride,
+                                        std::int64_t out_stride, int n, int parts) {
+    ninfer::pdl::enter();
+    const int e = int(blockIdx.y);
+    int c0, cols;
+    column_part(n, parts, int(blockIdx.z), c0, cols);
+    gemv_row<N>(b.w[e], b.x[e] + std::int64_t(c0) * x_stride, int(blockIdx.x), k, x_stride,
+                b.out[e] + std::int64_t(c0) * out_stride, out_stride, cols);
 }
 
 // Block m: output row m.
@@ -566,27 +604,36 @@ constexpr int kShortRows = kGemvThreads / 32; // output rows per block of the sh
 // A short product (k <= 128, k % 4 == 0, x_stride % 4 == 0), block (rows, b): warp r output row
 // 8 blockIdx.x + r of product b, lane l its values 4l..4l+3. The sums are gemv_row's: its threads
 // past k / 4 and its other warps add zeros.
+// Wide vector calls: blockIdx.z the part of `parts` (n columns), as gemv_parts_kernel.
 template <int N>
 __global__ void __launch_bounds__(kGemvThreads)
-    gemv_short_kernel(GemvBatch b, int m, int k, std::int64_t x_stride, std::int64_t out_stride) {
+    gemv_short_kernel(GemvBatch b, int m, int k, std::int64_t x_stride, std::int64_t out_stride,
+                      int n = N, int parts = 1) {
     ninfer::pdl::enter();
     const int e = int(blockIdx.y), lane = threadIdx.x & 31;
     const int row = int(blockIdx.x) * kShortRows + int(threadIdx.x >> 5);
     if (row >= m) { return; }
-    const float* x = b.x[e];
+    int c0 = 0, cols = N;
+    if (parts > 1) { column_part(n, parts, int(blockIdx.z), c0, cols); }
+    const float* x = b.x[e] + std::int64_t(c0) * x_stride;
+    float* out     = b.out[e] + std::int64_t(c0) * out_stride;
     float dot[N]   = {};
     if (lane < k / 4) {
         const float4 wv = reinterpret_cast<const float4*>(b.w[e] + std::int64_t(row) * k)[lane];
 #pragma unroll
         for (int t = 0; t < N; ++t) {
-            dot[t] += dot4(wv, reinterpret_cast<const float4*>(x + std::int64_t(t) * x_stride)[lane]);
+            if (t < cols) {
+                dot[t] += dot4(wv, reinterpret_cast<const float4*>(x + std::int64_t(t) * x_stride)[lane]);
+            }
         }
     }
 #pragma unroll
     for (int t = 0; t < N; ++t) { dot[t] = warp_sum(dot[t]); }
     if (lane == 0) {
 #pragma unroll
-        for (int t = 0; t < N; ++t) { b.out[e][std::int64_t(t) * out_stride + row] = 0.0f + dot[t]; }
+        for (int t = 0; t < N; ++t) {
+            if (t < cols) { out[std::int64_t(t) * out_stride + row] = 0.0f + dot[t]; }
+        }
     }
 }
 
@@ -2977,13 +3024,12 @@ void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, c
     if (vector_call && n > 2 * kGemvRows) {
         // Past 16 columns: launches of at most 16 (the matrix is small; its later reads come from
         // L2). Each column's sums are those of a narrower call.
+        // One launch: the parts on blockIdx.y run side by side.
         const int parts = (n + 2 * kGemvRows - 1) / (2 * kGemvRows);
-        for (int i = 0, c0 = 0; i < parts; ++i) {
-            const int cols = (n - c0 + (parts - i) - 1) / (parts - i);
-            gemm_f32(m, cols, k, w, x + std::int64_t(c0) * x_stride, out + std::int64_t(c0) * out_stride,
-                     stream, x_stride, out_stride, true);
-            c0 += cols;
-        }
+        with_columns((n + parts - 1) / parts, [&](auto tokens) {
+            (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(unsigned(m), unsigned(parts)), dim3(kGemvThreads), std::size_t(0), stream}, gemv_parts_kernel<decltype(tokens)::value>, w, x, k, x_stride, out, out_stride, n, parts);
+        });
+        check_launch("gemv parts");
         return;
     }
     if (n <= kGemvRows || (vector_call && n <= 2 * kGemvRows)) {
@@ -3012,17 +3058,18 @@ void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t st
     if (x_stride == 0) { x_stride = k; }
     if (out_stride == 0) { out_stride = m; }
     if (vector_call && n > 2 * kGemvRows) {
-        const int parts = (n + 2 * kGemvRows - 1) / (2 * kGemvRows);
-        for (int i = 0, c0 = 0; i < parts; ++i) {
-            const int cols = (n - c0 + (parts - i) - 1) / (parts - i);
-            GemvBatch part = batch;
-            for (int e = 0; e < batch.count; ++e) {
-                part.x[e]   = batch.x[e] + std::int64_t(c0) * x_stride;
-                part.out[e] = batch.out[e] + std::int64_t(c0) * out_stride;
+        // One launch: the parts on blockIdx.z run side by side.
+        const int parts   = (n + 2 * kGemvRows - 1) / (2 * kGemvRows);
+        const bool short_k = k <= 128 && k % 4 == 0 && x_stride % 4 == 0;
+        with_columns((n + parts - 1) / parts, [&](auto tokens) {
+            constexpr int N = decltype(tokens)::value;
+            if (short_k) {
+                (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks_for(m, kShortRows), unsigned(batch.count), unsigned(parts)), dim3(kGemvThreads), std::size_t(0), stream}, gemv_short_kernel<N>, batch, m, k, x_stride, out_stride, n, parts);
+            } else {
+                (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(unsigned(m), unsigned(batch.count), unsigned(parts)), dim3(kGemvThreads), std::size_t(0), stream}, gemv_batch_parts_kernel<N>, batch, k, x_stride, out_stride, n, parts);
             }
-            gemm_f32_batch(m, cols, k, part, stream, x_stride, out_stride, true);
-            c0 += cols;
-        }
+        });
+        check_launch("gemv_batch parts");
         return;
     }
     if (n > (vector_call ? 2 * kGemvRows : kGemvRows)) {
@@ -3037,7 +3084,7 @@ void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t st
     const auto launch = [&](auto tokens) {
         constexpr int N = decltype(tokens)::value;
         if (short_k) {
-            (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(blocks_for(m, kShortRows), unsigned(batch.count))), dim3(kGemvThreads), std::size_t(0), stream}, gemv_short_kernel<N>, batch, m, k, x_stride, out_stride);
+            (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(blocks_for(m, kShortRows), unsigned(batch.count))), dim3(kGemvThreads), std::size_t(0), stream}, gemv_short_kernel<N>, batch, m, k, x_stride, out_stride, N, 1);
         } else {
             (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(dim3(unsigned(m), unsigned(batch.count))), dim3(kGemvThreads), std::size_t(0), stream}, gemv_batch_kernel<N>, batch, k, x_stride, out_stride);
         }
