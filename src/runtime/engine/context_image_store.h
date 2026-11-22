@@ -24,10 +24,16 @@
 #include "runtime/prefix_cache/tap_planner.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <set>
+#include <thread>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -41,6 +47,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <unistd.h>
 #include <vector>
 
 namespace ninfer::runtime {
@@ -173,6 +180,9 @@ struct ContextImageStoreOptions {
     // Prompts may resume from images only on disk (those a previous run left included); off
     // leaves the tier write-only.
     bool disk_restore = false;
+    // The directory is shared with other engine processes (disk_kv_shared): publish() writes
+    // through in the background and refresh() finds what the others wrote.
+    bool disk_shared = false;
 };
 
 // One record: this header, the profile, the family's fields, the tokens, the media units, the
@@ -210,7 +220,8 @@ context_image_store_options(const ContextCacheOptions& cache, std::uint64_t host
         out.disk_dir     = cache.disk_kv_path / profile;
         out.disk_budget  = cache.disk_kv_capacity_bytes != 0 ? cache.disk_kv_capacity_bytes
                                                              : (std::uint64_t(64) << 30);
-        out.disk_restore = cache.disk_kv_restore;
+        out.disk_restore = cache.disk_kv_restore || cache.disk_kv_shared;
+        out.disk_shared  = cache.disk_kv_shared;
     }
     return out;
 }
@@ -249,7 +260,13 @@ public:
         std::filesystem::path file;    // empty unless on disk
         std::uint64_t bytes     = 0;
         std::uint64_t last_used = 0;
+        bool writing            = false; // its pages are being written to the shared tier
     };
+
+    ContextImageStore() = default;
+    ContextImageStore(const ContextImageStore&)            = delete;
+    ContextImageStore& operator=(const ContextImageStore&) = delete;
+    ~ContextImageStore() { stop_writer(); }
 
     // `profile` names what an image's bytes mean; `image_bytes` is the executor's image size at a
     // position; `sync` waits for the copies the executor queued into or out of the pages, before
@@ -266,8 +283,134 @@ public:
         disk_dir_     = options.disk_dir;
         disk_budget_  = options.disk_budget;
         disk_restore_ = options.disk_restore;
+        disk_shared_  = options.disk_shared;
         std::filesystem::create_directories(disk_dir_);
         if (disk_restore_) { scan_disk(); }
+        if (disk_shared_) {
+            std::error_code ignored;
+            dir_time_ = std::filesystem::last_write_time(disk_dir_, ignored);
+            writer_   = std::thread([this] { run_writer(); });
+        }
+    }
+
+    [[nodiscard]] bool shared() const noexcept { return disk_shared_; }
+
+    // ---- The shared tier ------------------------------------------------------------------------
+
+    // Writes the image of exactly these tokens and media through to the shared directory in the
+    // background, once `wait()` (on the writer thread) has seen the executor's copies into its
+    // pages complete. Its pages stay until the file is written.
+    void publish(std::span<const TokenId> tokens, std::span<const ContextMediaMark> media,
+                 std::function<void()> wait) {
+        if (!disk_shared_) { return; }
+        collect_writes();
+        const auto at = index(tokens, media);
+        if (!at) { return; }
+        Image& image = images_[*at];
+        if (image.writing || !image.file.empty() || image.pages.empty()) { return; }
+        const std::uint64_t size = record_bytes(image);
+        if (size > disk_budget_) { return; }
+        while (disk_used_ + size > disk_budget_) {
+            Image* oldest = nullptr;
+            for (Image& other : images_) {
+                if (!other.file.empty() && (oldest == nullptr || other.last_used < oldest->last_used)) {
+                    oldest = &other;
+                }
+            }
+            if (oldest == nullptr) { return; }
+            remove_file(*oldest);
+        }
+        WriteJob job;
+        job.path  = disk_dir_ / file_name(image);
+        job.pages = image.pages;
+        job.bytes = image.bytes;
+        job.size  = size;
+        job.wait  = std::move(wait);
+        job.tokens.assign(tokens.begin(), tokens.end());
+        job.media.assign(media.begin(), media.end());
+        {
+            std::ostringstream head(std::ios::binary);
+            std::vector<std::byte> extra;
+            const ContextImageRecordHeader record = record_head(image, extra);
+            head.write(reinterpret_cast<const char*>(&record), sizeof(record));
+            head.write(profile_.data(), std::streamsize(profile_.size()));
+            head.write(reinterpret_cast<const char*>(extra.data()), std::streamsize(extra.size()));
+            head.write(reinterpret_cast<const char*>(image.tokens.data()),
+                       std::streamsize(4 * image.tokens.size()));
+            head.write(reinterpret_cast<const char*>(image.media.data()),
+                       std::streamsize(sizeof(ContextMediaMark) * image.media.size()));
+            job.head = std::move(head).str();
+        }
+        image.writing = true;
+        disk_used_ += size;
+        {
+            std::lock_guard lock(writer_mutex_);
+            jobs_.push_back(std::move(job));
+        }
+        writer_cv_.notify_one();
+    }
+
+    // Takes in what the other processes wrote since the last look (the directory changed) and
+    // forgets images whose files they removed; the written-through images of this process are
+    // collected too.
+    void refresh() {
+        if (!disk_shared_) { return; }
+        collect_writes();
+        std::error_code failed;
+        const auto now = std::filesystem::last_write_time(disk_dir_, failed);
+        if (failed || now == dir_time_) { return; }
+        dir_time_ = now;
+        std::set<std::filesystem::path> present;
+        std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> fresh;
+        for (const auto& entry : std::filesystem::directory_iterator(disk_dir_, failed)) {
+            if (entry.path().extension() != ".img") { continue; }
+            present.insert(entry.path());
+            fresh.emplace_back(entry.last_write_time(failed), entry.path());
+        }
+        // Gone: the other process evicted them (only images that were not in host pages).
+        for (Image& image : images_) {
+            if (!image.file.empty() && !image.writing && !present.contains(image.file)) {
+                disk_used_ -= std::min<std::uint64_t>(disk_used_, record_bytes(image));
+                image.file.clear();
+            }
+        }
+        drop_dead();
+        std::set<std::filesystem::path> known;
+        for (const Image& image : images_) {
+            if (!image.file.empty()) { known.insert(image.file); }
+        }
+        {
+            std::lock_guard lock(writer_mutex_);
+            for (const auto& path : writing_paths_) { known.insert(path); }
+            for (const WriteJob& job : jobs_) { known.insert(job.path); }
+        }
+        std::sort(fresh.begin(), fresh.end());
+        for (const auto& [time, path] : fresh) {
+            if (known.contains(path)) { continue; }
+            std::ifstream in(path, std::ios::binary);
+            Image image;
+            if (!read_record_head(in, image)) { continue; }
+            if (const auto at = index(image.tokens, image.media)) {
+                if (images_[*at].file.empty() && !images_[*at].writing) {
+                    images_[*at].file = path;
+                    disk_used_ += std::filesystem::file_size(path, failed);
+                }
+                continue;
+            }
+            image.file      = path;
+            image.last_used = ++clock_;
+            disk_used_ += std::filesystem::file_size(path, failed);
+            images_.push_back(std::move(image));
+        }
+    }
+
+    // Waits for the written-through images (a clean stop, a drop).
+    void finish_writes() {
+        if (!disk_shared_) { return; }
+        std::unique_lock lock(writer_mutex_);
+        writer_cv_.wait(lock, [&] { return jobs_.empty() && !writer_busy_; });
+        lock.unlock();
+        collect_writes();
     }
 
     [[nodiscard]] bool enabled() const noexcept { return host_budget_ != 0; }
@@ -382,6 +525,12 @@ public:
         Image& image = images_[*at];
         load(static_cast<const Header&>(image.header), std::span<std::byte* const>(image.pages),
              kPageBytes);
+        if (disk_shared_ && !image.file.empty()) {
+            // The other processes' order of use: a file's time is its last use.
+            std::error_code ignored;
+            std::filesystem::last_write_time(image.file, std::filesystem::file_time_type::clock::now(),
+                                             ignored);
+        }
         image.last_used           = ++clock_;
         const std::uint64_t bytes = image.bytes;
         // Within the budget again, the image just read in being the most recently used.
@@ -392,6 +541,7 @@ public:
     // Drops the images `drop(image)` names, their files too.
     template <class Drop>
     void drop_if(Drop&& drop) {
+        finish_writes();
         for (std::size_t i = images_.size(); i-- > 0;) {
             Image& image = images_[i];
             if (!drop(static_cast<const Image&>(image))) { continue; }
@@ -408,6 +558,7 @@ public:
     // bytes.
     std::pair<std::uint32_t, std::uint64_t> spill_to_disk() {
         if (disk_dir_.empty()) { return {0, 0}; }
+        finish_writes();
         std::vector<std::size_t> order;
         for (std::size_t i = 0; i < images_.size(); ++i) {
             if (!images_[i].pages.empty() && images_[i].file.empty()) { order.push_back(i); }
@@ -648,14 +799,17 @@ private:
         if (bytes > host_budget_) { return false; }
         while (host_used_ + bytes > host_budget_) {
             std::optional<std::size_t> oldest;
+            collect_writes();
             for (std::size_t i = 0; i < images_.size(); ++i) {
-                if (!images_[i].pages.empty() &&
+                if (!images_[i].pages.empty() && !images_[i].writing &&
                     (!oldest || images_[i].last_used < images_[*oldest].last_used)) {
                     oldest = i;
                 }
             }
             if (!oldest) { return false; }
-            write_file(images_[*oldest]);
+            // A shared tier holds what publish() writes through; spilling an evicted image would
+            // write a whole state on the caller's thread.
+            if (!disk_shared_) { write_file(images_[*oldest]); }
             give_back(images_[*oldest]);
             drop_dead();
         }
@@ -841,6 +995,103 @@ private:
         }
         return true;
     }
+
+    // ---- The shared tier's writer ----------------------------------------------------------------
+    struct WriteJob {
+        std::filesystem::path path;
+        std::string head; // the record up to its bytes
+        std::vector<std::byte*> pages;
+        std::uint64_t bytes = 0, size = 0;
+        std::function<void()> wait;
+        std::vector<TokenId> tokens;
+        std::vector<ContextMediaMark> media;
+        bool written = false;
+    };
+
+    void run_writer() {
+        for (;;) {
+            WriteJob job;
+            {
+                std::unique_lock lock(writer_mutex_);
+                writer_cv_.wait(lock, [&] { return writer_stop_ || !jobs_.empty(); });
+                if (jobs_.empty()) { return; }
+                job = std::move(jobs_.front());
+                jobs_.pop_front();
+                writer_busy_ = true;
+                writing_paths_.insert(job.path);
+            }
+            if (job.wait) { job.wait(); }
+            const auto temporary = std::filesystem::path(job.path).concat(".tmp" + std::to_string(::getpid()));
+            {
+                std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+                out.write(job.head.data(), std::streamsize(job.head.size()));
+                for (std::uint64_t at = 0; at < job.bytes; at += kPageBytes) {
+                    out.write(reinterpret_cast<const char*>(job.pages[at / kPageBytes]),
+                              std::streamsize(std::min<std::uint64_t>(kPageBytes, job.bytes - at)));
+                }
+                job.written = static_cast<bool>(out);
+            }
+            std::error_code failed;
+            if (job.written) { std::filesystem::rename(temporary, job.path, failed); }
+            if (!job.written || failed) {
+                std::filesystem::remove(temporary, failed);
+                job.written = false;
+            }
+            {
+                std::lock_guard lock(writer_mutex_);
+                writing_paths_.erase(job.path);
+                job.wait = nullptr;
+                done_.push_back(std::move(job));
+                writer_busy_ = false;
+            }
+            writer_cv_.notify_all();
+        }
+    }
+
+    // The writes the writer finished: their images keep their files and give up the hold on
+    // their pages.
+    void collect_writes() {
+        if (!disk_shared_) { return; }
+        std::vector<WriteJob> done;
+        {
+            std::lock_guard lock(writer_mutex_);
+            done.swap(done_);
+        }
+        for (WriteJob& job : done) {
+            const auto at = index(job.tokens, job.media);
+            if (!at) {
+                disk_used_ -= std::min<std::uint64_t>(disk_used_, job.size);
+                continue;
+            }
+            Image& image  = images_[*at];
+            image.writing = false;
+            if (job.written) {
+                image.file = job.path;
+            } else {
+                disk_used_ -= std::min<std::uint64_t>(disk_used_, job.size);
+            }
+        }
+    }
+
+    void stop_writer() {
+        if (!writer_.joinable()) { return; }
+        {
+            std::lock_guard lock(writer_mutex_);
+            writer_stop_ = true;
+        }
+        writer_cv_.notify_all();
+        writer_.join();
+    }
+
+    bool disk_shared_ = false;
+    std::filesystem::file_time_type dir_time_{};
+    std::thread writer_;
+    std::mutex writer_mutex_;
+    std::condition_variable writer_cv_;
+    std::deque<WriteJob> jobs_;
+    std::vector<WriteJob> done_;
+    std::set<std::filesystem::path> writing_paths_;
+    bool writer_stop_ = false, writer_busy_ = false;
 
     std::uint64_t host_budget_ = 0, host_reserve_ = 0, host_used_ = 0;
     std::uint64_t disk_budget_ = 0, disk_used_ = 0;

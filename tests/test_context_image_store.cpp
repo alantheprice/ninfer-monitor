@@ -193,6 +193,49 @@ void check_disk_tier(const std::filesystem::path& root) {
     }
 }
 
+// Two processes' stores on one shared directory: a published image is written in the
+// background, the other store finds it on refresh and reads it back, and a removed file leaves
+// both.
+void check_shared_tier(const std::filesystem::path& root) {
+    const auto dir = root / "shared";
+    const auto shared_options = [&] {
+        ContextImageStoreOptions options;
+        options.host_budget  = 8 * kPage;
+        options.host_reserve = 4 * kPage;
+        options.disk_dir     = dir;
+        options.disk_budget  = 64 * kPage;
+        options.disk_restore = true;
+        options.disk_shared  = true;
+        return options;
+    };
+    const auto a = prompt(120, 3);
+    Store writer, reader;
+    writer.configure(shared_options(), "test-image2-profile", image_bytes, {});
+    reader.configure(shared_options(), "test-image2-profile", image_bytes, {});
+    writer.pin_reserve();
+    reader.pin_reserve();
+    (void)writer.put(a, {}, PrefixReusePath::PrivateTurnClosure, 120, save(120, 5));
+    bool waited = false;
+    writer.publish(a, {}, [&] { waited = true; });
+    writer.finish_writes();
+    check(waited && on_disk(dir) == 1, "a published image is written through after its copies");
+    // A directory time of a coarse filesystem may not move within one tick: look again.
+    std::filesystem::last_write_time(dir, std::filesystem::file_time_type::clock::now() +
+                                              std::chrono::seconds(1));
+    reader.refresh();
+    const auto [served, length] = reader.best([&](const Store::Image& image) {
+        return image.tokens == a ? 120U : 0U;
+    });
+    check(length == 120, "another process's store finds the published image");
+    check(loads(reader, a, 120, 5), "and reads its bytes back");
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        std::filesystem::remove(entry.path());
+    }
+    Store late;
+    late.configure(shared_options(), "test-image2-profile", image_bytes, {});
+    check(late.images().empty(), "a removed file is gone for a new store");
+}
+
 void check_records(const std::filesystem::path& root) {
     const auto a = prompt(150, 7);
     const std::vector<ContextMediaMark> media{{.begin = 10, .count = 20, .key = 0x1234}};
@@ -422,6 +465,7 @@ int main() {
         check_host_budget();
         check_pin_ahead();
         check_disk_tier(root);
+        check_shared_tier(root);
         check_records(root);
         check_cache_file(root);
     } catch (const std::exception& error) {

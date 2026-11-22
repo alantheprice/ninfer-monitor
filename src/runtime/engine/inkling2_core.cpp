@@ -1220,7 +1220,8 @@ struct Inkling2Core::Impl {
     // the store, unless the store already holds that prefix or it is too short to be worth it.
     void store_image(std::uint32_t s, const std::vector<TokenId>& tokens,
                      const std::vector<MediaMark>& media,
-                     const models::inkling2::SequenceSnapshot* at, PrefixReusePath path) {
+                     const models::inkling2::SequenceSnapshot* at, PrefixReusePath path,
+                     bool beside = false) {
         if (!store.enabled()) { return; }
         const bool frontier = path == PrefixReusePath::SharedStablePrefix ||
                               path == PrefixReusePath::PrivateLongAnchor;
@@ -1234,13 +1235,30 @@ struct Inkling2Core::Impl {
         const auto bytes = store.put(
             tokens, media, path, position,
             [&](std::span<std::byte* const> pages, std::size_t page_bytes) {
-                return executor.save_image(s, at, pages, page_bytes);
+                return beside ? executor.save_image_async(s, at, pages, page_bytes)
+                              : executor.save_image(s, at, pages, page_bytes);
             });
         if (!bytes) { return; }
         std::lock_guard lock(stats_mutex);
         stats.state_d2h_count += 1;
         stats.state_d2h_bytes += *bytes;
         stats.host_kv_occupied_bytes = store.host_used();
+    }
+
+    // A shared tier: the sequence's anchor (where its conversation's next turn resumes), written
+    // through so another engine process can serve that turn. The copy out runs on the head stream
+    // now; the store's writer waits for it and writes the file.
+    void publish_anchor(std::uint32_t s) {
+        Slot& slot = slots[s];
+        const bool anchored = !slot.anchor.empty() && slot.anchor.size() <= slot.fed.size() &&
+                              std::equal(slot.anchor.begin(), slot.anchor.end(), slot.fed.begin());
+        if (!anchored) { return; }
+        store_image(s, slot.anchor, slot.anchor_media, &slot.snapshot, slot.anchor_path, true);
+        const cudaStream_t copies = instance.executor->copy_stream();
+        auto copied = std::make_shared<CudaCompletionEvent>(device);
+        copied->record(copies != nullptr ? copies : instance.executor->head_stream());
+        std::vector<runtime::ContextMediaMark> media(slot.anchor_media.begin(), slot.anchor_media.end());
+        store.publish(slot.anchor, media, [copied] { copied->synchronize(); });
     }
 
     // Keeps what sequence `s` holds before its state goes: the prefix its last prompt's turn
@@ -1371,6 +1389,7 @@ struct Inkling2Core::Impl {
         // longest prefix the store keeps; what the sequence held goes to the store first.
         std::uint32_t reused = 0;
         if (reuse_prefixes && r.reusable) {
+            store.refresh(); // what other engine processes wrote to a shared tier
             const std::uint32_t live       = prefix_reuse(slot.fed, slot.media, r);
             const std::uint32_t anchored   = prefix_reuse(slot.anchor, slot.anchor_media, r);
             const auto [image, from_store] = find_stored(r);
@@ -1823,6 +1842,9 @@ struct Inkling2Core::Impl {
         }
         result.timings.total_seconds = r.prepare_seconds + seconds(r.submitted, now);
         Slot& held   = slots.at(r.slot);
+        if (store.shared() && reuse_prefixes && r.reusable && reason != FinishReason::Cancelled) {
+            publish_anchor(r.slot);
+        }
         held.request = nullptr;
         // The session the sequence keeps, which /slots lists under this slot.
         if (!held.fed.empty()) {

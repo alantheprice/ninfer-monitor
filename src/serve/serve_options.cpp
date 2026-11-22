@@ -458,6 +458,11 @@ std::string serve_usage_text(const char* argv0) {
            "  --disk-kv-gib N               disk tier budget (default 64)\n"
            "  --disk-kv-restore             seed a new request's matching prefix from the\n"
            "                                disk tier\n"
+           "  --disk-kv-shared              share the disk tier's directory with other engine\n"
+           "                                processes: write each finished conversation through\n"
+           "                                and resume from theirs (Inkling 2, Gemma 4, Flint,\n"
+           "                                DeepSeek-V4.1, Flash-Next); a /dev/shm path is a\n"
+           "                                shared RAM tier\n"
            "  --disk-kv-directstorage       read restores through DirectStorage (Windows\n"
            "                                builds with NINFER_DIRECTSTORAGE)\n"
            "  --slot-save-path DIR          enable POST /slots/{id}?action=save|restore|erase,\n"
@@ -1095,6 +1100,12 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             continue;
         }
         if (product::switch_option(arg, "disk-kv-restore", [&](bool on) { options.context_cache.disk_kv_restore = on; })) {
+            continue;
+        }
+        if (product::switch_option(arg, "disk-kv-shared", [&](bool on) {
+                options.context_cache.disk_kv_shared = on;
+                if (on) { options.context_cache.disk_kv_restore = true; }
+            })) {
             continue;
         }
         if (product::switch_option(arg, "disk-kv-directstorage", [&](bool on) { options.context_cache.disk_kv_directstorage = on; })) {

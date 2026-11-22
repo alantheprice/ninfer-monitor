@@ -206,6 +206,12 @@ public:
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;
     SequenceImage save_image(std::uint32_t sequence, const SequenceSnapshot* at,
                              std::span<std::byte* const> pages, std::size_t page_bytes);
+    // save_image on a copy stream of its own, beside the work queued after it (a write-through
+    // of a finished conversation); the sequence's next state write waits for it. copy_stream()
+    // is that stream (null until the first such copy).
+    SequenceImage save_image_async(std::uint32_t sequence, const SequenceSnapshot* at,
+                                   std::span<std::byte* const> pages, std::size_t page_bytes);
+    [[nodiscard]] cudaStream_t copy_stream() const noexcept;
     void load_image(std::uint32_t sequence, const SequenceImage& image,
                     std::span<std::byte* const> pages, std::size_t page_bytes);
 

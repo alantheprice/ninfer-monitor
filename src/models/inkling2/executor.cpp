@@ -1525,6 +1525,12 @@ struct Executor::Impl {
 
     ~Impl() {
         if (delivery || growing) { ninfer::wait_for_stream(stream); }
+        if (copy_stream != nullptr) {
+            (void)cudaStreamSynchronize(copy_stream);
+            (void)cudaEventDestroy(copy_mark);
+            (void)cudaEventDestroy(copy_done);
+            (void)cudaStreamDestroy(copy_stream);
+        }
         if (side) {
             if (side->in) { swap_side(); }
             (void)cudaStreamSynchronize(side->stream);
@@ -3417,15 +3423,63 @@ struct Executor::Impl {
 
     SequenceImage save_image(std::uint32_t sequence, const SequenceSnapshot* at,
                              std::span<std::byte* const> pages, std::size_t page_bytes) {
+        await_copy(sequence);
         const std::uint32_t position = at != nullptr ? at->position : positions.at(sequence);
         copy_image(sequence, position, pages, page_bytes, true, at != nullptr);
         return {position};
+    }
+
+    // ---- Image copies beside the work ------------------------------------------------------------
+    // save_image_async queues the copy out on a stream of its own, after everything queued on the
+    // executor's stream, so decoding goes on while it runs. Until a later call that writes the
+    // sequence's state (snapshot, restore, reset, load or save) orders itself after it, the copy
+    // reads rows and rings nothing else writes: the positions before the image's are fixed, and
+    // its snapshot changes only at the next snapshot.
+    cudaStream_t copy_stream = nullptr;
+    cudaEvent_t copy_mark = nullptr, copy_done = nullptr;
+    std::vector<char> copy_pending;
+
+    SequenceImage save_image_async(std::uint32_t sequence, const SequenceSnapshot* at,
+                                   std::span<std::byte* const> pages, std::size_t page_bytes) {
+        if (copy_stream == nullptr) {
+            int least = 0, greatest = 0;
+            CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+            CUDA_CHECK(cudaStreamCreateWithPriority(&copy_stream, cudaStreamNonBlocking, least));
+            CUDA_CHECK(cudaEventCreateWithFlags(&copy_mark, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&copy_done, cudaEventDisableTiming));
+            copy_pending.assign(options.sequences, 0);
+        }
+        CUDA_CHECK(cudaEventRecord(copy_mark, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(copy_stream, copy_mark, 0));
+        const std::uint32_t position = at != nullptr ? at->position : positions.at(sequence);
+        std::swap(stream, copy_stream);
+        try {
+            copy_image(sequence, position, pages, page_bytes, true, at != nullptr);
+        } catch (...) {
+            std::swap(stream, copy_stream);
+            throw;
+        }
+        std::swap(stream, copy_stream);
+        CUDA_CHECK(cudaEventRecord(copy_done, copy_stream));
+        copy_pending.at(sequence) = 1;
+        return {position};
+    }
+
+    void await_copy(std::uint32_t sequence) {
+        if (copy_pending.empty() || !copy_pending.at(sequence)) { return; }
+        CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done, 0));
+        copy_pending[sequence] = 0;
     }
 
     void load_image(std::uint32_t sequence, const SequenceImage& image,
                     std::span<std::byte* const> pages, std::size_t page_bytes) {
         if (image.position > options.max_context) {
             throw std::invalid_argument("inkling2 load_image: invalid image");
+        }
+        // Host pages an earlier copy out may still be filling (an image of any sequence).
+        if (copy_stream != nullptr) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done, 0));
+            std::fill(copy_pending.begin(), copy_pending.end(), 0);
         }
         back(sequence, image.position);
         copy_image(sequence, image.position, pages, page_bytes, false, false);
@@ -3434,11 +3488,13 @@ struct Executor::Impl {
     }
 
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
+        await_copy(sequence);
         copy_rings(sequence, true);
         out.position = positions[sequence];
     }
 
     void restore(std::uint32_t sequence, const SequenceSnapshot& from) {
+        await_copy(sequence);
         copy_rings(sequence, false);
         positions[sequence]  = from.position;
         ring_floor[sequence] = from.position;
@@ -3492,12 +3548,20 @@ SequenceImage Executor::save_image(std::uint32_t sequence, const SequenceSnapsho
     return impl_->save_image(sequence, at, pages, page_bytes);
 }
 
+SequenceImage Executor::save_image_async(std::uint32_t sequence, const SequenceSnapshot* at,
+                                         std::span<std::byte* const> pages, std::size_t page_bytes) {
+    return impl_->save_image_async(sequence, at, pages, page_bytes);
+}
+
+cudaStream_t Executor::copy_stream() const noexcept { return impl_->copy_stream; }
+
 void Executor::load_image(std::uint32_t sequence, const SequenceImage& image,
                           std::span<std::byte* const> pages, std::size_t page_bytes) {
     impl_->load_image(sequence, image, pages, page_bytes);
 }
 
 void Executor::reset(std::uint32_t sequence) {
+    impl_->await_copy(sequence);
     impl_->positions.at(sequence)  = 0;
     impl_->ring_floor.at(sequence) = 0;
     impl_->release(sequence);

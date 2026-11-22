@@ -272,6 +272,11 @@ struct ContextCacheOptions {
     // those KV pages and the StateImage at E and prefills only [E, prompt). Off leaves the tier
     // write-only.
     bool disk_kv_restore = false;
+    // Shared tier (the families with an Engine core of their own): several engine processes on
+    // the host share the directory. Each finished conversation's state is written through to it
+    // (in the background), and a prompt resumes from images other processes wrote; implies
+    // disk_kv_restore. A tmpfs path (/dev/shm/...) makes it a shared RAM tier.
+    bool disk_kv_shared = false;
     // Restore reads go through Microsoft DirectStorage (Windows builds with NINFER_DIRECTSTORAGE);
     // any other build refuses it at load. A failed batch falls back to mapped reads.
     bool disk_kv_directstorage = false;

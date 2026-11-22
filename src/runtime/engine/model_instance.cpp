@@ -428,6 +428,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // Without a catalog no continuation is ever evicted or restored.
         cache.disk_kv_path.clear();
         cache.disk_kv_restore       = false;
+        cache.disk_kv_shared        = false;
         cache.disk_kv_directstorage = false;
         cache.rolling_retention            = false;
         cache.release_diverged_checkpoints = false;
