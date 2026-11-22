@@ -44,6 +44,9 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    // --model-card: a JSON model card served verbatim under model_card on /v1/models/{id} and at
+    // /v1/models/{id}/card (the fleet contract); empty: none.
+    std::string model_card;
     // --electricity-rate: USD per kWh for /usage's energy cost (the fleet contract).
     double electricity_rate_usd_per_kwh = 0.0;
     // --slots-format: GET /slots in the fleet contract's shape (port, default) or llama.cpp's list.

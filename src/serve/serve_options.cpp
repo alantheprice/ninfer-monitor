@@ -689,6 +689,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --response-store-max-mib N    Responses state budget (default 256)\n"
            "\n"
            "LOGGING\n"
+           "  --model-card FILE             JSON model card served under model_card on\n"
+           "                                /v1/models/{id} and at /v1/models/{id}/card\n"
            "  --electricity-rate USD        USD per kWh for /usage's energy cost (default 0)\n"
            "  --slots-format port|llamacpp  GET /slots as lane occupancy (port, default) or\n"
            "                                llama.cpp's catalog-cell list\n"
@@ -1238,6 +1240,11 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
                 parse_nonnegative_int(require_value("--max-cache-markers-per-request"),
                                       "max-cache-markers-per-request"));
             context_capacity_explicit = true;
+            continue;
+        }
+        if (arg == "--model-card") {
+            options.model_card = require_value("--model-card");
+            if (options.model_card.empty()) { throw std::invalid_argument("--model-card must not be empty"); }
             continue;
         }
         if (arg == "--electricity-rate") {

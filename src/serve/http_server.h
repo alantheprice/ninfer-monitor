@@ -10,6 +10,8 @@
 #include "serve/request_log.h"
 #include "serve/serve_metrics.h"
 #include "serve/port_contract.h"
+
+#include <nlohmann/json.hpp>
 #include "serve/serve_options.h"
 #include "serve/systemone.h"
 #include "serve/text_completion.h"
@@ -165,6 +167,7 @@ private:
     void handle_health(httplib::Response& res) const;
     void handle_slots(const httplib::Request& req, httplib::Response& res) const;
     void handle_usage(const httplib::Request& req, httplib::Response& res) const;
+    void handle_model_card(const httplib::Request& req, httplib::Response& res) const;
     void handle_model_residency(const httplib::Request& req, httplib::Response& res) const;
     void handle_model_suspend(const httplib::Request& req, httplib::Response& res);
     void handle_model_resume(const httplib::Request& req, httplib::Response& res);
@@ -253,6 +256,8 @@ private:
     ServeMetrics metrics_;
     // The fleet monitoring contract (/usage, port-shaped /slots, ninfer_* metrics).
     PortContract port_contract_;
+    // --model-card's JSON (null without one), read at construction.
+    nlohmann::json model_card_;
     bool port_contract_configured_ = false;
     void configure_port_contract();
     std::unique_ptr<ConsoleStatsPanel> console_stats_;

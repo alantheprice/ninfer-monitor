@@ -1,5 +1,7 @@
 #include "serve/http_server.h"
 #include "product/speculative_options.h"
+
+#include <fstream>
 #include "serve/slot_files.h"
 
 #include "product/logging/logging.h"
@@ -307,6 +309,16 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                      options_.request_log_keep) {
     if (options_.log_stats_panel && panel != nullptr && panel->enabled()) {
         console_stats_ = std::make_unique<ConsoleStatsPanel>(std::move(panel));
+    }
+    if (!options_.model_card.empty()) {
+        // Parse errors are fatal: a fleet would otherwise serve no card without noticing.
+        std::ifstream in(options_.model_card);
+        if (!in) { throw std::invalid_argument("--model-card: cannot read " + options_.model_card); }
+        try {
+            model_card_ = nlohmann::json::parse(in);
+        } catch (const std::exception& e) {
+            throw std::invalid_argument("--model-card: " + options_.model_card + ": " + e.what());
+        }
     }
     // cpp-httplib is thread-per-connection: a worker is held for a connection's whole
     // life, including the idle keep-alive window between requests. Sizing the pool to the
@@ -676,6 +688,10 @@ void HttpServer::register_routes() {
                   [this](const httplib::Request& req, httplib::Response& res) {
                       handle_model_resume(req, res);
                   });
+    server_.Get(api_route_pattern(R"(/models/(.+)/card)"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_model_card(req, res);
+                });
     server_.Get(api_route_pattern(R"(/models/(.+))"),
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_model(req, res);
@@ -861,6 +877,26 @@ void HttpServer::handle_usage(const httplib::Request& req, httplib::Response& re
     }
     res.set_header("Cache-Control", "no-store");
     res.set_content(port_contract_.usage_json(lease.service().runtime_stats()), "application/json");
+}
+
+void HttpServer::handle_model_card(const httplib::Request& req, httplib::Response& res) const {
+    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
+    ApiError error;
+    error.status = 404;
+    error.type   = "invalid_request_error";
+    if (!registry_->resolve(id)) {
+        error.code    = "model_not_found";
+        error.message = "model '" + id + "' not found";
+        write_openai_error(res, error);
+        return;
+    }
+    if (model_card_.is_null()) {
+        error.code    = "model_card_not_found";
+        error.message = "no model card configured for this server (start with --model-card FILE)";
+        write_openai_error(res, error);
+        return;
+    }
+    res.set_content(model_card_.dump(), "application/json");
 }
 
 void HttpServer::configure_port_contract() {
@@ -1359,8 +1395,15 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         return;
     }
     if (auto lease = registry_->observe(*resolved)) {
-        res.set_content(make_model_object(model_description(*lease), unix_time_now()),
-                        "application/json");
+        std::string body = make_model_object(model_description(*lease), unix_time_now());
+        if (!model_card_.is_null()) {
+            // Non-spec extension (the fleet contract): the configured card inline; clients ignore
+            // unknown members on the Model object.
+            nlohmann::json payload = nlohmann::json::parse(body);
+            payload["model_card"]  = model_card_;
+            body                   = payload.dump();
+        }
+        res.set_content(body, "application/json");
         return;
     }
     const auto status = registry_->status(*resolved);
