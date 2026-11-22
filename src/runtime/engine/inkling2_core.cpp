@@ -117,6 +117,14 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     const SpeculativeOptions& speculative = options.speculative;
     const bool dspine = speculative.backend == SpeculativeBackend::DSpine;
     const bool dspark = speculative.backend == SpeculativeBackend::DSpark;
+    // Known issue: with more than 16 lanes, a DSpark server restoring prefix images from the host
+    // tier sometimes decodes from a corrupted state (sampled outputs change between identical
+    // runs; one in a few streams renders no text). Not yet root-caused (compute-sanitizer memcheck
+    // clean; not FP8 KV, not host-tier eviction); refused until it is.
+    if (dspark && options.max_concurrency > 16) {
+        throw std::invalid_argument("Inkling 2: --spec dspark supports at most 16 lanes "
+                                    "(--max-concurrency); serve more lanes with --spec none");
+    }
     if (speculative.backend != SpeculativeBackend::None && !dspine && !dspark) {
         throw std::invalid_argument("Inkling 2 drafts with its DSpark drafter (--spec dspark), a "
                                     "DSpine drafter (--spec dspine --draft-model) or by context "
