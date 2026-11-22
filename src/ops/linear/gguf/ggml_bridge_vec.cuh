@@ -979,7 +979,8 @@ void launch_columns(const VecArgs& args, int columns, cudaStream_t stream) {
 // goes back by shuffle to the lane that would have computed it and is added last, as there. Every
 // sum is the R = 2 form's, bit for bit (the same additions in the same order), while no lane idles
 // through a part-empty round (K = 1152: 36 slices, 9 rounds instead of 2 x 2 with 4 lanes busy).
-template <ggml_type type, int T, bool Fused, bool Cooperative = false, int R = 2>
+// KS: K fixed at compile time (0: p.k), so the rounds unroll and their loads issue together.
+template <ggml_type type, int T, bool Fused, bool Cooperative = false, int R = 2, int KS = 0>
 __launch_bounds__(kVecWarps * 32, NINFER_MOE_MIN_BLOCKS) __global__ void moe_kernel(MoeVecArgs p) {
     ninfer::pdl::enter_streaming();
     using D                 = Decoder<type>;
@@ -1006,7 +1007,7 @@ __launch_bounds__(kVecWarps * 32, NINFER_MOE_MIN_BLOCKS) __global__ void moe_ker
     const std::uint8_t* second     = Fused ? p.second[expert] : nullptr;
     const int warp                 = threadIdx.x >> 5;
     const int lane                 = threadIdx.x & 31;
-    const int k                    = p.k;
+    const int k                    = KS != 0 ? KS : p.k;
     const int slices               = k / 32;
     const int step                 = Fused ? 1 : kRows;
     const std::int64_t lane_offset = std::int64_t(lane / kPerBlock) * D::kBlockBytes;
@@ -1040,7 +1041,9 @@ __launch_bounds__(kVecWarps * 32, NINFER_MOE_MIN_BLOCKS) __global__ void moe_ker
                 for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
             }
             const int rounds_end = kTail ? 32 * (slices / 32) : slices;
-            for (int it = 0; lane + 32 * it < rounds_end; ++it) {
+#pragma unroll
+            for (int it = 0; it < (KS != 0 ? (KS / 32 + 31) / 32 : 64); ++it) {
+                if (lane + 32 * it >= rounds_end) { break; }
                 const int s = lane + 32 * it;
                 int a[T][8];
                 float d[T], sum[T];
@@ -1194,12 +1197,37 @@ inline int moe_expert_columns(int max_active) {
     return cap > 0 ? std::min(max_active, cap) : max_active;
 }
 
-template <ggml_type type, int T, bool Fused, bool Cooperative, int R>
-void moe_launch_rows(const MoeVecArgs& args, int max_active, cudaStream_t stream) {
+// Static K for the expert widths the kernel unrolls (NINFER_MOE_STATIC_K=0: always runtime K).
+inline bool moe_static_k_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_MOE_STATIC_K");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+template <ggml_type type, int T, bool Fused, bool Cooperative, int R, int KS>
+void moe_launch_rows_k(const MoeVecArgs& args, int max_active, cudaStream_t stream) {
     const int per_block = kVecWarps * (Fused ? 1 : R);
     const int groups    = (args.rows + per_block - 1) / per_block;
-    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(groups, moe_expert_columns(max_active), 1), dim3(kVecWarps * 32), std::size_t(0), stream}, moe_kernel<type, T, Fused, Cooperative, R>, args);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(groups, moe_expert_columns(max_active), 1), dim3(kVecWarps * 32), std::size_t(0), stream}, moe_kernel<type, T, Fused, Cooperative, R, KS>, args);
     check(cudaGetLastError(), "moe product launch");
+}
+
+template <ggml_type type, int T, bool Fused, bool Cooperative, int R>
+void moe_launch_rows(const MoeVecArgs& args, int max_active, cudaStream_t stream) {
+    if constexpr (!Fused && !Cooperative && Decoder<type>::kBlockElems <= 64) {
+        if (moe_static_k_enabled()) {
+            // Inkling 2's expert widths: [gate; up] over the hidden 2304, down over 1152.
+            if (args.k == 2304 && (R == 4 || balanced_tail_rows(2304, max_active) == 2)) {
+                return moe_launch_rows_k<type, T, Fused, Cooperative, R, 2304>(args, max_active, stream);
+            }
+            if (args.k == 1152) {
+                return moe_launch_rows_k<type, T, Fused, Cooperative, R, 1152>(args, max_active, stream);
+            }
+        }
+    }
+    moe_launch_rows_k<type, T, Fused, Cooperative, R, 0>(args, max_active, stream);
 }
 
 template <ggml_type type, int T, bool Fused, bool Cooperative = false>
