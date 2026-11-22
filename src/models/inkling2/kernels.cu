@@ -1506,8 +1506,12 @@ constexpr int kDtKeys  = 32;
 constexpr int kDtWarps = 2;
 constexpr int kDtSpan  = kDtKeys + 8; // distances a tile spans for a run's rows
 
+// One K/V tile stage (a barrier after each tile's compute frees it; the next tile waits in
+// registers): 21 KB a block, four blocks a multiprocessor where two stages allowed two.
+constexpr int kDtStages = 1;
+
 std::size_t attention_dtc_smem() {
-    return std::size_t(2 * 2 * kDtKeys * kD) * sizeof(__half) +
+    return std::size_t(kDtStages * 2 * kDtKeys * kD) * sizeof(__half) +
            std::size_t(kDtWarps * 16 * kDtSpan) * sizeof(float);
 }
 
@@ -1517,7 +1521,7 @@ __global__ void __launch_bounds__(kDtWarps * 32) attention_dtc_kernel(AttentionA
     constexpr int kThreads = kDtWarps * 32;
     extern __shared__ __align__(16) unsigned char dt_smem[];
     __half* tiles  = reinterpret_cast<__half*>(dt_smem);
-    float* scratch = reinterpret_cast<float*>(dt_smem + std::size_t(2 * 2 * kDtKeys * kD) * sizeof(__half));
+    float* scratch = reinterpret_cast<float*>(dt_smem + std::size_t(kDtStages * 2 * kDtKeys * kD) * sizeof(__half));
     const int warp = int(threadIdx.x) >> 5, lane = int(threadIdx.x) & 31;
     const int r = lane >> 2, q = lane & 3;
     const int kv_head = int(blockIdx.y);
@@ -1689,7 +1693,8 @@ __global__ void __launch_bounds__(kDtWarps * 32) attention_dtc_kernel(AttentionA
     float* bias = scratch + warp * 16 * kDtSpan;
     fetch(begin);
     int stage = 0;
-    for (int tile = begin; tile < end; tile += kDtKeys, stage ^= 1) {
+    for (int tile = begin; tile < end; tile += kDtKeys, stage = (stage + 1) % kDtStages) {
+        if (kDtStages == 1 && tile != begin) { __syncthreads(); } // the stage's last readers
         store(stage);
         __syncthreads();
         if (tile + kDtKeys < end) { fetch(tile + kDtKeys); }

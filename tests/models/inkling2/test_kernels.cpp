@@ -1603,7 +1603,7 @@ void q6k_mma_case(std::mt19937& rng) {
                 ax(std::size_t(max_cols) * kk * 2), aq(gguf::vector_activation_bytes(kk, max_cols));
             check(cudaMemset(big.p, 0x11, std::size_t(vr) * rb), "fill");
             check(cudaMemset(ax.p, 0x22, std::size_t(max_cols) * kk * 2), "fill");
-            for (const int cols : {1, 6, 29}) {
+            for (const int cols : {1, 6, 29, 40}) {
                 gguf::quantize_vector_activation(as<bf16>(ax), kk, cols, nullptr, aq.p, nullptr);
                 gguf::VectorOutput o;
                 o.column_stride = vr;
