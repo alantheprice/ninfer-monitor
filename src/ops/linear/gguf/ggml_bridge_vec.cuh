@@ -876,10 +876,15 @@ __launch_bounds__(kVecWarps * 32, NINFER_VEC_MIN_BLOCKS) __global__ void kernel(
                     for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
                 }
             };
-            if constexpr (KS != 0) {
-                static_assert(KS % 1024 == 0);
-    #pragma unroll
+            if constexpr (KS != 0 && KS % 1024 == 0) {
+#pragma unroll
                 for (int it = 0; it < KS / 1024; ++it) { slice(it); }
+            } else if constexpr (KS != 0) {
+                // A last round of fewer than 32 slices: unrolled, its idle lanes predicated off.
+#pragma unroll
+                for (int it = 0; it < (KS / 32 + 31) / 32; ++it) {
+                    if (lane + 32 * it < slices) { slice(it); }
+                }
             } else {
                 for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
             }
@@ -938,8 +943,27 @@ void launch(const VecArgs& args, cudaStream_t stream) {
     check(cudaGetLastError(), "vector product launch");
 }
 
+// Static K for Inkling 2's attention and head widths (NINFER_VEC_STATIC_K=0: runtime K).
+inline bool vec_static_k_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_VEC_STATIC_K");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
 template <ggml_type type, int T, bool Fused, bool Cooperative = false>
 void launch_k(const VecArgs& args, cudaStream_t stream) {
+    if constexpr (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q5_K ||
+                  type == GGML_TYPE_NVFP4) {
+        if (vec_static_k_enabled()) {
+            switch (args.k) {
+            case 2304: return launch<type, T, Fused, 2304, Cooperative>(args, stream);
+            case 3072: return launch<type, T, Fused, 3072, Cooperative>(args, stream);
+            default: break;
+            }
+        }
+    }
     if constexpr (kVecStaticK<type>) {
         switch (args.k) {
         case 5120: return launch<type, T, Fused, 5120, Cooperative>(args, stream);
