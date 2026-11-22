@@ -1216,14 +1216,29 @@ __global__ void __launch_bounds__(kGroup * kTcGroups * 32) attention_tc_kernel(A
     constexpr bool kMx = kMode == kKvMxfp8;
     uint4 raw[kMx ? 1 : kPer];
     uint2 mxc[kMx ? kPer : 1];
-    std::uint32_t mxs[kMx ? (kPer + 3) / 4 : 1];
+    // MXFP8: lane l's scale words (four group exponents) of the tile's key l, K then V.
+    std::uint32_t mx_kw = 0, mx_vw = 0;
+    static_assert(kTcKeys == 32, "MXFP8 scale lanes: 32 keys a tile");
     const auto fetch = [&](int tile) {
+        if constexpr (kMx) {
+            const int p = tile + lane;
+            mx_kw = mx_vw = 0;
+            if (p <= hi) {
+                const int slot = a.ring != 0 ? p % a.ring : p;
+                const auto word = [&](const KvPlaneView& plane) {
+                    return *reinterpret_cast<const std::uint32_t*>(
+                        plane.scales + std::int64_t(sequence) * plane.scale_seq +
+                        std::int64_t(kv_head) * plane.scale_head + std::int64_t(slot) * plane.scale_row);
+                };
+                mx_kw = word(a.k_plane);
+                mx_vw = word(a.v_plane);
+            }
+        }
 #pragma unroll
         for (int i = 0; i < kPer; ++i) {
             const int w = int(threadIdx.x) + i * kThreads;
             if constexpr (kMx) {
                 mxc[i] = make_uint2(0, 0);
-                if (i % 4 == 0) { mxs[i / 4] = 0; }
             } else {
                 raw[i] = make_uint4(0, 0, 0, 0);
             }
@@ -1242,10 +1257,6 @@ __global__ void __launch_bounds__(kGroup * kTcGroups * 32) attention_tc_kernel(A
                 mxc[i] = *reinterpret_cast<const uint2*>(
                     plane.codes + std::int64_t(sequence) * plane.code_seq +
                     std::int64_t(kv_head) * plane.code_head + std::int64_t(slot) * plane.code_row + c * 8);
-                mxs[i / 4] |= std::uint32_t(plane.scales[std::int64_t(sequence) * plane.scale_seq +
-                                                        std::int64_t(kv_head) * plane.scale_head +
-                                                        std::int64_t(slot) * plane.scale_row + c / 4])
-                              << (8 * (i % 4));
             } else if (plane.coding != KvCoding::F16) {
                 // A quantized plane's chunk decoded to eight F16 values.
                 raw[i] = chunk_word(plane,
@@ -1272,7 +1283,11 @@ __global__ void __launch_bounds__(kGroup * kTcGroups * 32) attention_tc_kernel(A
             const int key = rest / (kD / 8), c = rest % (kD / 8);
             uint4 word;
             if constexpr (kMx) {
-                const unsigned e = (mxs[i / 4] >> (8 * (i % 4))) & 0xFFu;
+                // The row's exponents from the lane holding its key (both planes' words move,
+                // then the row's matrix picks one).
+                const std::uint32_t kw = __shfl_sync(0xFFFFFFFFu, mx_kw, key);
+                const std::uint32_t vw = __shfl_sync(0xFFFFFFFFu, mx_vw, key);
+                const unsigned e = ((matrix == 0 ? kw : vw) >> (8 * (c / 4))) & 0xFFu;
                 if (e >= 113u && e <= 142u) {
                     // The scale 2^(e - 127) a normal FP16 power of two: code (exact in FP16)
                     // times it is exact, the float decode's value.
