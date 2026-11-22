@@ -259,7 +259,22 @@ int main() {
         }
         failures += check(scheduler.select_runnable_prefill_lane(3, runnable) == std::optional(1U),
                           "a long prompt starved behind shorter ones");
+        // The starved lane holds a quantum of kPrefillMaxSkip units. A prompt that finishes in
+        // one unit cuts in, at most kPrefillMaxSkip times a quantum; then the quantum runs out
+        // and the shortest prompt runs again.
         scheduler.record_prefill_unit(1);
+        for (std::uint32_t unit = 0; unit < ninfer::runtime::kPrefillMaxSkip; ++unit) {
+            failures += check(scheduler.select_runnable_prefill_lane(3, runnable) ==
+                                  std::optional(2U),
+                              "a one-unit prompt could not cut into a quantum");
+            scheduler.record_prefill_unit(2);
+        }
+        for (std::uint32_t unit = 1; unit < ninfer::runtime::kPrefillMaxSkip; ++unit) {
+            failures += check(scheduler.select_runnable_prefill_lane(3, runnable) ==
+                                  std::optional(1U),
+                              "a starved lane lost its quantum early");
+            scheduler.record_prefill_unit(1);
+        }
         failures += check(scheduler.select_runnable_prefill_lane(3, runnable) == std::optional(2U),
                           "running a starved lane did not reset its skip count");
         slots[1]->capture_pending = true;
@@ -273,7 +288,7 @@ int main() {
     failures += check(!scheduler.has_prefill_lane() && scheduler.select_prefill_lane() == std::nullopt &&
                           throws_logic([&] { scheduler.clear_prefill_lane(0); }),
                       "staged-prefill lane clearing changed");
-    failures += check(throws_logic([&] { scheduler.set_prefill_lane(8); }),
+    failures += check(throws_logic([&] { scheduler.set_prefill_lane(ninfer::kMaximumConcurrency); }),
                       "staged-prefill lane bound check changed");
     scheduler.set_prefill_lane(1);
     scheduler.set_prefill_lane(2);

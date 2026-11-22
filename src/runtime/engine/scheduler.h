@@ -304,13 +304,36 @@ public:
 
     // The lane owning staged prefill that runs the next unit. `remaining(lane)` is the lane's
     // prompt suffix still to compute, or nullopt for a lane that must wait, such as one offering
-    // an active capture, so it cannot starve the others. A lane passed over kPrefillMaxSkip times
-    // runs first (the most passed over, then the lowest lane); otherwise the shortest remaining
-    // suffix does, so a short or prefix-cached request is not held behind a long prompt for its
-    // whole prefill. Ties go to the lower lane.
+    // an active capture, so it cannot starve the others. The shortest remaining suffix runs, so a
+    // short or prefix-cached request is not held behind a long prompt for its whole prefill. A
+    // lane passed over kPrefillMaxSkip times is starved and runs first (the shortest starved
+    // suffix, then the most passed over, then the lowest lane), and keeps the GPU for a quantum of
+    // kPrefillMaxSkip units: without the quantum, a batch of long prompts arriving together
+    // starves every waiting lane at once and the bound turns into round-robin, so every request's
+    // first token waits for nearly the whole batch.
     template <class Remaining>
     [[nodiscard]] std::optional<std::uint32_t>
     select_runnable_prefill_lane(std::uint32_t max_concurrency, Remaining&& remaining) const {
+        if (promoted_ && *promoted_ < max_concurrency &&
+            (prefill_lanes_ & (1ULL << *promoted_)) != 0 && remaining(*promoted_)) {
+            // A prompt that finishes in one unit (a conversation's next turn) may cut in, at most
+            // kPrefillMaxSkip times a quantum, so the quantum still ends.
+            if (promoted_preemptions_ < kPrefillMaxSkip) {
+                std::optional<std::uint32_t> cut;
+                std::uint32_t cut_remaining = 0;
+                for (std::uint64_t m = prefill_lanes_; m != 0; m &= m - 1U) {
+                    const auto lane = static_cast<std::uint32_t>(std::countr_zero(m));
+                    if (lane >= max_concurrency || lane == *promoted_) { continue; }
+                    const std::optional<std::uint32_t> left = remaining(lane);
+                    if (left && *left <= chunk_tokens_ && (!cut || *left < cut_remaining)) {
+                        cut           = lane;
+                        cut_remaining = *left;
+                    }
+                }
+                if (cut) { return cut; }
+            }
+            return promoted_;
+        }
         std::optional<std::uint32_t> best;
         std::uint32_t best_remaining = 0;
         bool best_starved            = false;
@@ -325,7 +348,9 @@ public:
             const bool better =
                 !best || (starved && !best_starved) ||
                 (starved == best_starved &&
-                 (starved ? prefill_skips_[lane] > prefill_skips_[*best] : *left < best_remaining));
+                 (*left < best_remaining ||
+                  (starved && *left == best_remaining &&
+                   prefill_skips_[lane] > prefill_skips_[*best])));
             if (better) {
                 best           = lane;
                 best_remaining = *left;
@@ -343,6 +368,24 @@ public:
     // Accounts one prefill unit that ran on every lane in `ran` (one pass shared by several
     // lanes) against the other lanes owning staged prefill.
     void record_prefill_units(std::uint64_t ran) noexcept {
+        // A starved lane that runs holds the quantum; the quantum's lane counts its units.
+        if (promoted_ && (ran & (1ULL << *promoted_)) != 0) {
+            if (++promoted_units_ >= kPrefillMaxSkip) { promoted_.reset(); }
+        } else if (promoted_ && (prefill_lanes_ & (1ULL << *promoted_)) != 0 &&
+                   promoted_preemptions_ < kPrefillMaxSkip) {
+            ++promoted_preemptions_; // a one-unit prompt cut in; the quantum stays
+        } else {
+            promoted_.reset();
+            for (std::uint64_t m = ran; m != 0; m &= m - 1U) {
+                const auto lane = static_cast<std::uint32_t>(std::countr_zero(m));
+                if (lane < kMaximumConcurrency && prefill_skips_[lane] >= kPrefillMaxSkip) {
+                    promoted_             = lane;
+                    promoted_units_       = 1;
+                    promoted_preemptions_ = 0;
+                    break;
+                }
+            }
+        }
         std::uint64_t mask = prefill_lanes_ | ran;
         while (mask != 0) {
             const auto lane = static_cast<std::uint32_t>(std::countr_zero(mask));
@@ -373,6 +416,7 @@ public:
             throw std::logic_error("request does not own staged prefill");
         }
         prefill_lanes_ &= ~(1ULL << lane);
+        if (promoted_ == lane) { promoted_.reset(); }
     }
 
     void observe_fifo_head(std::optional<std::uint64_t> request_id) noexcept {
@@ -465,6 +509,7 @@ public:
     void reset() noexcept {
         prefill_lanes_ = 0;
         prefill_skips_.fill(0);
+        promoted_.reset();
         fifo_head_id_.reset();
         protection_.reset();
     }
@@ -476,6 +521,11 @@ private:
     std::uint32_t chunk_tokens_  = 1;
     // Prefill units each lane owning staged prefill has been passed over since its last one.
     std::array<std::uint32_t, kMaximumConcurrency> prefill_skips_{};
+    // The starved lane holding a prefill quantum, and the units it has run in it.
+    std::optional<std::uint32_t> promoted_;
+    std::uint32_t promoted_units_ = 0;
+    // One-unit prompts that cut into the current quantum.
+    std::uint32_t promoted_preemptions_ = 0;
     std::optional<std::uint64_t> fifo_head_id_;
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;
