@@ -765,7 +765,7 @@ void vector_launch_sliced(GgmlType type, detail::VecArgs args, int columns, bool
                           cudaStream_t stream) {
     const int step = vector_max_columns();
     if (columns <= step) { return detail::vector_launch(type)(args, columns, fused, stream); }
-    if (column_groups_enabled() && columns <= 4 * step) {
+    if (column_groups_enabled() && columns <= 8 * step) {
         // G groups of T columns in one launch (the last possibly short): the rows come from
         // memory once.
         const int groups = (columns + step - 1) / step;

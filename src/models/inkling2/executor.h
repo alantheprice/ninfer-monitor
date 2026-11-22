@@ -179,6 +179,16 @@ public:
     void draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
                std::span<float> confidence);
     [[nodiscard]] cudaStream_t head_stream() const noexcept;
+    // Prompt chunks beside decoding (NINFER_INKLING_OVERLAP=0: off): between side_begin() and
+    // side_end() the executor's calls run on a second stream with their own workspace and staging,
+    // after everything enqueued before side_begin(); side_idle() tells when that work is done and
+    // side_join() orders later calls after it. Only one side call runs at a time, and it must not
+    // touch a sequence the main stream uses until joined.
+    [[nodiscard]] bool overlap() const noexcept;
+    void side_begin();
+    void side_end();
+    [[nodiscard]] bool side_idle() const;
+    void side_join();
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
     // Takes the sequence back `tokens` positions: false, changing nothing, when its rings no

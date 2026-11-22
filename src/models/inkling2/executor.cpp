@@ -291,6 +291,68 @@ struct Executor::Impl {
 
     static constexpr int kR = Executor::kHistory;
 
+    // The second stream's context (Executor::side_begin): what a call's enqueued work owns.
+    struct SideContext {
+        cudaStream_t stream = nullptr;
+        std::unique_ptr<WorkspaceArena> workspace;
+        DeviceBuffer d_tokens, d_positions, d_sequences, d_starts, staging_k, staging_v;
+        std::unique_ptr<PinnedHostBuffer> h_staging;
+        std::unique_ptr<CudaCompletionEvent> staged;
+        cudaEvent_t done = nullptr, mark = nullptr;
+        bool in = false;
+        // A side call is captured and launched as one graph: launching its ~1,500 kernels one by
+        // one would fill the launch queue and hold the host until the GPU drained them. Executable
+        // graphs by node count, updated in place for each call of the same shape.
+        std::map<std::size_t, cudaGraphExec_t> execs;
+    };
+    bool capturing = false;
+    std::unique_ptr<SideContext> side;
+
+    void swap_side() {
+        SideContext& c = *side;
+        std::swap(stream, c.stream);
+        std::swap(workspace, c.workspace);
+        std::swap(d_tokens, c.d_tokens);
+        std::swap(d_positions, c.d_positions);
+        std::swap(d_sequences, c.d_sequences);
+        std::swap(d_starts, c.d_starts);
+        std::swap(staging_k, c.staging_k);
+        std::swap(staging_v, c.staging_v);
+        std::swap(h_staging, c.h_staging);
+        std::swap(staged, c.staged);
+    }
+
+    void plan_side() {
+        if (const char* v = std::getenv("NINFER_INKLING_OVERLAP"); v != nullptr && std::string(v) == "0") {
+            return;
+        }
+        if (delivery || cpu_experts || model.expert_parallel() || spine) { return; }
+        std::size_t free_bytes = 0, total_bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        const std::size_t need = workspace_bytes + staging_k.bytes + staging_v.bytes + (64u << 20);
+        if (need + kGraphReserve + unbacked() > free_bytes) { return; }
+        auto c = std::make_unique<SideContext>();
+        int least = 0, greatest = 0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&c->stream, cudaStreamNonBlocking, least));
+        c->workspace   = std::make_unique<WorkspaceArena>(workspace_bytes);
+        c->d_tokens    = DeviceBuffer(d_tokens.bytes);
+        c->d_positions = DeviceBuffer(d_positions.bytes);
+        c->d_sequences = DeviceBuffer(d_sequences.bytes);
+        c->d_starts    = DeviceBuffer(d_starts.bytes);
+        if (staging_k.bytes > 0) {
+            c->staging_k = DeviceBuffer(staging_k.bytes);
+            c->staging_v = DeviceBuffer(staging_v.bytes);
+            c->staging_k.fill(0);
+            c->staging_v.fill(0);
+        }
+        c->h_staging = std::make_unique<PinnedHostBuffer>(h_staging->size());
+        c->staged    = std::make_unique<CudaCompletionEvent>(device);
+        CUDA_CHECK(cudaEventCreateWithFlags(&c->done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&c->mark, cudaEventDisableTiming));
+        side = std::move(c);
+    }
+
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(o), config(m.config()) {
         if (options.sequences == 0 || options.prefill_chunk == 0 || options.max_context == 0) {
@@ -501,6 +563,7 @@ struct Executor::Impl {
         if (options.dspine) { make_spine(); }
         allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
+        plan_side();
     }
 
     LayerPlan plan_layer(std::uint32_t i) {
@@ -1385,6 +1448,15 @@ struct Executor::Impl {
 
     ~Impl() {
         if (delivery || growing) { ninfer::wait_for_stream(stream); }
+        if (side) {
+            if (side->in) { swap_side(); }
+            (void)cudaStreamSynchronize(side->stream);
+            side->workspace.reset();
+            for (auto& [n, exec] : side->execs) { (void)cudaGraphExecDestroy(exec); }
+            (void)cudaEventDestroy(side->done);
+            (void)cudaEventDestroy(side->mark);
+            (void)cudaStreamDestroy(side->stream);
+        }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
@@ -1403,7 +1475,7 @@ struct Executor::Impl {
 
     // Rows of one decode call: every active lane's next token. The vector products take 8
     // columns a group, so a call of 9..32 lanes runs them in up to four column groups.
-    static constexpr int kMaxDecodeRows = 32;
+    static constexpr int kMaxDecodeRows = 64;
 
     [[nodiscard]] int decode_rows() const {
         return std::min<int>(kMaxDecodeRows,
@@ -1779,7 +1851,9 @@ struct Executor::Impl {
     // Tokens, positions, and when given sequences and branch starts, to the device.
     void stage(std::span<const std::int32_t> a, std::span<const std::int32_t> b,
                std::span<const std::int32_t> c, std::span<const std::int32_t> g = {}) {
-        staged->synchronize();
+        // A captured side call runs after the previous one finished (side_idle), so its staging
+        // is free; the event cannot be waited on inside a capture.
+        if (!capturing) { staged->synchronize(); }
         auto* host = static_cast<std::int32_t*>(h_staging->data());
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, options.sequences);
         if (a.size() > rows || b.size() > rows || c.size() > rows || g.size() > rows) {
@@ -1800,7 +1874,7 @@ struct Executor::Impl {
             CUDA_CHECK(cudaMemcpyAsync(d_starts.p, host + 3 * rows, g.size() * 4,
                                        cudaMemcpyHostToDevice, stream));
         }
-        staged->record(stream);
+        if (!capturing) { staged->record(stream); }
     }
 
     // ---- The forward pass ------------------------------------------------------------------------
@@ -2842,7 +2916,7 @@ struct Executor::Impl {
         std::int64_t keys = 0;
         for (int i = 0; i < rows; ++i) { keys = std::max<std::int64_t>(keys, pos[i] + 1); }
         const std::int64_t bound = span_full > 0 ? key_bound_of(keys) : 0;
-        run_graph(span_full > 0 ? (2U << 20) | (bound_index(bound) << 12) | (std::uint32_t(n) << 6) |
+        run_graph(span_full > 0 ? (2U << 24) | (bound_index(bound) << 16) | (std::uint32_t(n) << 8) |
                                       std::uint32_t(rows)
                                 : 64 + std::uint32_t(rows),
                   [&] { decode_body(rows, false, n, bound); });
@@ -3230,6 +3304,65 @@ Tensor Executor::logits(std::uint32_t rows) const {
 }
 
 cudaStream_t Executor::head_stream() const noexcept { return impl_->stream; }
+
+bool Executor::overlap() const noexcept { return impl_->side != nullptr; }
+
+void Executor::side_begin() {
+    auto& i = *impl_;
+    if (!i.side || i.side->in) { throw std::logic_error("inkling2: no side context free"); }
+    CUDA_CHECK(cudaEventRecord(i.side->mark, i.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(i.side->stream, i.side->mark, 0));
+    i.swap_side();
+    i.side->in = true;
+    CUDA_CHECK(cudaStreamBeginCapture(i.stream, cudaStreamCaptureModeRelaxed));
+    i.capturing = true;
+}
+
+void Executor::side_end() {
+    auto& i = *impl_;
+    if (!i.side || !i.side->in) { throw std::logic_error("inkling2: side_end without side_begin"); }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ended = cudaStreamEndCapture(i.stream, &graph);
+    i.capturing = false;
+    const cudaStream_t side_stream = i.stream;
+    i.swap_side();
+    i.side->in = false;
+    if (ended != cudaSuccess || graph == nullptr) {
+        (void)cudaGetLastError();
+        if (graph != nullptr) { (void)cudaGraphDestroy(graph); }
+        throw std::runtime_error("inkling2: a side call's capture failed");
+    }
+    std::size_t nodes = 0;
+    CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &nodes));
+    cudaGraphExec_t& exec = i.side->execs[nodes];
+    if (exec != nullptr) {
+        cudaGraphExecUpdateResultInfo info{};
+        if (cudaGraphExecUpdate(exec, graph, &info) != cudaSuccess) {
+            (void)cudaGetLastError();
+            (void)cudaGraphExecDestroy(exec);
+            exec = nullptr;
+        }
+    }
+    if (exec == nullptr) { CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0)); }
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaGraphLaunch(exec, side_stream));
+    CUDA_CHECK(cudaEventRecord(i.side->done, side_stream));
+}
+
+bool Executor::side_idle() const {
+    const auto& i = *impl_;
+    if (!i.side) { return true; }
+    const cudaError_t e = cudaEventQuery(i.side->done);
+    if (e == cudaErrorNotReady) { return false; }
+    CUDA_CHECK(e);
+    return true;
+}
+
+void Executor::side_join() {
+    auto& i = *impl_;
+    if (!i.side) { return; }
+    CUDA_CHECK(cudaStreamWaitEvent(i.stream, i.side->done, 0));
+}
 
 std::uint32_t Executor::draft_tokens() const noexcept { return impl_->options.draft_tokens; }
 

@@ -2489,13 +2489,16 @@ void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, c
     if (m <= 0 || n <= 0) { return; }
     if (x_stride == 0) { x_stride = k; }
     if (out_stride == 0) { out_stride = m; }
-    if (vector_call && n > 2 * kGemvRows && n <= 4 * kGemvRows) {
-        // 17..32 columns: two launches of at most 16 (the matrix is small; its second read comes
-        // from L2). Each column's sums are those of a narrower call.
-        const int first = (n + 1) / 2;
-        gemm_f32(m, first, k, w, x, out, stream, x_stride, out_stride, true);
-        gemm_f32(m, n - first, k, w, x + std::int64_t(first) * x_stride,
-                 out + std::int64_t(first) * out_stride, stream, x_stride, out_stride, true);
+    if (vector_call && n > 2 * kGemvRows) {
+        // Past 16 columns: launches of at most 16 (the matrix is small; its later reads come from
+        // L2). Each column's sums are those of a narrower call.
+        const int parts = (n + 2 * kGemvRows - 1) / (2 * kGemvRows);
+        for (int i = 0, c0 = 0; i < parts; ++i) {
+            const int cols = (n - c0 + (parts - i) - 1) / (parts - i);
+            gemm_f32(m, cols, k, w, x + std::int64_t(c0) * x_stride, out + std::int64_t(c0) * out_stride,
+                     stream, x_stride, out_stride, true);
+            c0 += cols;
+        }
         return;
     }
     if (n <= kGemvRows || (vector_call && n <= 2 * kGemvRows)) {
@@ -2523,15 +2526,18 @@ void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t st
     if (m <= 0 || n <= 0 || batch.count == 0) { return; }
     if (x_stride == 0) { x_stride = k; }
     if (out_stride == 0) { out_stride = m; }
-    if (vector_call && n > 2 * kGemvRows && n <= 4 * kGemvRows) {
-        const int first = (n + 1) / 2;
-        GemvBatch second = batch;
-        for (int e = 0; e < batch.count; ++e) {
-            second.x[e]   = batch.x[e] + std::int64_t(first) * x_stride;
-            second.out[e] = batch.out[e] + std::int64_t(first) * out_stride;
+    if (vector_call && n > 2 * kGemvRows) {
+        const int parts = (n + 2 * kGemvRows - 1) / (2 * kGemvRows);
+        for (int i = 0, c0 = 0; i < parts; ++i) {
+            const int cols = (n - c0 + (parts - i) - 1) / (parts - i);
+            GemvBatch part = batch;
+            for (int e = 0; e < batch.count; ++e) {
+                part.x[e]   = batch.x[e] + std::int64_t(c0) * x_stride;
+                part.out[e] = batch.out[e] + std::int64_t(c0) * out_stride;
+            }
+            gemm_f32_batch(m, cols, k, part, stream, x_stride, out_stride, true);
+            c0 += cols;
         }
-        gemm_f32_batch(m, first, k, batch, stream, x_stride, out_stride, true);
-        gemm_f32_batch(m, n - first, k, second, stream, x_stride, out_stride, true);
         return;
     }
     if (n > (vector_call ? 2 * kGemvRows : kGemvRows)) {
