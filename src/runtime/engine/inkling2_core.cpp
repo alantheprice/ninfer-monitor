@@ -143,9 +143,11 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                                     "with --spec dspine or dspark");
     }
     if (options.kv_cache != KvCacheStorage::BFloat16 &&
-        options.kv_cache != KvCacheStorage::Float16) {
+        options.kv_cache != KvCacheStorage::Float16 &&
+        options.kv_cache != KvCacheStorage::Fp8E4M3Row256) {
         throw std::invalid_argument(
-            "Inkling 2 keeps its KV cache in F16 (--kv-dtype fp16, or bf16, the default)");
+            "Inkling 2 keeps its KV cache in F16 (--kv-dtype fp16, or bf16, the default) or, for "
+            "its full-attention visits, E4M3 (--kv-dtype fp8)");
     }
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
@@ -228,11 +230,12 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     models::inkling2::ExecutorOptions executor;
     executor.max_context   = options.max_context;
-    executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
+    executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, kMaximumConcurrency);
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.draft_tokens  = dspine ? speculative.draft_tokens : lookup_drafts;
     executor.dspine        = dspine;
     executor.dspark        = dspark;
+    executor.kv_fp8        = options.kv_cache == KvCacheStorage::Fp8E4M3Row256;
     if (dspark) {
         // The drafter's block less its anchor a round, or fewer with --draft-tokens; a round of a
         // context lookup's may verify as many as the lookup proposes.

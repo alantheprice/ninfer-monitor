@@ -1449,14 +1449,14 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
-    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
+    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumFamilyConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
     // Decode and verify rounds run the target's projections with the prefill's Linear policies, one
     // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
     // would put a weight-sized scratch into every round workspace and change decode numerics -- so
     // the widest round sits at or below the floor no device profile moves its width gate past.
-    static_assert(kMaximumConcurrency * kMtpDecodeMaximumWidth <=
+    static_assert(kMaximumFamilyConcurrency * kMtpDecodeMaximumWidth <=
                       static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens),
                   "the widest decode/verify round must stay below the cuBLAS prefill width gate");
     if (parameters.text.rank_count != device.size()) {

@@ -1,3 +1,4 @@
+#include "../../../core/pdl.cuh"
 // Entry points into the vendored ggml CUDA kernels and the vector kernel (ggml_bridge_vec.cuh). The
 // activation quantizers follow ggml's q8_1, reading BF16 and optionally gathering the input columns.
 
@@ -80,6 +81,7 @@ __launch_bounds__(kQuantizeThreads) __global__
     void quantize_vector_kernel(const __nv_bfloat16* __restrict__ x,
                                 const std::int32_t* __restrict__ input_columns,
                                 std::int8_t* __restrict__ qs, half2* __restrict__ ds, int k) {
+    ninfer::pdl::enter();
     const int i      = blockDim.x * blockIdx.x + threadIdx.x;
     const int column = blockIdx.y;
     if (i >= k) { return; }
@@ -95,6 +97,7 @@ __launch_bounds__(kQuantizeThreads) __global__
                                     const std::int32_t* __restrict__ source,
                                     const float* __restrict__ scale, std::int8_t* __restrict__ qs,
                                     half2* __restrict__ ds, int k) {
+    ninfer::pdl::enter();
     const int i      = blockDim.x * blockIdx.x + threadIdx.x;
     const int column = blockIdx.y;
     if (i >= k) { return; }
@@ -224,6 +227,7 @@ __launch_bounds__(kSortThreads) __global__
                          std::int32_t* __restrict__ small_count,
                          std::int32_t* __restrict__ large_tile_count,
                          std::int32_t* __restrict__ large_tiles) {
+    ninfer::pdl::enter();
     extern __shared__ int shared[];
     const bool split = small_active != nullptr; // uniform over the block
     int* count  = shared;
@@ -716,7 +720,7 @@ void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
     }
     auto* base = static_cast<std::uint8_t*>(out);
     const dim3 blocks((k + detail::kQuantizeThreads - 1) / detail::kQuantizeThreads, columns, 1);
-    detail::quantize_vector_kernel<<<blocks, detail::kQuantizeThreads, 0, stream>>>(
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks), dim3(detail::kQuantizeThreads), std::size_t(0), stream}, detail::quantize_vector_kernel, 
         x, input_columns, reinterpret_cast<std::int8_t*>(base),
         reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k);
     detail::check(cudaGetLastError(), "vector activation launch");
@@ -729,11 +733,49 @@ void quantize_vector_activation_f32(const float* x, int k, int columns, const st
     }
     auto* base = static_cast<std::uint8_t*>(out);
     const dim3 blocks((k + detail::kQuantizeThreads - 1) / detail::kQuantizeThreads, columns, 1);
-    detail::quantize_vector_f32_kernel<<<blocks, detail::kQuantizeThreads, 0, stream>>>(
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks), dim3(detail::kQuantizeThreads), std::size_t(0), stream}, detail::quantize_vector_f32_kernel, 
         x, source, scale, reinterpret_cast<std::int8_t*>(base),
         reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k);
     detail::check(cudaGetLastError(), "vector activation launch");
 }
+
+namespace {
+
+// The widest vector form a launch takes (NINFER_VEC_MAX_COLUMNS, 1..8, default 8): wider calls go
+// as several launches over column slices; each column's sums are the same at any width.
+int vector_max_columns() {
+    static const int n = [] {
+        const char* v = std::getenv("NINFER_VEC_MAX_COLUMNS");
+        const int x   = v != nullptr ? std::atoi(v) : 8;
+        return x >= 1 && x <= 8 ? x : 8;
+    }();
+    return n;
+}
+
+void vector_launch_sliced(GgmlType type, detail::VecArgs args, int columns, bool fused,
+                          cudaStream_t stream) {
+    const int step = vector_max_columns();
+    if (columns <= step) { return detail::vector_launch(type)(args, columns, fused, stream); }
+    const auto slice = [&](detail::VecStore& o, int c0) {
+        if (o.bf16 != nullptr) { o.bf16 += std::int64_t(c0) * o.column_stride; }
+        if (o.f32 != nullptr) { o.f32 += std::int64_t(c0) * o.column_stride; }
+        if (o.gate != nullptr) { o.gate += std::int64_t(c0) * o.gate_column_stride; }
+    };
+    for (int c0 = 0; c0 < columns; c0 += step) {
+        detail::VecArgs a = args;
+        a.qs += std::int64_t(c0) * a.k;
+        a.ds += std::int64_t(c0) * (a.k / 32);
+        slice(a.out, c0);
+        for (int s = 0; s < a.more_count; ++s) {
+            a.more[s].qs += std::int64_t(c0) * a.k;
+            a.more[s].ds += std::int64_t(c0) * (a.k / 32);
+            slice(a.more[s].out, c0);
+        }
+        detail::vector_launch(type)(a, std::min(step, columns - c0), fused, stream);
+    }
+}
+
+} // namespace
 
 void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                     const void* activation, int columns, const VectorOutput& out,
@@ -745,9 +787,42 @@ void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
     const detail::VecStore store{out.bf16,     out.f32,  out.column_stride,
                                  out.epilogue, out.gate, out.gate_column_stride,
                                  static_cast<int>(out.activation)};
-    detail::vector_launch(type)(
+    vector_launch_sliced(type,
         detail::vector_args(weight, row_bytes, rows, k, activation, columns, store), columns,
         false, stream);
+}
+
+void vector_product_segments(GgmlType type, int k, int columns, const VectorSegment* segments,
+                             int count, cudaStream_t stream) {
+    if (count < 1 || count > kMaxVectorSegments || segments == nullptr) {
+        throw std::invalid_argument("gguf vector product: 1..4 segments");
+    }
+    const auto store_of = [](const VectorOutput& out) {
+        if ((out.bf16 == nullptr) == (out.f32 == nullptr) ||
+            (out.epilogue == Epilogue::GateProduct && out.gate == nullptr)) {
+            throw std::invalid_argument("gguf vector product: invalid output");
+        }
+        return detail::VecStore{out.bf16,     out.f32,  out.column_stride,
+                                out.epilogue, out.gate, out.gate_column_stride,
+                                static_cast<int>(out.activation)};
+    };
+    for (int i = 0; i < count; ++i) {
+        if (segments[i].rows <= 0 || segments[i].weight == nullptr) {
+            throw std::invalid_argument("gguf vector product: empty segment");
+        }
+    }
+    const VectorSegment& s0 = segments[0];
+    detail::VecArgs args = detail::vector_args(s0.weight, s0.row_bytes, s0.rows, k, s0.activation,
+                                               columns, store_of(s0.out));
+    args.more_count = count - 1;
+    for (int i = 1; i < count; ++i) {
+        const VectorSegment& s = segments[i];
+        const detail::VecArgs one = detail::vector_args(s.weight, s.row_bytes, s.rows, k,
+                                                        s.activation, columns, store_of(s.out));
+        args.more[i - 1] = detail::VecSegment{one.weight, one.row_bytes, one.rows,
+                                              one.qs,     one.ds,        one.out};
+    }
+    vector_launch_sliced(type, args, columns, false, stream);
 }
 
 void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
@@ -757,7 +832,7 @@ void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, in
     const detail::VecStore store{out,     nullptr, out_column_stride,
                                  Epilogue::Store, nullptr, 0,
                                  static_cast<int>(gate_activation)};
-    detail::vector_launch(type)(
+    vector_launch_sliced(type,
         detail::vector_args(weight, row_bytes, rows, k, activation, columns, store), columns,
         true, stream);
 }
@@ -792,7 +867,7 @@ MoeSplitRouting sort_routes(const std::int32_t* ids, int pairs, int experts, int
     std::int32_t* small_count  = split ? small_active + experts : nullptr;
     std::int32_t* large_count  = split ? small_count + 1 : nullptr;
     std::int32_t* large_tiles  = split ? large_count + detail::kMoeTileWidths : nullptr;
-    detail::moe_sort_kernel<<<1, detail::kSortThreads, 2 * experts * sizeof(int), stream>>>(
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(1), dim3(detail::kSortThreads), std::size_t(2 * experts * sizeof(int)), stream}, detail::moe_sort_kernel, 
         ids, pairs, experts, bounds, sorted, active, active_count, tile_count, tiles, capacity,
         vector_pairs, small_active, small_count, large_count, large_tiles);
     detail::check(cudaGetLastError(), "moe routing launch");

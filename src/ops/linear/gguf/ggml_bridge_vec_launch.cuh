@@ -44,6 +44,19 @@ struct VecStore {
     int activation; // GateActivation of the gate product and of a fused [gate; up] product
 };
 
+// Segments 1.. of a multi-segment launch (vector_product_segments): their own weight, activation
+// and output over the same type, K and columns as segment 0, the VecArgs fields.
+struct VecSegment {
+    const std::uint8_t* weight;
+    std::int64_t row_bytes;
+    int rows;
+    const std::int8_t* qs;
+    const half2* ds;
+    VecStore out;
+};
+
+inline constexpr int kMaxVecSegments = 4;
+
 struct VecArgs {
     const std::uint8_t* weight;
     std::int64_t row_bytes;
@@ -52,6 +65,11 @@ struct VecArgs {
     const std::int8_t* qs; // [columns][k]
     const half2* ds;       // [columns][k / 32]
     VecStore out;
+    // Further segments: blocks [block_end[s - 1], block_end[s]) run segment s (block_end[0] ends
+    // segment 0). more_count == 0 is the single product.
+    int more_count = 0;
+    int block_end[kMaxVecSegments] = {};
+    VecSegment more[kMaxVecSegments - 1] = {};
 };
 
 // The vector kernel's MoE form (ggml_bridge_vec.cuh moe_kernel).

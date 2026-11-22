@@ -159,7 +159,7 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
     constexpr const char* op = "speculative_overlay_copy_proposals";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
-    if (k < 1 || batch < 1 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+    if (k < 1 || batch < 1 || batch > static_cast<std::int32_t>(kMaximumFamilyConcurrency)) {
         throw std::invalid_argument(
             "speculative_overlay_copy_proposals: K must be >=1 and B must be in [1,8]");
     }

@@ -1005,7 +1005,7 @@ runtime::ExecutionTiming ProgramImpl::prefill_batch(std::span<const SequenceHand
     if (pending_transaction_ || sequences.empty() || sequences.size() > max_concurrency) {
         throw std::logic_error("batched prefill membership is invalid");
     }
-    std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+    std::array<std::uint32_t, kMaximumFamilyConcurrency> lanes{};
     for (std::size_t row = 0; row < sequences.size(); ++row) {
         if (!valid_sequence(sequences[row])) {
             throw std::logic_error("prefill sequence capability is invalid");

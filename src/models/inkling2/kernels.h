@@ -184,7 +184,12 @@ struct KvArgs {
     __half* v_cache = nullptr;
     std::int64_t seq_stride = 0, head_stride = 0;
     int ring = 0;
+    // Nonzero: the caches hold one E4M3 byte a value (strides still count values), the value
+    // being its code times the scale (--kv-dtype fp8; the full-attention visits only).
+    float k_scale = 0.0f, v_scale = 0.0f;
 };
+// query_post and kv_post in one launch (the same rows).
+void qkv_post(const QueryArgs& q, const KvArgs& kv, cudaStream_t stream);
 void kv_post(const KvArgs& args, cudaStream_t stream);
 
 // The attention of each row's heads (128 values, `query_heads / kv_heads` query heads per key and
@@ -223,6 +228,7 @@ struct AttentionArgs {
     std::int64_t gate_stride = 0;
     __nv_bfloat16* out = nullptr;
     Q8Rows out_q;
+    float k_scale = 0.0f, v_scale = 0.0f; // nonzero: E4M3 caches, as KvArgs
 };
 [[nodiscard]] std::size_t attention_workspace_floats(int rows, int query_heads, int splits);
 void attention(const AttentionArgs& args, cudaStream_t stream);
@@ -307,6 +313,14 @@ void route(const RouteArgs& args, cudaStream_t stream);
 // values the CPU's expert products compute (cpu_experts.h).
 void situ_rows(const float* gu, std::int64_t stride, int pairs, int width, const float* pair_scale,
                float gate_cap, float up_cap, __nv_bfloat16* out, cudaStream_t stream);
+
+// situ_rows into BF16 then the q8_1 vector activation of those rows (gguf's layout: int8 values
+// at 0, half2 scales at `scales_offset`), bit for bit as the two steps; the grid also zeroes
+// `zero_count` words of `zero`.
+void situ_quantize(const float* gu, std::int64_t stride, int pairs, int width,
+                   const float* pair_scale, float gate_cap, float up_cap, void* activation,
+                   std::size_t scales_offset, unsigned long long* zero, std::int64_t zero_count,
+                   cudaStream_t stream);
 
 // out = bf16(cap tanh(in / cap)) for `n` logits.
 void softcap_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, float cap,

@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -154,9 +155,11 @@ struct VisitPlan {
     bool restart      = false; // the core's first visit of a later pass
     bool control      = false; // a later pass's core visit
     bool start        = false; // the layer starts a residual block
-    // The F16 K and V caches: [sequences][kv heads][slots][D].
+    // The K and V caches: [sequences][kv heads][slots][D], F16 or (k_scale > 0) E4M3.
     KvArea k, v;
     int slots = 0, ring = 0;
+    int elem = 2; // bytes a cached value
+    float k_scale = 0.0f, v_scale = 0.0f;
     std::int64_t seq_stride = 0, head_stride = 0;
     std::vector<DeviceBuffer> checkpoint; // sliding: every sequence's rings, K then V
 };
@@ -354,7 +357,7 @@ struct Executor::Impl {
             for (const auto& [layer, pass] : schedule) {
                 const std::size_t kv = 2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
                 needed += config.full_attention[layer]
-                              ? std::size_t(global_slots) * kv
+                              ? std::size_t(global_slots) * kv / (options.kv_fp8 ? 2 : 1)
                               : (options.checkpoints ? 2 : 1) * std::size_t(ring) * kv;
             }
             needed += (options.checkpoints ? 2 : 1) * std::size_t(sequences) * schedule.size() *
@@ -396,10 +399,18 @@ struct Executor::Impl {
             p.ring         = p.full ? 0 : ring;
             p.head_stride  = std::int64_t(p.slots) * kD;
             p.seq_stride   = p.head_stride * kv_heads;
+            if (p.full && options.kv_fp8) {
+                if (!(config.qk_clip > 0.0f)) {
+                    throw std::invalid_argument("inkling2: --kv-dtype fp8 needs the keys' L2 clip");
+                }
+                p.elem    = 1;
+                p.k_scale = config.qk_clip / 448.0f;
+                p.v_scale = std::sqrt(float(kD)) / 448.0f;
+            }
             const bool grows = growing && p.full;
             for (KvArea* area : {&p.k, &p.v}) {
                 *area = KvArea(std::size_t(sequences), kv_heads,
-                               std::size_t(p.head_stride) * sizeof(__half), row_f16, grows,
+                               std::size_t(p.head_stride) * p.elem, std::size_t(kD) * p.elem, grows,
                                device_id);
                 kv_bytes += area->bytes;
             }
@@ -1324,8 +1335,12 @@ struct Executor::Impl {
 
     static constexpr int kHeadRows = 64; // LM-head columns per FP32 plane pass
 
+    // Rows of one decode call: every active lane's next token. The vector products take 8
+    // columns a launch, so a call of 9..16 lanes runs them in two column slices.
+    static constexpr int kMaxDecodeRows = 16;
+
     [[nodiscard]] int decode_rows() const {
-        return std::min<int>(gguf::kMaxVectorColumns,
+        return std::min<int>(kMaxDecodeRows,
                              std::max<int>(int(options.sequences), int(options.draft_tokens) + 1));
     }
 
@@ -1517,7 +1532,15 @@ struct Executor::Impl {
         auto* gu =
             static_cast<float*>(space.alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
         if (t <= gguf::kMaxVectorColumns) {
-            const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
+            static const int chunk_override = [] {
+                const char* v = std::getenv("NINFER_INKLING_MOE_CHUNK");
+                return v != nullptr ? std::atoi(v) : 0;
+            }();
+            // Two columns a pass at any width: with 8 of 128 experts a token, an expert of a call of
+            // up to 8 tokens holds one or two of its pairs, and the wider forms' registers cost more
+            // occupancy than their shared weight loads save (RTX PRO 6000, 8 requests: 622 tok/s
+            // at 2 against 517 at 8, the same sums at any width).
+            const int chunk = chunk_override > 0 ? std::min(chunk_override, 8) : t <= 1 ? 1 : 2;
             void* act2      = space.alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, on));
             // Another rank's pairs keep zero rows; their middles are never read.
@@ -1643,6 +1666,46 @@ struct Executor::Impl {
         }
         project_f32(Tensor(const_cast<__nv_bfloat16*>(x), DType::BF16, {w.k, t}), w, out,
                     column_stride, row);
+    }
+
+    // A vector call's query, key and value products in one launch, when they share a block type
+    // and K (each row's sums are the separate launches' bit for bit). NINFER_INKLING_QKV_SEGMENTS=0
+    // keeps them apart.
+    bool projections_in_one_launch(Call& c, const LayerPlan& lp, int ki, int vi, int t, float* qgr,
+                                   float* kv) {
+        static const bool enabled = [] {
+            const char* v = std::getenv("NINFER_INKLING_QKV_SEGMENTS");
+            return v == nullptr || v[0] != '0';
+        }();
+        if (!enabled || !c.q8 || lp.query.size() + 2 > std::size_t(gguf::kMaxVectorSegments)) {
+            return false;
+        }
+        const auto same = [&](const Weight& w) {
+            return w.qtype == lp.key.qtype && w.k == lp.key.k;
+        };
+        if (!same(lp.value)) { return false; }
+        for (const Weight& w : lp.query) {
+            if (!same(w)) { return false; }
+        }
+        std::array<gguf::VectorSegment, gguf::kMaxVectorSegments> segments{};
+        int n = 0;
+        const auto add = [&](const Weight& w, const void* x, float* out, int stride) {
+            gguf::VectorSegment& s = segments[std::size_t(n++)];
+            s.weight               = w.qdata;
+            s.row_bytes            = row_bytes(w);
+            s.rows                 = w.n;
+            s.activation           = x;
+            s.out.f32              = out;
+            s.out.column_stride    = stride;
+        };
+        for (std::size_t i = 0, row = 0; i < lp.query.size(); row += lp.query[i].n, ++i) {
+            add(lp.query[i], input_q(c, 0), qgr + row, lp.query_rows);
+        }
+        add(lp.key, input_q(c, ki), kv, 2 * kvd);
+        add(lp.value, input_q(c, vi), kv + kvd, 2 * kvd);
+        gguf::vector_product_segments(ops::detail::gguf_type(lp.key.qtype), lp.key.k, t,
+                                      segments.data(), n, stream);
+        return true;
     }
 
     static constexpr std::size_t kStagingRegions = 4;
@@ -2012,11 +2075,13 @@ struct Executor::Impl {
         auto* qgr = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * lp.query_rows * 4).data);
         auto* kv  = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 4).data);
         auto* sinks = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * 4).data);
-        for (std::size_t i = 0, row = 0; i < lp.query.size(); row += lp.query[i].n, ++i) {
-            product(lp.query[i], input_q(c, 0), bf16_in(0), t, qgr, lp.query_rows, int(row));
+        if (!projections_in_one_launch(c, lp, ki, vi, t, qgr, kv)) {
+            for (std::size_t i = 0, row = 0; i < lp.query.size(); row += lp.query[i].n, ++i) {
+                product(lp.query[i], input_q(c, 0), bf16_in(0), t, qgr, lp.query_rows, int(row));
+            }
+            product(lp.key, input_q(c, ki), bf16_in(ki), t, kv, 2 * kvd, 0);
+            product(lp.value, input_q(c, vi), bf16_in(vi), t, kv, 2 * kvd, kvd);
         }
-        product(lp.key, input_q(c, ki), bf16_in(ki), t, kv, 2 * kvd, 0);
-        product(lp.value, input_q(c, vi), bf16_in(vi), t, kv, 2 * kvd, kvd);
         kernels::gemm_f32(query_heads, t, hidden, lp.sinks, f32_in(0), sinks, stream);
         float* taps = nullptr;
         const int tap_columns = 2 * kv_heads * kTaps;
@@ -2029,8 +2094,8 @@ struct Executor::Impl {
         }
         auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
         auto* r = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * rel * 4).data);
+        kernels::QueryArgs qa;
         {
-            kernels::QueryArgs qa;
             qa.qgr             = qgr;
             qa.stride          = lp.query_rows;
             qa.relative_column = 2 * q_floats;
@@ -2046,8 +2111,14 @@ struct Executor::Impl {
             qa.positions       = c.rows.positions;
             qa.q_out           = q;
             qa.r_out           = r;
-            kernels::query_post(qa, stream);
         }
+        // A decode call's query and key/value epilogues go in one launch below.
+        static const bool merged_post = [] {
+            const char* v = std::getenv("NINFER_INKLING_MERGED_POST");
+            return v == nullptr || v[0] != '0';
+        }();
+        const bool merge_post = merged_post && !c.chunk;
+        if (!merge_post) { kernels::query_post(qa, stream); }
         // K and V into the cache: a prompt chunk's sliding visit attends over the staging ring
         // (the window before the chunk comes over from the sequence's ring, the chunk's keys land
         // there, and the window that ends the chunk's kept rows goes back).
@@ -2091,11 +2162,17 @@ struct Executor::Impl {
         } else {
             ka.k_cache     = static_cast<__half*>(vp.k.p);
             ka.v_cache     = static_cast<__half*>(vp.v.p);
+            ka.k_scale     = vp.k_scale;
+            ka.v_scale     = vp.v_scale;
             ka.seq_stride  = vp.seq_stride;
             ka.head_stride = vp.head_stride;
             ka.ring        = vp.ring;
         }
-        kernels::kv_post(ka, stream);
+        if (merge_post) {
+            kernels::qkv_post(qa, ka, stream);
+        } else {
+            kernels::kv_post(ka, stream);
+        }
         if (c.chunk) {
             const auto [begin, end] = kept_history(c);
             kernels::keep_history(kv, 2 * kvd, 2 * kvd, c.rows.positions, begin, end, site(v, 0),
@@ -2120,6 +2197,8 @@ struct Executor::Impl {
             aa.extent      = int(lp.full ? config.relative_extent : config.sliding_window);
             aa.k_cache     = ka.k_cache;
             aa.v_cache     = ka.v_cache;
+            aa.k_scale     = ka.k_scale;
+            aa.v_scale     = ka.v_scale;
             aa.seq_stride  = ka.seq_stride;
             aa.head_stride = ka.head_stride;
             aa.ring        = ka.ring;
@@ -2272,11 +2351,18 @@ struct Executor::Impl {
         auto* gu = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
         if (vector) {
-            const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
+            static const int chunk_override = [] {
+                const char* v = std::getenv("NINFER_INKLING_MOE_CHUNK");
+                return v != nullptr ? std::atoi(v) : 0;
+            }();
+            // Two columns a pass at any width: with 8 of 128 experts a token, an expert of a call of
+            // up to 8 tokens holds one or two of its pairs, and the wider forms' registers cost more
+            // occupancy than their shared weight loads save (RTX PRO 6000, 8 requests: 622 tok/s
+            // at 2 against 517 at 8, the same sums at any width).
+            const int chunk = chunk_override > 0 ? std::min(chunk_override, 8) : t <= 1 ? 1 : 2;
             void* act2  = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             auto* fixed = static_cast<unsigned long long*>(
                 workspace->alloc_bytes(std::size_t(t) * hidden * 8).data);
-            CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
             gguf::MoeOutput rows;
             rows.f32 = gu;
             gguf::MoeOutput out;
@@ -2290,6 +2376,24 @@ struct Executor::Impl {
                 gguf::moe_vector_product(p.down_type, down, part, max_active, 1, k, act2, pairs,
                                          out, chunk, stream);
             };
+            static const bool fused_situ = [] {
+                const char* v = std::getenv("NINFER_INKLING_FUSED_SITU");
+                return v == nullptr || v[0] != '0';
+            }();
+            if (!call && fused_situ) {
+                // The memset, SiTU and quantization in one kernel between the two products.
+                gguf::moe_vector_product(p.gate_up_type, gate_up, routing, max_active, k, k, act, t,
+                                         rows, chunk, stream);
+                kernels::situ_quantize(gu, 2 * std::int64_t(width), pairs, width, pair_scale,
+                                       config.gate_cap, config.up_cap, act2,
+                                       gguf::vector_activation_scales_offset(width, pairs), fixed,
+                                       std::int64_t(t) * hidden, stream);
+                gguf::moe_vector_product(p.down_type, down, routing, max_active, 1, k, act2, pairs,
+                                         out, chunk, stream);
+                ra.fixed = fixed;
+                return;
+            }
+            CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
             if (call) {
                 // Both stages add to the same exact fixed-point sum, each over its experts of the
                 // call's sorted routes. The middles of the other stage's pairs come from zero rows
@@ -2568,7 +2672,7 @@ struct Executor::Impl {
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
         const int b = int(sequences.size());
         if (b <= 0 || std::uint32_t(b) > options.sequences || tokens.size() != sequences.size() ||
-            b > gguf::kMaxVectorColumns) {
+            b > kMaxDecodeRows) {
             throw std::invalid_argument("inkling2 decode: invalid batch");
         }
         std::vector<std::int32_t> pos(b), seq(b);
@@ -2734,7 +2838,7 @@ struct Executor::Impl {
     // A sliding visit's ring buffers of one sequence, (start, bytes): K and V.
     std::array<std::pair<std::uint8_t*, std::size_t>, 2> ring_buffers(const VisitPlan& p,
                                                                       std::uint32_t sequence) const {
-        const std::size_t bytes = std::size_t(p.seq_stride) * sizeof(__half);
+        const std::size_t bytes = std::size_t(p.seq_stride) * p.elem;
         return {{{static_cast<std::uint8_t*>(p.k.p) + sequence * bytes, bytes},
                  {static_cast<std::uint8_t*>(p.v.p) + sequence * bytes, bytes}}};
     }
@@ -2791,7 +2895,7 @@ struct Executor::Impl {
         std::uint64_t bytes = sequence_history_bytes();
         for (const VisitPlan* p : cache_plans()) {
             if (p->full) {
-                bytes += 2 * std::uint64_t(kv_heads) * position * kD * sizeof(__half);
+                bytes += 2 * std::uint64_t(kv_heads) * position * kD * p->elem;
             } else {
                 for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; }
             }
@@ -2820,13 +2924,13 @@ struct Executor::Impl {
                 at += in_page;
             }
         };
-        const std::size_t head_bytes = std::size_t(global_slots) * kD * sizeof(__half);
         for (const VisitPlan* p : cache_plans()) {
             if (p->full) {
+                const std::size_t head_bytes = std::size_t(p->head_stride) * p->elem;
                 for (const KvArea* area : {&p->k, &p->v}) {
                     auto* base = static_cast<std::uint8_t*>(area->p) + sequence * head_bytes * kv_heads;
                     for (int h = 0; h < kv_heads; ++h) {
-                        copy(base + h * head_bytes, std::size_t(position) * kD * sizeof(__half));
+                        copy(base + h * head_bytes, std::size_t(position) * kD * p->elem);
                     }
                 }
                 continue;

@@ -59,6 +59,9 @@ struct ExecutorOptions {
     bool dspine = false;
     // Drafts with the model's DSpark drafter (Model::dspark(); its block of drafts a round).
     bool dspark = false;
+    // The full-attention visits' K and V in E4M3 with static scales (--kv-dtype fp8): a byte a
+    // value instead of two. The sliding rings and the drafter's caches stay F16.
+    bool kv_fp8 = false;
     // Prompt calls may carry images (a model loaded with its vision tower): the most patches an
     // image has, which sizes the tower's scratch. 0: text only.
     std::uint32_t vision_max_patches = 0;
