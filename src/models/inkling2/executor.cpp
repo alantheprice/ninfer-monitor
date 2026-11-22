@@ -2801,6 +2801,14 @@ struct Executor::Impl {
     }
 
     void decode_body(int b, bool keep, int runs = 0, std::int64_t key_bound = 0) {
+        // Q8_0 products on the tensor cores (NINFER_INKLING_DENSE_MMA=1; off by default: this first
+        // form is latency-bound below 8 columns, C=1 321 -> 285 tok/s, C=8 64 -> 67).
+        static const bool dense_mma = [] {
+            const char* v = std::getenv("NINFER_INKLING_DENSE_MMA");
+            return v != nullptr && std::string(v) == "1";
+        }();
+        std::optional<gguf::VectorMmaScope> mma;
+        if (dense_mma) { mma.emplace(); }
         workspace->reset();
         auto scope = workspace->scope();
         Call c;

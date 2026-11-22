@@ -98,6 +98,16 @@ struct VectorSegment {
     VectorOutput out;
 };
 inline constexpr int kMaxVectorSegments = 4;
+// While one lives on the calling thread, non-fused Q8_0 vector products of 1..64 columns run on
+// the int8 tensor cores (each column's values the same at any column count, though not the vector
+// kernel's bits): a model's decode calls, whose rows must not depend on their batch.
+struct VectorMmaScope {
+    VectorMmaScope();
+    ~VectorMmaScope();
+    VectorMmaScope(const VectorMmaScope&)            = delete;
+    VectorMmaScope& operator=(const VectorMmaScope&) = delete;
+};
+
 void vector_product_segments(GgmlType type, int k, int columns, const VectorSegment* segments,
                              int count, cudaStream_t stream);
 
