@@ -826,8 +826,9 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
     const int begin = lo + split * chunk;
     const int end   = min(hi + 1, begin + chunk);
 
-    __shared__ __align__(16) __half k_s[kTile][kD];
-    __shared__ __align__(16) __half v_s[kTile][kD];
+    // Two tiles of K and V: the next tile's loads are in flight while this one computes.
+    __shared__ __align__(16) __half k_s2[2][kTile][kD];
+    __shared__ __align__(16) __half v_s2[2][kTile][kD];
     __shared__ float r_s[kWarps][kMaxGroup][kRel];
 
     float q_r[kMaxGroup][4], acc[kMaxGroup][4], m[kMaxGroup], l[kMaxGroup];
@@ -858,40 +859,72 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
     const int lane_key = ((lane & 16) ? 8 : 0) + ((lane & 8) ? 4 : 0) + ((lane & 4) ? 2 : 0) +
                          ((lane & 2) ? 1 : 0);
     const int half = lane & 1;
-    for (int tile = begin; tile < end; tile += kTile) {
+    // A thread's share of a tile's 2 * kTile * 16 sixteen-byte words, loaded raw (E4M3 caches:
+    // their first eight bytes) and converted when stored.
+    constexpr int kWords = 2 * kTile * (kD / 8) / (kWarps * 32);
+    static_assert(kWords * kWarps * 32 == 2 * kTile * (kD / 8), "whole words a thread");
+    const bool fp8 = a.k_scale > 0.0f;
+    uint4 raw[kWords];
+    const auto fetch = [&](int tile) {
         const int count = min(kTile, end - tile);
-        __syncthreads();
-        for (int w = threadIdx.x; w < 2 * kTile * (kD / 8); w += blockDim.x) {
+#pragma unroll
+        for (int i = 0; i < kWords; ++i) {
+            const int w      = int(threadIdx.x) + i * kWarps * 32;
             const int matrix = w / (kTile * (kD / 8));
             const int rest   = w % (kTile * (kD / 8));
             const int r = rest / (kD / 8), c = rest % (kD / 8);
-            uint4 word = make_uint4(0, 0, 0, 0);
+            raw[i] = make_uint4(0, 0, 0, 0);
             if (r < count) {
                 const int p    = tile + r;
                 const int slot = a.ring != 0 ? p % a.ring : p;
                 const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
-                if (a.k_scale > 0.0f) {
-                    // Eight E4M3 codes into eight F16 values (exact), times the static scale.
+                if (fp8) {
                     const uint2 codes = *reinterpret_cast<const uint2*>(
                         reinterpret_cast<const std::uint8_t*>(cache) + base + std::int64_t(slot) * kD + c * 8);
-                    const float scale = matrix == 0 ? a.k_scale : a.v_scale;
-                    const std::uint32_t parts[2] = {codes.x, codes.y};
-                    __half2 h[4];
-#pragma unroll
-                    for (int q = 0; q < 4; ++q) {
-                        const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(
-                            __nv_fp8x2_storage_t(parts[q / 2] >> (16 * (q % 2))), __NV_E4M3);
-                        const float2 f = __half22float2(__half2(raw));
-                        h[q] = __floats2half2_rn(f.x * scale, f.y * scale);
-                    }
-                    word = *reinterpret_cast<const uint4*>(h);
+                    raw[i].x = codes.x;
+                    raw[i].y = codes.y;
                 } else {
-                    word = *reinterpret_cast<const uint4*>(cache + base + std::int64_t(slot) * kD + c * 8);
+                    raw[i] = *reinterpret_cast<const uint4*>(cache + base + std::int64_t(slot) * kD + c * 8);
                 }
             }
-            *reinterpret_cast<uint4*>(matrix == 0 ? &k_s[r][c * 8] : &v_s[r][c * 8]) = word;
         }
+    };
+    const auto store = [&](int buf) {
+#pragma unroll
+        for (int i = 0; i < kWords; ++i) {
+            const int w      = int(threadIdx.x) + i * kWarps * 32;
+            const int matrix = w / (kTile * (kD / 8));
+            const int rest   = w % (kTile * (kD / 8));
+            const int r = rest / (kD / 8), c = rest % (kD / 8);
+            uint4 word = raw[i];
+            if (fp8) {
+                // Eight E4M3 codes into eight F16 values (exact), times the static scale.
+                const float scale = matrix == 0 ? a.k_scale : a.v_scale;
+                const std::uint32_t parts[2] = {raw[i].x, raw[i].y};
+                __half2 h[4];
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(
+                        __nv_fp8x2_storage_t(parts[q / 2] >> (16 * (q % 2))), __NV_E4M3);
+                    const float2 f = __half22float2(__half2(hr));
+                    h[q] = __floats2half2_rn(f.x * scale, f.y * scale);
+                }
+                word = *reinterpret_cast<const uint4*>(h);
+            }
+            *reinterpret_cast<uint4*>(matrix == 0 ? &k_s2[buf][r][c * 8] : &v_s2[buf][r][c * 8]) = word;
+        }
+    };
+    if (begin < end) { fetch(begin); }
+    int buf = 0;
+    for (int tile = begin; tile < end; tile += kTile, buf ^= 1) {
+        const int count = min(kTile, end - tile);
+        // This tile into `buf`: its last readers finished two tiles ago, before the barrier
+        // the previous tile passed.
+        store(buf);
         __syncthreads();
+        if (tile + kTile < end) { fetch(tile + kTile); }
+        const auto& k_s = k_s2[buf];
+        const auto& v_s = v_s2[buf];
         if (!row_ok) { continue; }
         int distance = 0;
         const bool visible =
