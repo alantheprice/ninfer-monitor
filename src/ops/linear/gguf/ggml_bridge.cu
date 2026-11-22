@@ -752,10 +752,24 @@ int vector_max_columns() {
     return n;
 }
 
+// In-kernel column groups for an even call of 9..16 columns (NINFER_VEC_COLUMN_GROUPS=0: slices).
+bool column_groups_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_VEC_COLUMN_GROUPS");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
 void vector_launch_sliced(GgmlType type, detail::VecArgs args, int columns, bool fused,
                           cudaStream_t stream) {
     const int step = vector_max_columns();
     if (columns <= step) { return detail::vector_launch(type)(args, columns, fused, stream); }
+    if (columns % 2 == 0 && columns / 2 <= step && column_groups_enabled()) {
+        // Two groups of half the columns in one launch: the rows come from memory once.
+        args.column_groups = 2;
+        return detail::vector_launch(type)(args, columns / 2, fused, stream);
+    }
     const auto slice = [&](detail::VecStore& o, int c0) {
         if (o.bf16 != nullptr) { o.bf16 += std::int64_t(c0) * o.column_stride; }
         if (o.f32 != nullptr) { o.f32 += std::int64_t(c0) * o.column_stride; }

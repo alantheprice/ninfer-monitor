@@ -3,6 +3,10 @@
 // Blocks a multiprocessor must fit of the MoE vector kernel: its register budget. 6 measured
 // +3% over the unbounded form on an RTX PRO 6000 at 1, 8 and 16 requests (more resident warps;
 // the kernel is latency-bound at its 72-96 registers).
+// The same for the dense vector kernel.
+#ifndef NINFER_VEC_MIN_BLOCKS
+#define NINFER_VEC_MIN_BLOCKS 1
+#endif
 #ifndef NINFER_MOE_MIN_BLOCKS
 #define NINFER_MOE_MIN_BLOCKS 6
 #endif
@@ -783,7 +787,7 @@ struct Decoder<GGML_TYPE_IQ1_M> {
 // KS: the static K the slice loop unrolls over, or 0 for the runtime K. Fused: the weight is one
 // [gate; up] parent and each output row is silu(gate row) * up row.
 template <ggml_type type, int T, bool Fused, int KS, bool Cooperative = false>
-__launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
+__launch_bounds__(kVecWarps * 32, NINFER_VEC_MIN_BLOCKS) __global__ void kernel(VecArgs p) {
     ninfer::pdl::enter_streaming();
     // A multi-segment launch: this block's segment, and its blocks within it.
     int block = int(blockIdx.x), blocks = int(gridDim.x);
@@ -839,66 +843,71 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
                 rowp[r] = weight + std::int64_t(min(row0 + r, rows - 1)) * row_bytes + lane_offset;
             }
         }
-        float acc[kRows][T];
-#pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-            for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
-        }
-        const auto slice = [&](int it) {
-            const int s = lane + 32 * it;
-            int a[T][8];
-            float d[T], sum[T];
-#pragma unroll
-            for (int j = 0; j < T; ++j) {
-                const float2 ds = __half22float2(act_ds[std::int64_t(j) * slices + s]);
-                d[j]            = ds.x;
-                sum[j]          = ds.y;
-                const auto* q   = reinterpret_cast<const int4*>(act_qs + std::int64_t(j) * k + 32 * s);
-                const int4 v0 = q[0], v1 = q[1];
-                a[j][0] = v0.x; a[j][1] = v0.y; a[j][2] = v0.z; a[j][3] = v0.w;
-                a[j][4] = v1.x; a[j][5] = v1.y; a[j][6] = v1.z; a[j][7] = v1.w;
-            }
-#pragma unroll
+        // Column groups: the same rows against T more columns, the rows' bytes now in L1.
+        for (int g = 0; g < p.column_groups; ++g) {
+        const std::int8_t* gqs = act_qs + std::int64_t(g) * T * k;
+        const half2* gds       = act_ds + std::int64_t(g) * T * slices;
+            float acc[kRows][T];
+    #pragma unroll
             for (int r = 0; r < kRows; ++r) {
-                Slice sl;
-                const auto* block = rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes;
-                decode_words<D, Cooperative>(block, sub, table, sl);
-#pragma unroll
-                for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
+    #pragma unroll
+                for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
             }
-        };
-        if constexpr (KS != 0) {
-            static_assert(KS % 1024 == 0);
-#pragma unroll
-            for (int it = 0; it < KS / 1024; ++it) { slice(it); }
-        } else {
-            for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
-        }
-#pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-            for (int j = 0; j < T; ++j) {
-#pragma unroll
-                for (int o = 16; o > 0; o >>= 1) {
-                    acc[r][j] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][j], o);
+            const auto slice = [&](int it) {
+                const int s = lane + 32 * it;
+                int a[T][8];
+                float d[T], sum[T];
+    #pragma unroll
+                for (int j = 0; j < T; ++j) {
+                    const float2 ds = __half22float2(gds[std::int64_t(j) * slices + s]);
+                    d[j]            = ds.x;
+                    sum[j]          = ds.y;
+                    const auto* q   = reinterpret_cast<const int4*>(gqs + std::int64_t(j) * k + 32 * s);
+                    const int4 v0 = q[0], v1 = q[1];
+                    a[j][0] = v0.x; a[j][1] = v0.y; a[j][2] = v0.z; a[j][3] = v0.w;
+                    a[j][4] = v1.x; a[j][5] = v1.y; a[j][6] = v1.z; a[j][7] = v1.w;
                 }
-            }
-        }
-        if (lane == 0) {
-            if constexpr (Fused) {
-#pragma unroll
-                for (int j = 0; j < T; ++j) { vec_store(out, row0, j, vec_gate(acc[0][j], out.activation) * acc[1][j]); }
-            } else {
-#pragma unroll
+    #pragma unroll
                 for (int r = 0; r < kRows; ++r) {
-                    if (row0 + r < rows) {
-#pragma unroll
-                        for (int j = 0; j < T; ++j) { vec_store(out, row0 + r, j, acc[r][j]); }
+                    Slice sl;
+                    const auto* block = rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes;
+                    decode_words<D, Cooperative>(block, sub, table, sl);
+    #pragma unroll
+                    for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
+                }
+            };
+            if constexpr (KS != 0) {
+                static_assert(KS % 1024 == 0);
+    #pragma unroll
+                for (int it = 0; it < KS / 1024; ++it) { slice(it); }
+            } else {
+                for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
+            }
+    #pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+    #pragma unroll
+                for (int j = 0; j < T; ++j) {
+    #pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) {
+                        acc[r][j] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][j], o);
                     }
                 }
             }
-        }
+            if (lane == 0) {
+                if constexpr (Fused) {
+    #pragma unroll
+                    for (int j = 0; j < T; ++j) { vec_store(out, row0, g * T + j, vec_gate(acc[0][j], out.activation) * acc[1][j]); }
+                } else {
+    #pragma unroll
+                    for (int r = 0; r < kRows; ++r) {
+                        if (row0 + r < rows) {
+    #pragma unroll
+                            for (int j = 0; j < T; ++j) { vec_store(out, row0 + r, g * T + j, acc[r][j]); }
+                        }
+                    }
+                }
+            }
+        } // column groups
     }
 }
 

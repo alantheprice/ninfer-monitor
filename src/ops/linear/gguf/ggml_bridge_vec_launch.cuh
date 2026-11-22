@@ -67,6 +67,9 @@ struct VecArgs {
     VecStore out;
     // Further segments: blocks [block_end[s - 1], block_end[s]) run segment s (block_end[0] ends
     // segment 0). more_count == 0 is the single product.
+    // Groups of the launch's T columns, each at T * group columns on (activation and output):
+    // a call of 2T columns reads its rows once from memory.
+    int column_groups = 1;
     int more_count = 0;
     int block_end[kMaxVecSegments] = {};
     VecSegment more[kMaxVecSegments - 1] = {};
