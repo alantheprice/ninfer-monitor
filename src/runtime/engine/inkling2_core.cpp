@@ -645,7 +645,12 @@ struct Inkling2Core::Impl {
     std::vector<Stored> stored;
     std::uint64_t host_budget = 0, host_used = 0;
     // NINFER_INKLING_BATCH_DRAFT=0: DSpark drafts only for a lone decoding request.
-    static constexpr std::size_t kBatchRoundRows = 32;
+    // NINFER_INKLING_BATCH_ROWS (2..32, default 32): a multi-request round's rows.
+    const std::size_t kBatchRoundRows = [] {
+        const char* v = std::getenv("NINFER_INKLING_BATCH_ROWS");
+        const int n   = v != nullptr ? std::atoi(v) : 32;
+        return std::size_t(n >= 2 && n <= 32 ? n : 32);
+    }();
     const bool batch_drafting = [] {
         const char* v = std::getenv("NINFER_INKLING_BATCH_DRAFT");
         return v == nullptr || std::string(v) != "0";
@@ -2070,8 +2075,10 @@ struct Inkling2Core::Impl {
             // Several decoding requests draft together, each round's rows (drafts and bonus) within
             // the executor's 32 decode rows.
             if (!batch_drafting || decoding == 0) { return 0U; }
+            // A single draft a request does not pay for its round's extra rows (12 requests at
+            // 38K tokens: 40.5 tok/s each against 41.7 without).
             const std::size_t width = kBatchRoundRows / decoding;
-            return width >= 2 ? std::min<std::uint32_t>(drafts, std::uint32_t(width - 1)) : 0U;
+            return width >= 3 ? std::min<std::uint32_t>(drafts, std::uint32_t(width - 1)) : 0U;
         }
         return decoding == 1 ? drafts : decoding <= 3 ? 1U : 0U;
     }
