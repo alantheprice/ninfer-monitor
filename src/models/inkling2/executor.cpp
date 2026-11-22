@@ -159,6 +159,7 @@ struct VisitPlan {
     KvArea k, v;
     int slots = 0, ring = 0;
     int elem = 2; // bytes a cached value
+    int window = 0; // a drafter ring's own attention window (0: the drafter's sliding window)
     float k_scale = 0.0f, v_scale = 0.0f;
     std::int64_t seq_stride = 0, head_stride = 0;
     std::vector<DeviceBuffer> checkpoint; // sliding: every sequence's rings, K then V
@@ -741,14 +742,24 @@ struct Executor::Impl {
 
     // A drafter layer's caches: a sliding layer's ring (the window and kR slots past it, like the
     // target's) with its checkpoint, a full layer's every position.
+    // A drafter layer's ring: its own window (a windowed full layer) or the sliding one.
+    [[nodiscard]] bool spark_windowed(bool full) const {
+        return full && options.draft_window > 0 && options.draft_window + kR < options.max_context;
+    }
+    [[nodiscard]] int spark_window_ring() const {
+        return int(round_up(options.draft_window + kR, 256));
+    }
+
     [[nodiscard]] std::size_t spark_planned_bytes() const {
         const DSparkConfig& dc = *model.dspark_config();
         const std::size_t kv = 2 * std::size_t(dc.num_key_value_heads) * dc.head_dim * sizeof(__half) *
                                options.sequences;
         std::size_t bytes = 0;
         for (const bool full : dc.full_attention) {
-            bytes += full ? std::size_t(round_up(options.max_context + 1, 256)) * kv
-                          : (options.checkpoints ? 2 : 1) * std::size_t(ring) * kv;
+            const int slots = spark_windowed(full) ? spark_window_ring() : ring;
+            bytes += full && !spark_windowed(full)
+                         ? std::size_t(round_up(options.max_context + 1, 256)) * kv
+                         : (options.checkpoints ? 2 : 1) * std::size_t(slots) * kv;
         }
         bytes += (options.checkpoints ? 2 : 1) * std::size_t(options.sequences) * kR *
                  config.hidden_size * 4;
@@ -822,9 +833,11 @@ struct Executor::Impl {
             l.key_norm         = fp32(model, lw.key_norm, kD);
             l.context_key_norm = fp32(model, lw.context_key_norm, kD);
             VisitPlan& c   = l.cache;
-            c.full         = dc.full_attention[i];
-            c.slots        = c.full ? global_slots : ring;
-            c.ring         = c.full ? 0 : ring;
+            const bool windowed = spark_windowed(dc.full_attention[i]);
+            c.full         = dc.full_attention[i] && !windowed;
+            c.window       = windowed ? int(options.draft_window) : 0;
+            c.slots        = c.full ? global_slots : windowed ? spark_window_ring() : ring;
+            c.ring         = c.full ? 0 : c.slots;
             c.head_stride  = std::int64_t(c.slots) * kD;
             c.seq_stride   = c.head_stride * kv_heads;
             for (KvArea* area : {&c.k, &c.v}) {
@@ -951,7 +964,9 @@ struct Executor::Impl {
             ra.x           = kv;
             ra.stride      = 2 * kvd;
             ra.heads       = kv_heads;
-            ra.begin       = layer.cache.full ? 0 : std::max(0, n - d.window);
+            ra.begin       = layer.cache.full
+                                 ? 0
+                                 : std::max(0, n - (layer.cache.window ? layer.cache.window : d.window));
             ra.end         = n;
             ra.norm        = layer.context_key_norm;
             ra.eps         = dc.rms_norm_eps;
@@ -1034,7 +1049,7 @@ struct Executor::Impl {
             aa.seq_stride  = l.cache.seq_stride;
             aa.head_stride = l.cache.head_stride;
             aa.ring        = l.cache.ring;
-            aa.window      = l.cache.full ? 0 : d.window + b;
+            aa.window      = l.cache.full ? 0 : (l.cache.window ? l.cache.window : d.window) + b;
             aa.query_heads = query_heads;
             aa.kv_heads    = kv_heads;
             aa.scale       = 1.0f / std::sqrt(float(kD));

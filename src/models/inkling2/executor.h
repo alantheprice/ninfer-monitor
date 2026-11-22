@@ -62,6 +62,10 @@ struct ExecutorOptions {
     // The full-attention visits' K and V in E4M3 with static scales (--kv-dtype fp8): a byte a
     // value instead of two. The sliding rings and the drafter's caches stay F16.
     bool kv_fp8 = false;
+    // Nonzero: the DSpark drafter's full-attention layers attend over the last draft_window
+    // positions, kept in a ring, instead of the whole context. Drafts are verified, so this
+    // changes how many survive, never the output; it bounds the drafter's per-sequence caches.
+    std::uint32_t draft_window = 0;
     // Prompt calls may carry images (a model loaded with its vision tower): the most patches an
     // image has, which sizes the tower's scratch. 0: text only.
     std::uint32_t vision_max_patches = 0;

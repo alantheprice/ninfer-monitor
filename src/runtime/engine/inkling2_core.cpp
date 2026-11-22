@@ -236,6 +236,9 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.dspine        = dspine;
     executor.dspark        = dspark;
     executor.kv_fp8        = options.kv_cache == KvCacheStorage::Fp8E4M3Row256;
+    if (const char* w = std::getenv("NINFER_INKLING_DRAFT_WINDOW"); w != nullptr) {
+        executor.draft_window = std::uint32_t(std::strtoul(w, nullptr, 10));
+    }
     if (dspark) {
         // The drafter's block less its anchor a round, or fewer with --draft-tokens; a round of a
         // context lookup's may verify as many as the lookup proposes.

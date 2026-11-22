@@ -1,5 +1,12 @@
 #pragma once
 
+// Blocks a multiprocessor must fit of the MoE vector kernel: its register budget. 6 measured
+// +3% over the unbounded form on an RTX PRO 6000 at 1, 8 and 16 requests (more resident warps;
+// the kernel is latency-bound at its 72-96 registers).
+#ifndef NINFER_MOE_MIN_BLOCKS
+#define NINFER_MOE_MIN_BLOCKS 6
+#endif
+
 #include "../../../core/pdl.cuh"
 
 // The vector kernel: products of a GGUF matrix with one to eight q8 activation columns. A warp owns
@@ -964,7 +971,7 @@ void launch_columns(const VecArgs& args, int columns, cudaStream_t stream) {
 // sum is the R = 2 form's, bit for bit (the same additions in the same order), while no lane idles
 // through a part-empty round (K = 1152: 36 slices, 9 rounds instead of 2 x 2 with 4 lanes busy).
 template <ggml_type type, int T, bool Fused, bool Cooperative = false, int R = 2>
-__launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
+__launch_bounds__(kVecWarps * 32, NINFER_MOE_MIN_BLOCKS) __global__ void moe_kernel(MoeVecArgs p) {
     ninfer::pdl::enter_streaming();
     using D                 = Decoder<type>;
     constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
