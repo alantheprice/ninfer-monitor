@@ -2077,12 +2077,6 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             "--unconstrained-response-format conflicts with --structured-output");
     }
     product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
-    // The default copy window narrows above eight lanes so every lane's round fits the widest
-    // verification the Qwen family plans (128 columns).
-    if (!ngram_width_explicit && options.speculative.ngram_draft_tokens > 0 && options.max_concurrency > 8) {
-        options.speculative.ngram_draft_tokens =
-            std::min(options.speculative.ngram_draft_tokens, 128U / options.max_concurrency - 1U);
-    }
     product::apply_automatic_speculation(options.speculative, spec_explicit);
     options.kv_cache_automatic = !kv_dtype_explicit;
     product::validate_speculative_cli_options(options.speculative);

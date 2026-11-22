@@ -437,9 +437,9 @@ void ProgramImpl::prepare_graphs() {
         }
         if (ngram_draft_window != 0) {
             // Copy rounds verify at the ngram window and propose the draft window, on the same
-            // frame viewed at that width. Above 15 drafts only one request may be active.
+            // frame viewed at that width, for the batches a copy round may hold.
             const std::uint32_t verify_window = ngram_draft_window;
-            const std::uint32_t batch_limit   = verify_window > 15U ? 1U : max_concurrency;
+            const std::uint32_t batch_limit   = copy_round_lane_limit();
             const auto planned_profiles = mtp_graph_profiles(capacity, verify_window, draft_window,
                                                              attention_geometry, kv_storage);
             validate_graph_profiles(planned_profiles, capacity - 1, "ngram MTP");
@@ -499,7 +499,7 @@ void ProgramImpl::prepare_graphs() {
             // batch>1 copy round also runs the drafter so rows without a copy keep their neural
             // proposal.
             DecodeGraphFamily& family         = copy ? ngram_graphs : dflash_graphs;
-            const std::uint32_t batch_limit   = copy && family_window > 15U ? 1U : max_concurrency;
+            const std::uint32_t batch_limit   = copy ? copy_round_lane_limit() : max_concurrency;
             const auto batch_one_profiles =
                 dflash_graph_profiles(speculative_backend, capacity, family_window, 1);
             validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");

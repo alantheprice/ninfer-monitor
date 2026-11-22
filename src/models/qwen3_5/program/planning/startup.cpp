@@ -508,6 +508,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
     const std::int32_t narrowest_drafts =
         *std::min_element(round_widths.begin(), round_widths.end()) - 1;
+    // A copy round holds at most copy_lanes requests; larger batches only verify neural widths.
+    const auto copy_lanes = static_cast<std::int32_t>(
+        copy_round_lanes(plan.ngram_draft_window, plan.max_concurrency));
+    const auto neural_width = [&](std::int32_t width) { return width == drafts + 1; };
     // Invariant attention reductions plan every call's splits at the context's segment; a plan
     // with them reserves for the tuned splits as well, which the MTP layer keeps.
     const std::uint32_t segment_keys =
@@ -1025,6 +1029,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
              ++batch) {
             std::size_t target_bytes = 0;
             for (const std::int32_t width : round_widths) {
+                if (!neural_width(width) && batch > copy_lanes) { continue; }
                 const std::int32_t aggregate = batch * width;
                 WorkspaceLayoutBuilder target;
                 matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
@@ -1335,6 +1340,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                  ++batch) {
                 std::size_t target_bytes = 0;
                 for (const std::int32_t width : round_widths) {
+                    if (!neural_width(width) && batch > copy_lanes) { continue; }
                     const std::int32_t aggregate = width * batch;
                     WorkspaceLayoutBuilder target;
                     matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
@@ -1456,12 +1462,17 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
     // would put a weight-sized scratch into every round workspace and change decode numerics -- so
     // the widest round sits at or below the floor no device profile moves its width gate past.
-    if (options.max_concurrency *
-            (std::max(options.speculative.draft_tokens, options.speculative.ngram_draft_tokens) + 1U) >
-        static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens)) {
+    // A copy round holds only as many requests as fit (copy_round_lanes), so only the draft window
+    // scales with every lane.
+    if (options.max_concurrency * (options.speculative.draft_tokens + 1U) >
+            static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens) ||
+        copy_round_lanes(options.speculative.ngram_draft_tokens, options.max_concurrency) *
+                (options.speculative.ngram_draft_tokens + 1U) >
+            static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens)) {
         throw std::invalid_argument(
-            "the widest decode/verify round (max_concurrency x (the widest draft or copy window + 1)) "
-            "must stay at or below " + std::to_string(ops::kCublasPrefillFloorTokens) +
+            "the widest decode/verify round (max_concurrency x (draft window + 1), or a copy "
+            "round's lanes x (copy window + 1)) must stay at or below " +
+            std::to_string(ops::kCublasPrefillFloorTokens) +
             " columns, the cuBLAS prefill width gate");
     }
     if (parameters.text.rank_count != device.size()) {
@@ -1737,7 +1748,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                                       "MTP exact-b graph allowance");
             if (impl->ngram_draft_window != 0) {
                 const std::uint32_t copy_batches =
-                    impl->ngram_draft_window > 15U ? 1U : impl->max_concurrency;
+                    copy_round_lanes(impl->ngram_draft_window, impl->max_concurrency);
                 impl->graph_allowance_bytes =
                     checked_add(impl->graph_allowance_bytes,
                                 checked_mul(family_allowance(impl->ngram_draft_window),

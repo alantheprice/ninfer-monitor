@@ -959,6 +959,10 @@ public:
     [[nodiscard]] std::uint32_t widest_verify_window() const noexcept {
         return std::max(draft_window, ngram_draft_window);
     }
+    // The most requests a copy round holds (see copy_round_lanes in planning/startup.h).
+    [[nodiscard]] std::uint32_t copy_round_lane_limit() const noexcept {
+        return copy_round_lanes(ngram_draft_window, max_concurrency);
+    }
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;

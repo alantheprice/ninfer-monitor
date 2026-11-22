@@ -337,7 +337,9 @@ std::vector<NgramProposer::Match>
 ProgramImpl::propose_ngram(std::span<const std::uint32_t> lanes,
                            std::span<const runtime::RoundBudget> budgets) {
     std::vector<NgramProposer::Match> matches(lanes.size());
-    if (ngram_draft_window == 0) { return matches; }
+    // A batch past the copy-round limit runs a neural round; copies resume as it thins out (a
+    // stale continuation cursor is rechecked against the ledger before it is used).
+    if (ngram_draft_window == 0 || lanes.size() > copy_round_lane_limit()) { return matches; }
     if (budgets.size() != lanes.size()) {
         throw std::invalid_argument("ngram budget count does not match lane count");
     }
