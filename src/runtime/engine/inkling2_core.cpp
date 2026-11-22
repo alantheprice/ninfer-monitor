@@ -35,6 +35,8 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -1268,7 +1270,8 @@ struct Inkling2Core::Impl {
                     r.reuse_path = path;
                 }
             } else if (anchored > live) {
-                retire(s);
+                // The conversation continues in place: what the sequence held past its anchor was
+                // this conversation's own last answer, not worth a host image.
                 executor.restore(s, slot.snapshot);
                 slot.fed     = slot.anchor;
                 slot.media   = slot.anchor_media;
@@ -1278,6 +1281,11 @@ struct Inkling2Core::Impl {
                 reused       = live;
                 r.reuse_path = PrefixReusePath::PrivateEndpoint;
             }
+        }
+        if (std::getenv("NINFER_INKLING_ADMIT_LOG") != nullptr) {
+            std::fprintf(stderr, "admit slot %u prompt %u reused %u | slot fed %zu anchor %zu | stored %zu used %llu MiB\n",
+                         s, prompt_n, reused, slot.fed.size(), slot.anchor.size(), stored.size(),
+                         static_cast<unsigned long long>(host_used >> 20));
         }
         if (reused == 0) {
             if (reuse_prefixes) { retire(s); }
@@ -1685,7 +1693,11 @@ struct Inkling2Core::Impl {
             std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
             store_image(r.slot, slot.fed, slot.media, nullptr, PrefixReusePath::SharedStablePrefix);
         }
-        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at && r.prefilled < prompt_n) {
+        // The anchor: the state where the prompt's last user turn closes, or (no such frontier) at
+        // the prompt's end, so the conversation's next turn resumes in this sequence even when its
+        // rendering of this turn's answer differs from the tokens sampled.
+        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at &&
+            (r.prefilled < prompt_n || !r.branches)) {
             executor.snapshot(r.slot, slot.snapshot);
             slot.anchor       = slot.fed;
             slot.anchor_media = slot.media;
