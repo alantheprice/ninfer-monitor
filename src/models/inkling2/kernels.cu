@@ -2373,9 +2373,10 @@ __global__ void route_kernel(RouteArgs a) {
     a.pair_scale[at] = a.gate_up_scale != nullptr ? a.gate_up_scale[x] : 1.0f;
 }
 
-// One block, thread (t, e) expert e of row t (at most 8 rows of 128 experts): each row's top_k as
+// One block, thread (t, e) expert e of row t (at most 32 rows of 128 experts): each row's top_k as
 // route_kernel picks them, then the pairs grouped by expert, each expert's in row order. An expert
-// holds at most 8 pairs, so it fills one column tile of every width.
+// holds at most one pair a row (32), so it fills one column tile of every width but the narrowest
+// (16), where past 16 pairs it takes two, as moe_sort_routes lists them.
 constexpr int kRouteTileWidths = 4;
 // The block holds up to kSortedRouteBlockRows rows of threads; each thread takes rows t,
 // t + kSortedRouteBlockRows, ... of up to kSortedRouteRows.
@@ -2436,7 +2437,10 @@ __global__ void __launch_bounds__(kSortedRouteBlockRows * kSortedRouteExperts)
     if (tt == 0) {
         for (int r = 0; r < a.tokens; ++r) { count += pick[r][e] >= 0 ? 1 : 0; }
     }
-    const int packed = count | (count > 0 ? 1 << 16 : 0);
+    // Packed for one scan: pairs (bits 0-9, at most 256), experts with any (bits 10-19) and their
+    // 16-wide tiles (bits 20-29).
+    const int narrow = (count + 15) / 16;
+    const int packed = count | (count > 0 ? 1 << 10 : 0) | narrow << 20;
     int inclusive    = packed;
     const int lane = e & 31, warp = e >> 5;
     if (tt == 0) {
@@ -2456,19 +2460,21 @@ __global__ void __launch_bounds__(kSortedRouteBlockRows * kSortedRouteExperts)
         total += warp_total[w];
     }
     const int before = inclusive - packed + offset;
-    const int bound = before & 0xFFFF, listed = before >> 16;
+    const int bound = before & 0x3FF, listed = (before >> 10) & 0x3FF, narrow_at = before >> 20;
     const RouteSort& s = a.sorted;
     if (expert) { s.bounds[e] = bound; }
     if (e == 0) {
-        s.bounds[a.experts] = total & 0xFFFF;
-        *s.active_count     = total >> 16;
+        s.bounds[a.experts] = total & 0x3FF;
+        *s.active_count     = (total >> 10) & 0x3FF;
+        s.tile_count[0]     = total >> 20;
 #pragma unroll
-        for (int w = 0; w < kRouteTileWidths; ++w) { s.tile_count[w] = total >> 16; }
+        for (int w = 1; w < kRouteTileWidths; ++w) { s.tile_count[w] = (total >> 10) & 0x3FF; }
     }
     if (count == 0) { return; }
     s.active[listed] = e;
+    for (int tile = 0; tile < narrow; ++tile) { s.tiles[narrow_at + tile] = e | tile << 16; }
 #pragma unroll
-    for (int w = 0; w < kRouteTileWidths; ++w) { s.tiles[std::int64_t(w) * s.tile_capacity + listed] = e; }
+    for (int w = 1; w < kRouteTileWidths; ++w) { s.tiles[std::int64_t(w) * s.tile_capacity + listed] = e; }
     int n = 0;
     for (int r = 0; r < a.tokens; ++r) {
         if (pick[r][e] >= 0) { s.sorted[bound + n++] = r * a.top_k + pick[r][e]; }

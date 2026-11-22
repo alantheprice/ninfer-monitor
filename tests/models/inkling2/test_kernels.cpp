@@ -1780,6 +1780,8 @@ int main() {
         route_case(1, false, rng);
         route_case(3, true, rng);
         route_case(8, false, rng);
+        route_case(29, true, rng);
+        route_case(32, false, rng);
         route_case(64, true, rng);
         situ_case(rng);
         elementwise_case(rng);
