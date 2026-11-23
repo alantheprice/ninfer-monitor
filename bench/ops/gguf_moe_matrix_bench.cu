@@ -34,6 +34,7 @@ namespace {
 
 using namespace ninfer;
 namespace gguf = ops::gguf;
+int vector_chunk = 8; // --chunk: the vector route's columns a pass (Inkling 2 decode: 2)
 
 struct Shape {
     int hidden = 5120, width = 2304, top_k = 6;
@@ -54,6 +55,7 @@ constexpr Format kFormats[] = {
     {"IQ2_XS", gguf::GgmlType::IQ2_XS},   {"IQ2_S", gguf::GgmlType::IQ2_S},
     {"IQ3_XXS", gguf::GgmlType::IQ3_XXS}, {"IQ3_S", gguf::GgmlType::IQ3_S},
     {"IQ4_NL", gguf::GgmlType::IQ4_NL},   {"IQ4_XS", gguf::GgmlType::IQ4_XS},
+    {"NVFP4", gguf::GgmlType::NVFP4},
 };
 
 std::vector<std::string> split(const std::string& text) {
@@ -94,6 +96,7 @@ DeviceBuffer random_bank(gguf::GgmlType type, int experts, int rows, int k, std:
         }
         for (std::size_t at = 0; at < host.size(); at += std::size_t(shape.bytes)) {
             const std::uint16_t d = half_bits(scale(rng));
+            if (type == gguf::GgmlType::NVFP4) { continue; } // its scales: random E4M3 bytes
             if (type != gguf::GgmlType::IQ1_M) {
                 std::memcpy(&host[at], &d, 2);
                 continue;
@@ -176,7 +179,7 @@ void run(const Format& format, const Shape& shape_of, int experts, int tokens, s
             [&](cudaStream_t stream) {
                 gguf::quantize_vector_activation(xb, proj.k, columns, nullptr, vector_act.p, stream);
                 gguf::moe_vector_product(format.type, moe, routing, max_active, proj.column_group,
-                                         top_k, vector_act.p, columns, rows, 8, stream);
+                                         top_k, vector_act.p, columns, rows, vector_chunk, stream);
             },
             bytes, 3, 20, 300);
         check(cudaDeviceSynchronize(), "products");
@@ -218,6 +221,8 @@ int main(int argc, char** argv) {
                 shape.width = std::stoi(value());
             } else if (arg == "--top-k") {
                 shape.top_k = std::stoi(value());
+            } else if (arg == "--chunk") {
+                vector_chunk = std::stoi(value());
             } else {
                 throw std::invalid_argument("unknown argument " + arg);
             }
