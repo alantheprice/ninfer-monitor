@@ -487,6 +487,12 @@ struct Inkling2Core::Request {
     std::condition_variable cv;
     std::optional<GenerationStart> stream_start;
     bool stream_started = false; // stream_start was posted (a requeued request posts it once)
+    // Parked (Impl::park): a decoding request whose sequence went to the host store for want of
+    // device room, waiting in Impl::parked to resume where it was: what its sequence had read,
+    // its pictures, and its penalty counts (when it keeps them).
+    std::vector<TokenId> park_fed;
+    std::vector<ContextMediaMark> park_media;
+    std::vector<std::int32_t> park_counts;
     std::optional<PromptProgress> stream_progress;
     std::vector<std::variant<OutputDelta, GenerationTimingObservation>> events;
     bool response_done = false;
@@ -635,6 +641,8 @@ struct Inkling2Core::Impl {
     // and the requests whose growth found none this step.
     std::uint64_t round_claimed = 0;
     Clock::time_point engine_progress = Clock::now(); // the last step that ran something
+    // Decoding requests parked for want of device room (park), resumed before any new admission.
+    std::deque<std::shared_ptr<Request>> parked;
     std::vector<std::shared_ptr<Request>> stalled;
 
     // The context cache past the sequences (context_image_store.h): images of the prefixes they
@@ -1007,6 +1015,7 @@ struct Inkling2Core::Impl {
         for (auto& slot : slots) {
             if (slot.request) { complete(std::exchange(slot.request, {}), error); }
         }
+        for (auto& request : std::exchange(parked, {})) { complete(request, error); }
         queue_cv.notify_all();
     }
 
@@ -1015,7 +1024,8 @@ struct Inkling2Core::Impl {
             {
                 std::unique_lock lock(queue_mutex);
                 queue_cv.wait(lock, [&] {
-                    return stopping || !pending.empty() || any_active() || session.tasks.pending();
+                    return stopping || !pending.empty() || any_active() || !parked.empty() ||
+                           session.tasks.pending();
                 });
                 if (stopping) {
                     session.tasks.close(lock);
@@ -1028,6 +1038,7 @@ struct Inkling2Core::Impl {
                     for (auto& slot : slots) {
                         if (slot.request) { complete(std::exchange(slot.request, {}), unavailable); }
                     }
+                    for (auto& request : std::exchange(parked, {})) { complete(request, unavailable); }
                     persist();
                     publish_stats();
                     return;
@@ -1384,8 +1395,14 @@ struct Inkling2Core::Impl {
         const std::uint64_t need =
             executor.kv_growth(s, std::min<std::uint32_t>(end, max_context + 1));
         if (need == 0) { return true; }
+        if (std::getenv("NINFER_INKLING_ADMIT_LOG") != nullptr) {
+            std::fprintf(stderr, "grow slot %u to %u: need %llu MiB, room %llu MiB, claimed %llu MiB\n", s, end,
+                         static_cast<unsigned long long>(need >> 20),
+                         static_cast<unsigned long long>(kv_room() >> 20),
+                         static_cast<unsigned long long>(round_claimed >> 20));
+        }
         for (;;) {
-            if (need + round_claimed <= executor.kv_room()) {
+            if (need + round_claimed <= kv_room()) {
                 round_claimed += need;
                 return true;
             }
@@ -1410,7 +1427,38 @@ struct Inkling2Core::Impl {
     // up to kReservedReply more tokens of its output budget (a growing cache backs whole granules,
     // so a reply's growth comes in steps a running request should not stall on). Admission keeps
     // it free for them.
-    static constexpr std::uint32_t kReservedReply = 8192;
+    static constexpr std::uint32_t kDefaultReservedReply = 8192;
+    // Tests only: NINFER_INKLING_TEST_RESERVED_REPLY overrides the reply reservation, and
+    // NINFER_INKLING_TEST_KV_MIB caps the device bytes the growing caches may back, so a test can
+    // run the scheduler out of room on any device.
+    const std::uint32_t kReservedReply = [] {
+        const char* v = std::getenv("NINFER_INKLING_TEST_RESERVED_REPLY");
+        return v != nullptr ? static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10)) : kDefaultReservedReply;
+    }();
+    const std::uint64_t test_kv_cap = [] {
+        const char* v = std::getenv("NINFER_INKLING_TEST_KV_MIB");
+        return v != nullptr ? std::uint64_t(std::strtoull(v, nullptr, 10)) << 20 : 0;
+    }();
+    mutable std::uint64_t test_kv_base = 0;
+    // Tests only: NINFER_INKLING_TEST_PARK_EVERY parks the latest admitted decoding request every
+    // that many decode rounds; NINFER_INKLING_TEST_PARK_DROP=1 drops its image first, so it
+    // resumes by computing its tokens again.
+    const std::uint64_t test_park_every = [] {
+        const char* v = std::getenv("NINFER_INKLING_TEST_PARK_EVERY");
+        return v != nullptr ? std::uint64_t(std::strtoull(v, nullptr, 10)) : 0;
+    }();
+    const bool test_park_drop = std::getenv("NINFER_INKLING_TEST_PARK_DROP") != nullptr;
+    std::uint64_t test_park_rounds = 0;
+    // The device bytes the growing caches may still back.
+    [[nodiscard]] std::uint64_t kv_room() const {
+        const std::uint64_t room = instance.executor->kv_room();
+        if (test_kv_cap == 0) { return room; }
+        // The cap counts growth only: what was backed before any sequence grew is fixed.
+        const std::uint64_t backed = instance.executor->memory().kv_backed_bytes;
+        if (test_kv_base == 0) { test_kv_base = backed; }
+        const std::uint64_t grown = backed - std::min(backed, test_kv_base);
+        return std::min(room, test_kv_cap > grown ? test_kv_cap - grown : 0);
+    }
     [[nodiscard]] std::uint64_t prefill_reserved() const {
         std::uint64_t bytes = 0;
         for (std::uint32_t t = 0; t < slots.size(); ++t) {
@@ -1449,8 +1497,127 @@ struct Inkling2Core::Impl {
         pending.push_front(request);
     }
 
+    // Whether the store holds an image of exactly `tokens` and `media`.
+    [[nodiscard]] bool stored(const std::vector<TokenId>& tokens,
+                              const std::vector<MediaMark>& media) const {
+        for (const auto& image : store.images()) {
+            if (image.tokens.size() == tokens.size() && image.tokens == tokens &&
+                image.media.size() == media.size() &&
+                std::equal(image.media.begin(), image.media.end(), media.begin())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // A decoding request gives its sequence back for want of device room: its state goes to the
+    // host store and it waits in `parked`, to resume where it was (resume_parked). False, and the
+    // request keeps its sequence, when it cannot: a grammar's mask or kept logits in flight, or
+    // a state the store does not keep.
+    bool park(const std::shared_ptr<Request>& request) {
+        Request& r     = *request;
+        auto& executor = *instance.executor;
+        const std::uint32_t s = r.slot;
+        Slot& slot            = slots[s];
+        if (!r.decoding || r.constrained || r.awaiting_sample || r.feed.empty() || slot.request != request) {
+            return false;
+        }
+        if (s == side_slot) { executor.side_join(); }
+        store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
+        if (!stored(slot.fed, slot.media)) { return false; }
+        const bool anchored = !slot.anchor.empty() && slot.anchor.size() <= slot.fed.size() &&
+                              std::equal(slot.anchor.begin(), slot.anchor.end(), slot.fed.begin());
+        if (anchored) {
+            store_image(s, slot.anchor, slot.anchor_media, &slot.snapshot, slot.anchor_path);
+        }
+        if (r.penalties) {
+            r.park_counts.resize(domain);
+            CUDA_CHECK(cudaMemcpy(r.park_counts.data(),
+                                  static_cast<const std::int32_t*>(token_counts.p) + std::size_t(s) * domain,
+                                  std::size_t(domain) * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+        }
+        r.park_fed   = slot.fed;
+        r.park_media = slot.media;
+        clear_session(s);
+        slot.request = nullptr;
+        parked.push_back(request);
+        if (std::getenv("NINFER_INKLING_ADMIT_LOG") != nullptr) {
+            std::fprintf(stderr, "park req %llu slot %u at %zu generated %zu\n",
+                         static_cast<unsigned long long>(r.id), s, r.park_fed.size(), r.generated.size());
+        }
+        std::lock_guard lock(stats_mutex);
+        stats.pressure_private_owners_demoted += 1;
+        return true;
+    }
+
+    // The oldest parked request resumes on a free sequence when the device has room for it beside
+    // the running requests: its image restored (or, when the store dropped it, its tokens
+    // computed again), its penalty counts put back. False when none could.
+    bool resume_parked() {
+        if (parked.empty()) { return false; }
+        auto& executor = *instance.executor;
+        const std::shared_ptr<Request> request = parked.front();
+        Request& r = *request;
+        std::optional<std::uint32_t> free_slot;
+        for (std::uint32_t t = 0; t < slots.size(); ++t) {
+            if (slots[t].request) { continue; }
+            if (!free_slot || slots[t].last_used < slots[*free_slot].last_used) { free_slot = t; }
+        }
+        if (!free_slot) { return false; }
+        const std::uint32_t s = *free_slot;
+        const auto at = static_cast<std::uint32_t>(r.park_fed.size());
+        round_claimed = prefill_reserved();
+        if (any_active() && !room_for(s, at + kReservedReply)) { return false; }
+        parked.pop_front();
+        if (s == side_slot) { executor.side_join(); }
+        Slot& slot = slots[s];
+        retire(s);
+        if (test_park_drop) {
+            store.drop_if([&](const auto& image) { return image.tokens == r.park_fed; });
+        }
+        if (!restore_stored(s, r.park_fed, r.park_media)) {
+            if (!r.park_media.empty()) {
+                r.slot = s;
+                complete(request, std::make_exception_ptr(RequestError(
+                                      RequestErrorKind::Unavailable,
+                                      "the host store dropped this request's parked state")));
+                return true;
+            }
+            executor.reset(s);
+            const std::uint32_t chunk = executor.options().prefill_chunk;
+            for (std::uint32_t from = 0; from < at; from += chunk) {
+                const std::uint32_t n = std::min(chunk, at - from);
+                executor.forward(s, std::span(r.park_fed).subspan(from, n), 1);
+            }
+        }
+        slot.fed   = std::move(r.park_fed);
+        slot.media = std::move(r.park_media);
+        slot.anchor.clear();
+        slot.anchor_media.clear();
+        slot.lookup_lag = 0;
+        slot.request    = request;
+        slot.last_used  = ++use_clock;
+        slot.disposable = r.disposable;
+        r.slot          = s;
+        if (!r.park_counts.empty()) {
+            CUDA_CHECK(cudaMemcpy(static_cast<std::int32_t*>(token_counts.p) + std::size_t(s) * domain,
+                                  r.park_counts.data(), std::size_t(domain) * sizeof(std::int32_t),
+                                  cudaMemcpyHostToDevice));
+            r.park_counts.clear();
+        }
+        r.progress = Clock::now();
+        if (std::getenv("NINFER_INKLING_ADMIT_LOG") != nullptr) {
+            std::fprintf(stderr, "resume req %llu slot %u at %zu\n",
+                         static_cast<unsigned long long>(r.id), s, slot.fed.size());
+        }
+        return true;
+    }
+
     bool admit() {
         bool moved = false;
+        // Parked requests resume first; new prompts wait behind them.
+        while (resume_parked()) { moved = true; }
+        if (!parked.empty()) { return moved; }
         for (;;) {
             std::optional<std::uint32_t> best;
             std::shared_ptr<Request> request;
@@ -1698,6 +1865,16 @@ struct Inkling2Core::Impl {
             return true;
         }
         if (!decoding) { return break_stall(); }
+        if (test_park_every != 0 && ++test_park_rounds % test_park_every == 0) {
+            std::shared_ptr<Request> latest;
+            for (const Slot& slot : slots) {
+                if (slot.request && slot.request->decoding &&
+                    (!latest || latest->admitted < slot.request->admitted)) {
+                    latest = slot.request;
+                }
+            }
+            if (latest && park(latest)) { return true; }
+        }
         decode_run += decode_run != UINT32_MAX;
         if (!decode_step()) { return break_stall(); }
         return true;
@@ -1710,7 +1887,7 @@ struct Inkling2Core::Impl {
         if (stalled.empty()) { return false; }
         if (std::getenv("NINFER_INKLING_ADMIT_LOG") != nullptr) {
             std::fprintf(stderr, "stall | room %llu MiB claimed %llu MiB reserved %llu MiB |",
-                         static_cast<unsigned long long>(instance.executor->kv_room() >> 20),
+                         static_cast<unsigned long long>(kv_room() >> 20),
                          static_cast<unsigned long long>(round_claimed >> 20),
                          static_cast<unsigned long long>(prefill_reserved() >> 20));
             for (std::uint32_t t = 0; t < slots.size(); ++t) {
@@ -1734,6 +1911,14 @@ struct Inkling2Core::Impl {
         if (prefilling) {
             requeue(prefilling);
             return true;
+        }
+        // The latest admitted decoding request that can park does; failing is the last resort.
+        {
+            std::vector<std::shared_ptr<Request>> order(stalled.begin(), stalled.end());
+            std::sort(order.begin(), order.end(), [&](const auto& a, const auto& b) { return later(b, a); });
+            for (const auto& r : order) {
+                if (r->decoding && park(r)) { return true; }
+            }
         }
         if (side_request) { return false; }
         const auto latest = std::max_element(stalled.begin(), stalled.end(), later);
