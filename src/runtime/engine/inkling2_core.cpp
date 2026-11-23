@@ -1395,6 +1395,8 @@ struct Inkling2Core::Impl {
         // checkpoint at the end of its last prompt when the prompt continues that, else from the
         // longest prefix the store keeps; what the sequence held goes to the store first.
         std::uint32_t reused = 0;
+        std::uint32_t dbg_live = 0, dbg_anchored = 0, dbg_departs = 0, dbg_store = 0;
+        int dbg_rewind = -1, dbg_restore = -1;
         if (reuse_prefixes && r.reusable) {
             store.refresh(); // what other engine processes wrote to a shared tier
             const std::uint32_t live       = prefix_reuse(slot.fed, slot.media, r);
@@ -1406,8 +1408,13 @@ struct Inkling2Core::Impl {
             // closure of the last prompt, which the anchor at the default boundary would compute
             // again, and the reply's tokens the prompt keeps.
             const std::uint32_t departs = live == 0 ? departure(slot.fed, slot.media, r) : 0;
-            if (departs > std::max(anchored, from_store) &&
-                executor.rewind(s, static_cast<std::uint32_t>(slot.fed.size()) - departs)) {
+            dbg_live = live, dbg_anchored = anchored, dbg_departs = departs, dbg_store = from_store;
+            bool rewound = false;
+            if (departs > std::max(anchored, from_store)) {
+                rewound    = executor.rewind(s, static_cast<std::uint32_t>(slot.fed.size()) - departs);
+                dbg_rewind = rewound ? 1 : 0;
+            }
+            if (rewound) {
                 slot.fed.resize(departs);
                 std::erase_if(slot.media,
                               [departs](const MediaMark& mark) { return mark.begin >= departs; });
@@ -1419,7 +1426,9 @@ struct Inkling2Core::Impl {
                 const PrefixReusePath path   = store.images()[image].path;
                 retire(s);
                 // Retiring may have dropped or moved the image: restore_stored finds it again.
-                if (restore_stored(s, tokens, media)) {
+                const bool restored = restore_stored(s, tokens, media);
+                dbg_restore         = restored ? 1 : 0;
+                if (restored) {
                     slot.fed   = std::move(tokens);
                     slot.media = std::move(media);
                     slot.anchor.clear();
@@ -1441,9 +1450,11 @@ struct Inkling2Core::Impl {
             }
         }
         if (std::getenv("NINFER_INKLING_ADMIT_LOG") != nullptr) {
-            std::fprintf(stderr, "admit slot %u prompt %u reused %u | slot fed %zu anchor %zu | host store %llu MiB\n",
+            std::fprintf(stderr, "admit slot %u prompt %u reused %u | slot fed %zu anchor %zu | host store %llu MiB"
+                                 " | live %u anchored %u departs %u store %u rewind %d restore %d\n",
                          s, prompt_n, reused, slot.fed.size(), slot.anchor.size(),
-                         static_cast<unsigned long long>(store.host_used() >> 20));
+                         static_cast<unsigned long long>(store.host_used() >> 20), dbg_live,
+                         dbg_anchored, dbg_departs, dbg_store, dbg_rewind, dbg_restore);
         }
         if (reused == 0) {
             if (reuse_prefixes) { retire(s); }

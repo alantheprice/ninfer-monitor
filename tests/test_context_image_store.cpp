@@ -451,6 +451,39 @@ void check_message_checkpoint() {
 
 } // namespace
 
+void check_shared_prefix_kept() {
+    // Three images fill twelve pages. A shared prefix stored first outlives the per-conversation
+    // images while it is within its share and unexpired; past its TTL, or with no share left, it
+    // is evicted in least-recently-used order like any other.
+    const auto run = [](double share, std::chrono::seconds ttl) {
+        Store store;
+        ContextImageStoreOptions options;
+        options.host_budget       = 12 * kPage;
+        options.host_reserve      = 4 * kPage;
+        options.shared_host_share = share;
+        options.shared_ttl        = ttl;
+        store.configure(options, "test-image2-profile", image_bytes, {});
+        store.pin_reserve();
+        const auto shared = prompt(100), a = prompt(200, 1000), b = prompt(300, 2000),
+                   c = prompt(400, 3000);
+        check(store.put(shared, {}, PrefixReusePath::SharedStablePrefix, 100, save(100, 1)).has_value(),
+              "shared prefix stored");
+        check(store.put(a, {}, PrefixReusePath::PrivateEndpoint, 200, save(200, 2)).has_value(),
+              "first conversation image stored");
+        check(store.put(b, {}, PrefixReusePath::PrivateEndpoint, 300, save(300, 3)).has_value(),
+              "second conversation image stored");
+        check(store.put(c, {}, PrefixReusePath::PrivateEndpoint, 400, save(400, 4)).has_value(),
+              "third conversation image stored");
+        return std::pair{store.index(shared, {}).has_value(), store.index(a, {}).has_value()};
+    };
+    const auto [kept, a_kept] = run(0.5, std::chrono::hours(1));
+    check(kept && !a_kept, "a shared prefix within its share outlives an older-used conversation image");
+    const auto [expired_kept, a_after_expiry] = run(0.5, std::chrono::seconds(0));
+    check(!expired_kept && a_after_expiry, "an expired shared prefix is evicted first, by use order");
+    const auto [over_kept, a_over] = run(0.25, std::chrono::hours(1));
+    check(!over_kept && a_over, "a shared prefix past its share is evicted by use order");
+}
+
 int main() {
     int count                   = 0;
     const cudaError_t count_err = cudaGetDeviceCount(&count);
@@ -463,6 +496,7 @@ int main() {
         check_message_checkpoint();
         check_steps();
         check_host_budget();
+        check_shared_prefix_kept();
         check_pin_ahead();
         check_disk_tier(root);
         check_shared_tier(root);

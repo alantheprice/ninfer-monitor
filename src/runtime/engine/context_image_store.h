@@ -183,6 +183,13 @@ struct ContextImageStoreOptions {
     // The directory is shared with other engine processes (disk_kv_shared): publish() writes
     // through in the background and refresh() finds what the others wrote.
     bool disk_shared = false;
+    // Shared-prefix images (PrefixReusePath::SharedStablePrefix: a system prompt and tools that
+    // every conversation starts with) outlive the per-conversation images: eviction takes those
+    // first, and a shared prefix only while the shared prefixes hold more than this share of the
+    // host budget, once it went unused for shared_ttl, or when nothing else is left. One evicted
+    // from host pages goes to the disk tier rather than away.
+    double shared_host_share       = 0.25;
+    std::chrono::seconds shared_ttl = std::chrono::hours(1);
 };
 
 // One record: this header, the profile, the family's fields, the tokens, the media units, the
@@ -223,6 +230,12 @@ context_image_store_options(const ContextCacheOptions& cache, std::uint64_t host
         out.disk_restore = cache.disk_kv_restore || cache.disk_kv_shared;
         out.disk_shared  = cache.disk_kv_shared;
     }
+    // NINFER_SHARED_PREFIX_SHARE (0..1) and NINFER_SHARED_PREFIX_TTL_S tune how shared prefixes
+    // outlive per-conversation images.
+    if (const char* v = std::getenv("NINFER_SHARED_PREFIX_SHARE")) { out.shared_host_share = std::atof(v); }
+    if (const char* v = std::getenv("NINFER_SHARED_PREFIX_TTL_S")) {
+        out.shared_ttl = std::chrono::seconds(std::max(0L, std::atol(v)));
+    }
     return out;
 }
 
@@ -260,6 +273,7 @@ public:
         std::filesystem::path file;    // empty unless on disk
         std::uint64_t bytes     = 0;
         std::uint64_t last_used = 0;
+        std::chrono::steady_clock::time_point used_at{}; // shared prefixes expire from it
         bool writing            = false; // its pages are being written to the shared tier
     };
 
@@ -276,6 +290,9 @@ public:
                    std::function<void()> sync) {
         host_budget_  = options.host_budget / kPageBytes * kPageBytes;
         host_reserve_ = std::min(options.host_reserve / kPageBytes * kPageBytes, host_budget_);
+        shared_host_  = static_cast<std::uint64_t>(double(host_budget_) *
+                                                   std::clamp(options.shared_host_share, 0.0, 1.0));
+        shared_ttl_   = options.shared_ttl;
         profile_      = std::move(profile);
         image_bytes_  = std::move(image_bytes);
         sync_         = std::move(sync);
@@ -311,14 +328,9 @@ public:
         const std::uint64_t size = record_bytes(image);
         if (size > disk_budget_) { return; }
         while (disk_used_ + size > disk_budget_) {
-            Image* oldest = nullptr;
-            for (Image& other : images_) {
-                if (!other.file.empty() && (oldest == nullptr || other.last_used < oldest->last_used)) {
-                    oldest = &other;
-                }
-            }
-            if (oldest == nullptr) { return; }
-            remove_file(*oldest);
+            const auto oldest = disk_victim(&image);
+            if (!oldest) { return; }
+            remove_file(images_[*oldest]);
         }
         WriteJob job;
         job.path  = disk_dir_ / file_name(image);
@@ -398,7 +410,7 @@ public:
                 continue;
             }
             image.file      = path;
-            image.last_used = ++clock_;
+            mark_used(image);
             disk_used_ += std::filesystem::file_size(path, failed);
             images_.push_back(std::move(image));
         }
@@ -474,7 +486,7 @@ public:
         return out;
     }
 
-    void touch(std::size_t i) { images_.at(i).last_used = ++clock_; }
+    void touch(std::size_t i) { mark_used(images_.at(i)); }
 
     // Keeps an image of the state at `position`, which `save(pages, page_bytes)` copies into the
     // image's pages and returns the header of, unless the store holds that prefix already or
@@ -503,7 +515,7 @@ public:
             give_back(image);
             throw;
         }
-        image.last_used = ++clock_;
+        mark_used(image);
         images_.push_back(std::move(image));
         return bytes;
     }
@@ -531,7 +543,7 @@ public:
             std::filesystem::last_write_time(image.file, std::filesystem::file_time_type::clock::now(),
                                              ignored);
         }
-        image.last_used           = ++clock_;
+        mark_used(image);
         const std::uint64_t bytes = image.bytes;
         // Within the budget again, the image just read in being the most recently used.
         (void)make_room(0);
@@ -604,7 +616,7 @@ public:
             give_back(image);
             throw std::invalid_argument("session snapshot file is truncated");
         }
-        image.last_used = ++clock_;
+        mark_used(image);
         images_.push_back(std::move(image));
         return images_.size() - 1;
     }
@@ -795,21 +807,66 @@ private:
     // Brings the images in host pages within the budget with `bytes` more (whole pages): the
     // least recently used go to the disk tier, or are dropped without one. False when the budget
     // cannot hold `bytes` at all. Images may be dropped, so indices change.
+    void mark_used(Image& image) {
+        image.last_used = ++clock_;
+        image.used_at   = std::chrono::steady_clock::now();
+    }
+
+    [[nodiscard]] static bool is_shared_prefix(const Image& image) noexcept {
+        return image.path == PrefixReusePath::SharedStablePrefix;
+    }
+
+    [[nodiscard]] bool expired(const Image& image) const noexcept {
+        return std::chrono::steady_clock::now() - image.used_at > shared_ttl_;
+    }
+
+    // The least recently used of `candidates`: the per-conversation images first; a shared prefix
+    // once it expired or while the shared prefixes take more than their share (`shared_over`),
+    // else only when nothing else is left.
+    template <class Eligible>
+    [[nodiscard]] std::optional<std::size_t> victim(Eligible&& eligible, bool shared_over) const {
+        std::optional<std::size_t> plain, shared;
+        for (std::size_t i = 0; i < images_.size(); ++i) {
+            const Image& image = images_[i];
+            if (!eligible(image)) { continue; }
+            auto& best = is_shared_prefix(image) && !shared_over && !expired(image) ? shared : plain;
+            if (!best || image.last_used < images_[*best].last_used) { best = i; }
+        }
+        return plain ? plain : shared;
+    }
+
+    [[nodiscard]] std::optional<std::size_t> host_victim() const {
+        std::uint64_t shared_bytes = 0;
+        for (const Image& image : images_) {
+            if (is_shared_prefix(image) && !image.pages.empty()) { shared_bytes += page_rounded(image.bytes); }
+        }
+        return victim([](const Image& image) { return !image.pages.empty() && !image.writing; },
+                      shared_bytes > shared_host_);
+    }
+
+    // A file to delete for room in the disk tier, never `keep`'s: per-conversation files first.
+    // Shared prefixes on disk share the host budget's share of the disk budget.
+    [[nodiscard]] std::optional<std::size_t> disk_victim(const Image* keep) const {
+        std::uint64_t shared_bytes = 0;
+        for (const Image& image : images_) {
+            if (is_shared_prefix(image) && !image.file.empty()) { shared_bytes += record_bytes(image); }
+        }
+        const auto share = std::uint64_t(double(disk_budget_) *
+                                         (host_budget_ ? double(shared_host_) / double(host_budget_) : 0.0));
+        return victim([keep](const Image& image) { return !image.file.empty() && &image != keep; },
+                      shared_bytes > share);
+    }
+
     bool make_room(std::uint64_t bytes) {
         if (bytes > host_budget_) { return false; }
         while (host_used_ + bytes > host_budget_) {
-            std::optional<std::size_t> oldest;
             collect_writes();
-            for (std::size_t i = 0; i < images_.size(); ++i) {
-                if (!images_[i].pages.empty() && !images_[i].writing &&
-                    (!oldest || images_[i].last_used < images_[*oldest].last_used)) {
-                    oldest = i;
-                }
-            }
+            const std::optional<std::size_t> oldest = host_victim();
             if (!oldest) { return false; }
             // A shared tier holds what publish() writes through; spilling an evicted image would
-            // write a whole state on the caller's thread.
-            if (!disk_shared_) { write_file(images_[*oldest]); }
+            // write a whole state on the caller's thread. A shared prefix is spilled anyway: it is
+            // what every new conversation starts from, and it is rarely evicted.
+            if (!disk_shared_ || is_shared_prefix(images_[*oldest])) { write_file(images_[*oldest]); }
             give_back(images_[*oldest]);
             drop_dead();
         }
@@ -930,7 +987,7 @@ private:
             Image image;
             if (!read_record_head(in, image) || index(image.tokens, image.media)) { continue; }
             image.file      = entry.path();
-            image.last_used = ++clock_;
+            mark_used(image);
             disk_used_ += entry.file_size();
             images_.push_back(std::move(image));
         }
@@ -943,15 +1000,9 @@ private:
         const std::uint64_t size = record_bytes(image);
         if (size > disk_budget_) { return; }
         while (disk_used_ + size > disk_budget_) {
-            Image* oldest = nullptr;
-            for (Image& other : images_) {
-                if (!other.file.empty() &&
-                    (oldest == nullptr || other.last_used < oldest->last_used)) {
-                    oldest = &other;
-                }
-            }
-            if (oldest == nullptr) { return; }
-            remove_file(*oldest);
+            const auto oldest = disk_victim(&image);
+            if (!oldest) { return; }
+            remove_file(images_[*oldest]);
         }
         if (sync_) { sync_(); }
         const auto path      = disk_dir_ / file_name(image);
@@ -1104,6 +1155,8 @@ private:
     std::function<void()> sync_;
     std::vector<std::unique_ptr<HostPages>> chunks_;
     std::vector<std::byte*> free_pages_;
+    std::uint64_t shared_host_               = 0;
+    std::chrono::seconds shared_ttl_          = std::chrono::hours(1);
     std::vector<Image> images_;
 };
 
