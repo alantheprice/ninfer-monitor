@@ -33,7 +33,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -229,12 +228,6 @@ context_image_store_options(const ContextCacheOptions& cache, std::uint64_t host
                                                              : (std::uint64_t(64) << 30);
         out.disk_restore = cache.disk_kv_restore || cache.disk_kv_shared;
         out.disk_shared  = cache.disk_kv_shared;
-    }
-    // NINFER_SHARED_PREFIX_SHARE (0..1) and NINFER_SHARED_PREFIX_TTL_S tune how shared prefixes
-    // outlive per-conversation images.
-    if (const char* v = std::getenv("NINFER_SHARED_PREFIX_SHARE")) { out.shared_host_share = std::atof(v); }
-    if (const char* v = std::getenv("NINFER_SHARED_PREFIX_TTL_S")) {
-        out.shared_ttl = std::chrono::seconds(std::max(0L, std::atol(v)));
     }
     return out;
 }
