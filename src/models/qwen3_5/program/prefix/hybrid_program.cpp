@@ -72,9 +72,16 @@ std::vector<pc::TapExclusion> media_exclusions(std::span<const VisionTokenRange>
     return exclusions;
 }
 
+// A Boundary is a shared prefix; a tap or an output boundary is a point inside one
+// conversation's history; an endpoint is where a conversation stopped.
 PrefixReusePath reuse_path_for(pc::SnapshotKind kind) noexcept {
-    return kind == pc::SnapshotKind::Endpoint ? PrefixReusePath::PrivateEndpoint
-                                              : PrefixReusePath::SharedStablePrefix;
+    switch (kind) {
+    case pc::SnapshotKind::Endpoint: return PrefixReusePath::PrivateEndpoint;
+    case pc::SnapshotKind::Boundary: return PrefixReusePath::SharedStablePrefix;
+    case pc::SnapshotKind::Tap:
+    case pc::SnapshotKind::OutputBoundary: break;
+    }
+    return PrefixReusePath::PrivateLongAnchor;
 }
 
 } // namespace
@@ -1818,6 +1825,10 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     out.host_tail_restores              = counters.host_tail_restores;
     out.host_write_bytes                = counters.host_write_bytes;
     out.host_restore_bytes              = counters.host_restore_bytes;
+    out.host_image_write_bytes          = counters.host_image_write_bytes;
+    out.host_block_write_bytes          = counters.host_block_write_bytes;
+    out.host_image_restore_bytes        = counters.host_image_restore_bytes;
+    out.host_block_restore_bytes        = counters.host_block_restore_bytes;
     out.evicted_blocks                  = counters.evicted_blocks;
     out.host_snapshot_evictions         = index.host_snapshot_evictions;
     out.host_dead_reclaims              = index.host_dead_reclaims;

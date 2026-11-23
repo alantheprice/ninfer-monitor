@@ -369,6 +369,17 @@ public:
         out.hybrid_host_snapshot_evictions = hybrid.host_snapshot_evictions;
         out.hybrid_host_dead_reclaims      = hybrid.host_dead_reclaims;
         out.hybrid_unbacked_node_losses    = hybrid.unbacked_node_losses;
+        // The generic transfer and pressure series (as the image store and the Legacy catalog
+        // report them): state images and KV block bundles between Device and Host.
+        out.state_d2h_count                 = hybrid.host_image_writes;
+        out.state_h2d_count                 = hybrid.host_image_restores;
+        out.state_d2h_bytes                 = hybrid.host_image_write_bytes;
+        out.state_h2d_bytes                 = hybrid.host_image_restore_bytes;
+        out.main_kv_d2h_pages               = hybrid.host_block_writes;
+        out.main_kv_h2d_pages               = hybrid.host_block_restores;
+        out.main_kv_d2h_bytes               = hybrid.host_block_write_bytes;
+        out.main_kv_h2d_bytes               = hybrid.host_block_restore_bytes;
+        out.pressure_shared_owners_evicted  = hybrid.host_snapshot_evictions;
     }
 
     [[nodiscard]] LogicalLaneState lane_state(LaneId lane) const noexcept {

@@ -60,6 +60,11 @@ struct HybridCacheCounters {
     std::uint64_t host_tail_restores  = 0;
     std::uint64_t host_write_bytes    = 0;
     std::uint64_t host_restore_bytes  = 0;
+    // The same bytes split into state images and KV block bundles (snapshot tails included).
+    std::uint64_t host_image_write_bytes   = 0;
+    std::uint64_t host_block_write_bytes   = 0;
+    std::uint64_t host_image_restore_bytes = 0;
+    std::uint64_t host_block_restore_bytes = 0;
     std::uint64_t evicted_blocks      = 0;
 };
 

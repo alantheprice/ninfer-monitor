@@ -398,6 +398,8 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, Snapshot
         CUDA_CHECK(cudaEventRecord(pending_.back().done, transfer));
         ++counters_.host_image_writes;
         counters_.host_write_bytes += bytes;
+        counters_.host_image_write_bytes += host_layout_.image_bytes;
+        counters_.host_block_write_bytes += bytes - host_layout_.image_bytes;
     } catch (...) {
         // Copies may be in flight into the slabs; they return to the index only once idle.
         (void)ninfer::wait_for_stream(transfer);
@@ -457,6 +459,7 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes, 
     }
     counters_.host_block_writes += write.nodes.size();
     counters_.host_write_bytes += write.nodes.size() * host_layout_.block_payload_bytes;
+    counters_.host_block_write_bytes += write.nodes.size() * host_layout_.block_payload_bytes;
     pending_.push_back(std::move(write));
 }
 
@@ -635,9 +638,12 @@ void HybridPrefixCache::submit_restore() {
     counters_.host_block_restores += restore_.nodes.size();
     counters_.host_tail_restores += restore_.tail ? 1U : 0U;
     counters_.host_image_restores += restore_.image ? 1U : 0U;
-    counters_.host_restore_bytes +=
-        (restore_.nodes.size() + (restore_.tail ? 1U : 0U)) * host_layout_.block_payload_bytes +
-        (restore_.image ? host_layout_.image_bytes : 0U);
+    const std::uint64_t block_bytes =
+        (restore_.nodes.size() + (restore_.tail ? 1U : 0U)) * host_layout_.block_payload_bytes;
+    const std::uint64_t image_bytes = restore_.image ? host_layout_.image_bytes : 0U;
+    counters_.host_restore_bytes += block_bytes + image_bytes;
+    counters_.host_block_restore_bytes += block_bytes;
+    counters_.host_image_restore_bytes += image_bytes;
 }
 
 std::uint64_t HybridPrefixCache::land_restore(cudaStream_t consumer) {
