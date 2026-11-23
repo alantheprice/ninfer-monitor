@@ -536,6 +536,7 @@ struct Inkling2Core::Request {
     std::uint32_t slot         = 0;
     std::uint32_t reused       = 0;
     PrefixReusePath reuse_path = PrefixReusePath::Root;
+    bool selection_counted     = false; // count_selection
     std::uint32_t prefilled    = 0;
     bool decoding              = false;
     bool penalties             = false;
@@ -1058,6 +1059,29 @@ struct Inkling2Core::Impl {
         stats.running_requests      = running;
         stats.prefilling_requests   = prefilling;
         stats.decode_ready_requests = decoding;
+        if (store.enabled()) {
+            const auto& evicted                    = store.evictions();
+            stats.pressure_private_owners_evicted  = evicted.conversation;
+            stats.pressure_shared_owners_evicted   = evicted.shared;
+            stats.host_state_occupied_slots        = store.host_images();
+            stats.host_kv_occupied_bytes           = store.host_used();
+        }
+    }
+
+    // The prefix a request's prompt resumed from, once a request (the Prometheus selection
+    // series and the request log's interval selections, as the Qwen3.5 Program counts them).
+    void count_selection(Request& r) {
+        if (r.selection_counted) { return; }
+        r.selection_counted = true;
+        std::lock_guard lock(stats_mutex);
+        switch (r.reuse_path) {
+        case PrefixReusePath::Root: ++stats.root_selections; break;
+        case PrefixReusePath::PrivateEndpoint: ++stats.private_endpoint_selections; break;
+        case PrefixReusePath::PrivateTurnClosure: ++stats.private_turn_closure_selections; break;
+        case PrefixReusePath::PrivateResponseReplay: ++stats.private_response_replay_selections; break;
+        case PrefixReusePath::PrivateLongAnchor: ++stats.private_long_anchor_selections; break;
+        case PrefixReusePath::SharedStablePrefix: ++stats.shared_stable_prefix_selections; break;
+        }
     }
 
     // Drops every stored image of a prefix of the request's prompt.
@@ -1909,6 +1933,7 @@ struct Inkling2Core::Impl {
                 stats.reused_prompt_tokens += from_store;
             }
         }
+        count_selection(r);
         if (r.branches && r.prefilled == prompt_n) {
             branch_step(request);
             return;
@@ -2167,6 +2192,7 @@ struct Inkling2Core::Impl {
     // decodes from there.
     void finish_prompt(const std::shared_ptr<Request>& request) {
         Request& r          = *request;
+        count_selection(r);
         auto& executor      = *instance.executor;
         const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
         CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));

@@ -306,6 +306,21 @@ public:
 
     [[nodiscard]] bool shared() const noexcept { return disk_shared_; }
 
+    // Host images given up for room since startup, by kind, and the shared ones spilled to disk.
+    struct Evictions {
+        std::uint64_t conversation = 0;
+        std::uint64_t shared       = 0;
+        std::uint64_t shared_spilled = 0;
+    };
+    [[nodiscard]] const Evictions& evictions() const noexcept { return evictions_; }
+
+    // Images whose bytes are in host pages.
+    [[nodiscard]] std::uint32_t host_images() const noexcept {
+        std::uint32_t n = 0;
+        for (const Image& image : images_) { n += image.pages.empty() ? 0U : 1U; }
+        return n;
+    }
+
     // ---- The shared tier ------------------------------------------------------------------------
 
     // Writes the image of exactly these tokens and media through to the shared directory in the
@@ -860,7 +875,10 @@ private:
             // A shared tier holds what publish() writes through; spilling an evicted image would
             // write a whole state on the caller's thread. A shared prefix is spilled anyway: it is
             // what every new conversation starts from, and it is rarely evicted.
-            if (!disk_shared_ || is_shared_prefix(images_[*oldest])) { write_file(images_[*oldest]); }
+            const bool shared_prefix = is_shared_prefix(images_[*oldest]);
+            if (!disk_shared_ || shared_prefix) { write_file(images_[*oldest]); }
+            ++(shared_prefix ? evictions_.shared : evictions_.conversation);
+            if (shared_prefix && !images_[*oldest].file.empty()) { ++evictions_.shared_spilled; }
             give_back(images_[*oldest]);
             drop_dead();
         }
@@ -1165,6 +1183,7 @@ private:
     std::vector<std::unique_ptr<HostPages>> chunks_;
     std::vector<std::byte*> free_pages_;
     std::uint64_t shared_host_               = 0;
+    Evictions evictions_;
     std::chrono::seconds shared_ttl_          = std::chrono::hours(24);
     std::vector<Image> images_;
 };
