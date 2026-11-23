@@ -897,13 +897,21 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
     };
     for (std::size_t index = 0; index < hints.markers.size(); ++index) {
         const PromptCacheMarker& marker = hints.markers[index];
-        // Only a client-named breakpoint is honored unconditionally; protocol-automatic markers
-        // (OpenAI default caching, Anthropic automatic cache_control) are ordinary structural
-        // boundaries that compete with the Engine's own.
-        const TapHintKind kind = has_shared_candidate_evidence(
-                                     marker.evidence, SharedCandidateEvidence::ExplicitBoundary)
-                                     ? TapHintKind::Explicit
-                                     : TapHintKind::Structural;
+        // The image store's rule for a shared prefix (inkling2_core.cpp): a SharedStablePrefix
+        // marker with explicit, structural or requested evidence. A client-named breakpoint is
+        // honored unconditionally; requested and structural ones compete with the Engine's own
+        // boundaries; a private anchor (prompt_cache_key's prompt end) or a default-only marker
+        // marks one conversation's latest turn, which its next turn may supersede.
+        const bool shared_kind = marker.kind == PromptCacheMarkerKind::SharedStablePrefix;
+        const TapHintKind kind =
+            !shared_kind ? TapHintKind::Automatic
+            : has_shared_candidate_evidence(marker.evidence, SharedCandidateEvidence::ExplicitBoundary)
+                ? TapHintKind::Explicit
+            : has_shared_candidate_evidence(marker.evidence,
+                                            SharedCandidateEvidence::EngineStructural |
+                                                SharedCandidateEvidence::RequestedAutomatic)
+                ? TapHintKind::Structural
+                : TapHintKind::Automatic;
         if (marker.location == PromptCacheMarkerLocation::MessageBoundary) {
             if (marker.after_message_count < message_boundaries.size()) {
                 add(message_boundaries[marker.after_message_count], kind);
