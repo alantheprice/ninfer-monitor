@@ -295,6 +295,7 @@ public:
         disk_restore_ = options.disk_restore;
         disk_shared_  = options.disk_shared;
         std::filesystem::create_directories(disk_dir_);
+        remove_stale_temporaries();
         if (disk_restore_) { scan_disk(); }
         if (disk_shared_) {
             std::error_code ignored;
@@ -970,6 +971,21 @@ private:
         std::snprintf(name, sizeof(name), "%016llx-%u.img", static_cast<unsigned long long>(hash),
                       static_cast<unsigned>(image.tokens.size()));
         return name;
+    }
+
+    // Deletes the partial files of writes a process died during (".img.tmp", ".img.tmp<pid>").
+    // The directory may be shared with live processes, so only files untouched for ten minutes
+    // go: a write takes seconds.
+    void remove_stale_temporaries() {
+        std::error_code failed;
+        const auto cutoff = std::filesystem::file_time_type::clock::now() - std::chrono::minutes(10);
+        for (const auto& entry : std::filesystem::directory_iterator(disk_dir_, failed)) {
+            const std::string name = entry.path().filename().string();
+            if (name.find(".img.tmp") == std::string::npos) { continue; }
+            if (std::filesystem::last_write_time(entry.path(), failed) < cutoff && !failed) {
+                std::filesystem::remove(entry.path(), failed);
+            }
+        }
     }
 
     // Reads the heads of the images a previous run left in the disk tier.

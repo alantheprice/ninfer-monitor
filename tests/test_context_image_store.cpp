@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -484,6 +485,20 @@ void check_shared_prefix_kept() {
     check(!over_kept && a_over, "a shared prefix past its share is evicted by use order");
 }
 
+void check_stale_temporaries(const std::filesystem::path& root) {
+    // A partial write a dead process left goes at startup once it is old; a fresh one stays.
+    const auto dir = root / "stale";
+    std::filesystem::create_directories(dir);
+    const auto old_tmp = dir / "a-100.img.tmp1234", fresh_tmp = dir / "b-200.img.tmp";
+    std::ofstream(old_tmp) << "partial";
+    std::ofstream(fresh_tmp) << "partial";
+    std::filesystem::last_write_time(old_tmp, std::filesystem::file_time_type::clock::now() - std::chrono::hours(1));
+    Store store;
+    configure(store, 8, dir, true);
+    check(!std::filesystem::exists(old_tmp), "a stale partial write is removed at startup");
+    check(std::filesystem::exists(fresh_tmp), "a recent partial write (a live writer's) stays");
+}
+
 int main() {
     int count                   = 0;
     const cudaError_t count_err = cudaGetDeviceCount(&count);
@@ -499,6 +514,7 @@ int main() {
         check_shared_prefix_kept();
         check_pin_ahead();
         check_disk_tier(root);
+        check_stale_temporaries(root);
         check_shared_tier(root);
         check_records(root);
         check_cache_file(root);
