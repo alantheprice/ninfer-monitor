@@ -3493,9 +3493,22 @@ struct Executor::Impl {
         return {position};
     }
 
+    // Orders `stream` after the last image copy out. A stream capturing a graph (a prompt chunk
+    // beside decoding, side_begin) cannot wait on the uncaptured copy stream, so the host waits
+    // for the copy instead (allowed in relaxed capture).
+    void wait_copy_done() {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+        if (status != cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaEventSynchronize(copy_done));
+        } else {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done, 0));
+        }
+    }
+
     void await_copy(std::uint32_t sequence) {
         if (copy_pending.empty() || !copy_pending.at(sequence)) { return; }
-        CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done, 0));
+        wait_copy_done();
         copy_pending[sequence] = 0;
     }
 
@@ -3506,7 +3519,7 @@ struct Executor::Impl {
         }
         // Host pages an earlier copy out may still be filling (an image of any sequence).
         if (copy_stream != nullptr) {
-            CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done, 0));
+            wait_copy_done();
             std::fill(copy_pending.begin(), copy_pending.end(), 0);
         }
         back(sequence, image.position);
