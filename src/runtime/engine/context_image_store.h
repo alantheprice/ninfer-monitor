@@ -189,7 +189,7 @@ struct ContextImageStoreOptions {
     // host budget, once it went unused for shared_ttl, or when nothing else is left. One evicted
     // from host pages goes to the disk tier rather than away.
     double shared_host_share       = 0.25;
-    std::chrono::seconds shared_ttl = std::chrono::hours(1);
+    std::chrono::seconds shared_ttl = std::chrono::hours(24);
 };
 
 // One record: this header, the profile, the family's fields, the tokens, the media units, the
@@ -1156,7 +1156,7 @@ private:
     std::vector<std::unique_ptr<HostPages>> chunks_;
     std::vector<std::byte*> free_pages_;
     std::uint64_t shared_host_               = 0;
-    std::chrono::seconds shared_ttl_          = std::chrono::hours(1);
+    std::chrono::seconds shared_ttl_          = std::chrono::hours(24);
     std::vector<Image> images_;
 };
 
