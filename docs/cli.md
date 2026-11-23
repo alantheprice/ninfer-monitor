@@ -66,9 +66,10 @@ words lie inside a 12-word passage seen three times, the last 1,024 characters r
 at most 64 characters, or the last 2,048 do so with their numbers masked while every number of the period
 keeps its own step and one of them moves (a loop that counts, `'time1','time2',...`; a counter
 beside values that change otherwise is an enumeration and does not fire). `conclude` stops
-instead when the output left cannot hold the control span and one more token; Gemma 4 and Flint
-have no early-close control, so there it always stops (Inkling 2 closes its thinking block with the
-guidance and `<|end_message|>`). The run summary prints `reasoning loop`
+instead when the output left cannot hold the control span and one more token (Inkling 2 closes its
+thinking block with the guidance and `<|end_message|>`, Flint its `<think>` block with the guidance
+and `</think>`, Gemma 4 its thought channel with the guidance and `<channel|>`). The run summary
+prints `reasoning loop`
 when the guard fires. The option cannot be combined with `--no-thinking`. The check and its
 limits are described in [serving](serving.md#openai-chat-completions), under `--reasoning-loop`.
 
@@ -189,7 +190,11 @@ Speculative decoding is disabled by default. Select MTP, the 35B-A3B DFlash or t
 DFlash2 backend with one to fifteen draft positions. Only one backend can be enabled per Engine.
 Drafts go through the artifact's optimized proposal head when it stores one: a vocabulary shortlist
 (131,072 rows of the 27B's 248,320) that is cheaper to project at every draft step, for the memory
-of that matrix (0.3 GiB with the 27B GSQ-RCO IQ3_S artifact). `--lm-head-draft` requires the
+of that matrix (0.3 GiB with the 27B GSQ-RCO IQ3_S artifact). The converter takes the most frequent
+tokens of its ranking and 1,024 Russian ones that ranking holds too few of
+(`tools/freq_corpus/fixtures/ranking/proposal.include.ru.json`): the shortlist then holds 99.61% of
+the tokens of held-out Russian answers (98.42% without them) and 99.70% of English chat (99.72%).
+Artifacts converted before this change keep the shortlist without them. `--lm-head-draft` requires the
 proposal head and `--full-draft-head` keeps the full output head; both need a selected backend.
 Both masked-draft backends may be combined with `--vision`:
 
@@ -348,7 +353,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--expert-residency device\|host\|disk` | routed MoE experts on GPU, in pinned host memory, or in artifact files: [native Qwen](maintainer/qwen3_5-model.md#routed-expert-residency), [Gemma 4](gemma4.md#expert-residency), [Flint](flint.md#expert-residency), [Inkling 2](inkling2.md#expert-residency), [DeepSeek-V4.1](deepseek-v41.md#expert-residency) and [Flash-Next](qwen3-8-flash-next.md#run). Native Qwen, Gemma 4, Flint, Inkling 2 and DeepSeek-V4.1 bring misses into whole-layer device banks | `device` |
 | `--embedding-residency device\|host` | Qwen3.5 family: the input token embedding in the GPU's weight arena, or in pinned host memory mapped into the GPU, which the gather reads in place over the bus each step. The table's VRAM goes to the KV cache (Qwen3.8-27B: 388 MiB for an IQ2_S table, 1.26 GiB for Q8); output is unchanged. Excludes `--embedding-q4/q6`; refused for an artifact whose embedding is tied to the output head and for the other families. On Windows (WDDM) mapped host memory may still count against the card | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; native Qwen, Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 allow `0` and then keep only their layer banks, and Flash-Next disk mode needs a cache. With automatic KV, native Qwen gives the cache priority over KV beyond one request's context | `auto` (what is free after startup) |
-| `--expert-host-mib N` | Host experts: pin at most `N` MiB of them, in the artifact's order; the rest are read from the artifact's files as disk experts are, with the same results. By default the pinned block holds as many as fit the host's available memory and, on Windows and WSL2, what the GPU's shared memory segment can still lock (about half the RAM) less 4 GiB for what startup pins later; a part the host refuses ends the block. Qwen3.8-Flash-Next GGUF experts that do not all fit run as disk experts, each copied from its pinned bytes where the block holds it ([Flash-Next](qwen3-8-flash-next.md#host-experts-that-do-not-all-fit)). Needs `--expert-residency host` | as many as fit |
+| `--expert-host-mib N` | Host experts: pin at most `N` MiB of them, in the artifact's order; the rest are read from the artifact's files as disk experts are, with the same results. By default the pinned block holds as many as fit the host's available memory and, on Windows and WSL2, what the GPU's shared memory segment can still lock (WDDM's budget, about half of Windows' memory however much WSL2 is given) less 4 GiB for what startup pins later. `N` replaces that segment estimate: the block then ends at `N` MiB, the available memory or the first part the host refuses, and a block that takes the whole segment can make a later startup pin fail. A part the host refuses ends the block, and the startup line names what ended it. Qwen3.8-Flash-Next GGUF experts that do not all fit run as disk experts, each copied from its pinned bytes where the block holds it ([Flash-Next](qwen3-8-flash-next.md#host-experts-that-do-not-all-fit)). Needs `--expert-residency host` | as many as fit |
 | `--expert-misses staged\|mapped` | Qwen3.8-Flash-Next only, GGUF host experts: copy each missing expert to the device while the cached experts run, into a cache slot when the [expert tier](qwen3-8-flash-next.md#the-expert-cache) admits it (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
 | `--expert-dma-share F\|auto` | Host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF and Qwen3.5/3.6 MoE experts: the GPU's results bit for bit); `auto` splits each such call by the copy and CPU times measured on earlier calls and copies every miss of Flash-Next native experts. Flash-Next host experts' calls of 9 to 64 tokens give the CPU only missing experts with at most eight pairs; wider Flash-Next calls, Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 calls of more than eight tokens, and Qwen3.5/3.6 calls at or past the codec's prefill frontier or that route to half the experts or more, always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); DeepSeek-V4.1's `auto` copies every miss of disk experts ([its CPU share](deepseek-v41.md#the-cpu-share)) | `auto` |
 | `--iq1m-experts matrix\|vector` | DeepSeek-V4.1 and Qwen3.8-Flash-Next: IQ1_M routed experts of calls past eight tokens on the integer matrix kernel once a call routes more than 16 rows to each expert on average for their gate and up products and 6 for their down products (the vector kernel below), or always on the vector kernel in groups of eight columns; the two round the sums differently, so outputs differ slightly ([IQ1_M experts](deepseek-v41.md#iq1_m-experts-in-prompt-chunks)) | `matrix` |
@@ -445,7 +450,10 @@ for a request that offers tools ([HTTP serving](serving.md#server-options)).
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
-generated token IDs in diagnostics.
+generated token IDs in diagnostics. Repeat `--bad-word TEXT` to ban text from the reply, reasoning
+included, as vLLM's `bad_words` does: a reply that completes a banned string goes back to where the
+string began and writes something else there. The CLI then starts the Engine with structured-output
+masks ([banned words](serving.md#banned-words)).
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 
@@ -517,8 +525,8 @@ position of `--config` on the command line. A later layer overrides an earlier o
   Qwen3.8-Flash-Next).
 
 Every switch of every program also takes a `--no-` form, so the command line can turn off a switch
-that a file turns on. `ninfer-serve` records the merged options, with the API key redacted, as
-`arguments` in the request log's `server_start` record. In router mode the router's files and
+that a file turns on. `ninfer-serve` records the merged options, with the API key and admin
+token redacted, as `arguments` in the request log's `server_start` record. In router mode the router's files and
 command line are layers above each model's preset sections.
 
 The container image keeps the files in `/opt/ninfer/configs`. Its working directory is `/models`;

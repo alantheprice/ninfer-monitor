@@ -6,6 +6,7 @@
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/mapped_host_copy.h"
+#include "core/pdl_scope.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -1203,14 +1204,18 @@ struct Executor::Impl {
         kernels::unscale_columns(h, hidden, t, scale, stream);
     }
 
-    // A block's Q, K and V rows into FP32 [T][qkv_rows], part by part when they are not one parent.
+    // A block's Q, K and V rows into FP32 [T][qkv_rows], part by part when they are not one parent
+    // (the q8_1 parts of one block type and row size in one launch).
     void project_qkv(const Tensor* x, const Q8Act* xq, const LayerPlan& p, int t, float* out) {
         if (xq != nullptr) {
-            int row = 0;
-            for (const Weight& part : p.qkv) {
-                vector_f32(*xq, part, t, out, p.qkv_rows, row);
-                row += part.n;
+            std::vector<ops::detail::GgufVectorProduct> parts(p.qkv.size());
+            for (std::size_t i = 0, row = 0; i < parts.size(); row += p.qkv[i].n, ++i) {
+                parts[i].weight            = &p.qkv[i];
+                parts[i].activation        = xq->base;
+                parts[i].out.f32           = out + row;
+                parts[i].out.column_stride = p.qkv_rows;
             }
+            ops::detail::gguf_vector_project(parts, t, stream);
             return;
         }
         std::vector<ops::detail::GgufProduct> parts(p.qkv.size());
@@ -1626,11 +1631,12 @@ struct Executor::Impl {
                 qa.head_stride = stage_stride;
                 qa.ring        = prefill_ring;
             } else {
+                // full_k and full_v start at the sequence's rows (or the staging's), so the
+                // kernel adds no sequence offset.
                 qa.k_cache     = const_cast<__half*>(full_k);
                 qa.v_cache     = const_cast<__half*>(full_v);
-                qa.seq_stride  = quantized ? 0 : p.seq_stride;
+                qa.seq_stride  = 0;
                 qa.head_stride = p.head_stride;
-                qa.sequence    = int(sequence);
             }
             kernels::qkv_post(qa, stream);
             const bool attends = !(kv_only && p.full && li + 1 == layers.size() && !last_tap);
@@ -1864,7 +1870,12 @@ struct Executor::Impl {
             return;
         }
         if (!entry.executable.ready()) {
-            entry.definition.capture(stream, [&] { body(); });
+            // Its kernels release their dependents early (pdl::arch_enter_glue), so the captured
+            // launches become programmatic dependents on an sm_90+ device.
+            entry.definition.capture(stream, [&] {
+                const pdl::ArchScope dependents;
+                body();
+            });
             entry.executable.instantiate(entry.definition);
         }
         entry.executable.launch(stream);
@@ -2140,6 +2151,12 @@ struct Executor::Impl {
     // A position's window lies in the rings while the sequence has written fewer positions past
     // it than the rings hold beyond the window and a round's drafts, and the rings held the
     // window before it when they last came whole. The full-attention rows are kept by position.
+    std::uint32_t rewind_reach(std::uint32_t sequence, std::uint32_t position) const {
+        if (position < ring_floor.at(sequence) || position > positions.at(sequence)) { return 0; }
+        const std::int64_t slack = std::int64_t(ring) - window - std::int64_t(options.draft_tokens);
+        return slack > 0 ? std::uint32_t(slack) : 0;
+    }
+
     bool rewind(std::uint32_t sequence, std::uint32_t tokens) {
         const std::uint32_t at = positions.at(sequence);
         const std::int64_t slack = std::int64_t(ring) - window - std::int64_t(options.draft_tokens);
@@ -2271,6 +2288,10 @@ void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
 
 void Executor::restore(std::uint32_t sequence, const SequenceSnapshot& from) {
     impl_->restore(sequence, from);
+}
+
+std::uint32_t Executor::rewind_reach(std::uint32_t sequence, std::uint32_t position) const {
+    return impl_->rewind_reach(sequence, position);
 }
 
 bool Executor::rewind(std::uint32_t sequence, std::uint32_t tokens) {

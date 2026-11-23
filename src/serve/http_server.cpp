@@ -4,6 +4,7 @@
 #include <fstream>
 #include "serve/slot_files.h"
 
+#include "core/gpu_telemetry.h"
 #include "product/logging/logging.h"
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
@@ -22,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -196,9 +198,11 @@ const char* endpoint_name(std::string_view request_path) noexcept {
     if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
     if (path == "/v1/messages") { return "anthropic_messages"; }
     if (path == "/v1/messages/count_tokens") { return "anthropic_count_tokens"; }
+    if (path == "/v1/answer_now") { return "answer_now"; }
     if (path == "/v1/load") { return "load"; }
     if (path == "/stats") { return "stats"; }
     if (path == "/slots" || path.starts_with("/slots/")) { return "slots"; }
+    if (path == "/shutdown") { return "shutdown"; }
     if (path == "/models" || path.starts_with("/models/")) { return "models"; }
     return "http_route";
 }
@@ -210,6 +214,57 @@ std::string response_request_id(const httplib::Response& response) {
 }
 
 } // namespace
+
+void HttpServer::offer_answer_now(GenerationRequest& generation) {
+    generation.answer_now = std::make_shared<ninfer::AnswerNowSignal>();
+}
+
+void HttpServer::enroll_answer_now(PreparedRequest& prepared, const GenerationRequest& generation,
+                                   const httplib::Response& res) {
+    prepared.answer_now_enrollment =
+        answer_now_.enroll(response_request_id(res), generation.answer_now);
+}
+
+// POST /v1/answer_now {"request_id": ...}: the reply with that response request id closes its
+// reasoning at the end of its next round and answers in the same response.
+void HttpServer::handle_answer_now(const httplib::Request& req, httplib::Response& res) {
+    std::string id;
+    try {
+        const auto body = parse_json_body(req);
+        const auto found = body.find("request_id");
+        if (found == body.end() || !found->is_string() || found->get<std::string>().empty()) {
+            ApiError error;
+            error.param   = "request_id";
+            error.message = "request_id must be the non-empty x-request-id or request-id of a "
+                            "running reply";
+            throw ApiException(error);
+        }
+        id = found->get<std::string>();
+    } catch (const ApiException& exception) {
+        write_openai_error(res, exception.error());
+        return;
+    }
+    ApiError error;
+    switch (answer_now_.request(id)) {
+    case AnswerNowRegistry::Outcome::Accepted:
+        res.set_content(nlohmann::json{{"request_id", id}, {"status", "accepted"}}.dump(),
+                        "application/json");
+        return;
+    case AnswerNowRegistry::Outcome::Answering:
+        error.status  = 409;
+        error.code    = "already_answering";
+        error.message = "the reply is past its reasoning or does not reason";
+        break;
+    case AnswerNowRegistry::Outcome::Unknown:
+        error.status  = 404;
+        error.type    = "not_found_error";
+        error.code    = "request_not_found";
+        error.message = "no running reply has this request id";
+        break;
+    }
+    error.param = "request_id";
+    write_openai_error(res, error);
+}
 
 bool requires_api_key(const std::string& api_key, bool webui_enabled,
                       const httplib::Request& request) {
@@ -644,6 +699,14 @@ void HttpServer::register_routes() {
     register_post(R"(/slots/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_slot_action(req, res);
     });
+    // The supervisor's graceful stop: POST /shutdown runs the Ctrl+Break path, gated by its own
+    // --admin-token (not the API key). Registered only when a token is set, so the route is
+    // absent -- and the port answers 404 -- otherwise.
+    if (!options_.admin_token.empty()) {
+        register_post("/shutdown", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_shutdown(req, res);
+        });
+    }
     server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
         handle_props(req, res);
     });
@@ -744,6 +807,10 @@ void HttpServer::register_routes() {
     register_post(api_route_pattern("/responses/compact"),
                   [this](const httplib::Request& req, httplib::Response& res) {
                       handle_response_compact(req, res);
+                  });
+    register_post(api_route_pattern("/answer_now"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_answer_now(req, res);
                   });
     register_post(api_route_pattern(R"(/responses/([^/]+)/cancel)"),
                   [this](const httplib::Request& req, httplib::Response& res) {
@@ -1104,11 +1171,47 @@ void HttpServer::handle_health(httplib::Response& res) const {
                     "application/json");
 }
 
+void HttpServer::handle_shutdown(const httplib::Request& req, httplib::Response& res) {
+    // The route exists only when --admin-token is set. When an engine API key is configured,
+    // pre_route has already required it on this request, so a caller then carries two keys: the
+    // engine key as the bearer and this token as x-api-key. Accept the token in either header;
+    // without an engine key the caller simply presents the token as the bearer.
+    const bool bearer_ok =
+        matches_bearer_credential(req.get_header_value("Authorization"), options_.admin_token);
+    const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.admin_token;
+    if (!bearer_ok && !x_api_key_ok) {
+        ApiError error;
+        error.status  = 401;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_api_key";
+        error.message = "missing or invalid admin token";
+        write_openai_error(res, error);
+        return;
+    }
+    // Acknowledge, then stop off this thread: the stop closes the listener and tears the server
+    // down, and main() can then exit the process before this connection's response is flushed. A
+    // detached thread that fires the stop shortly after we return guarantees the 202 reaches the
+    // caller; the stop itself (cancel requests, save the prefix cache) outlives it either way.
+    res.status         = 202;
+    res.set_content(R"({"status":"stopping","message":"graceful stop requested; the server "
+                         "exits after cancelling requests and saving its prefix cache"})",
+                    "application/json");
+    std::function<void()> handler = shutdown_handler_;
+    if (handler) {
+        std::thread([handler = std::move(handler)] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            handler();
+        }).detach();
+    }
+}
+
 void HttpServer::handle_metrics(const httplib::Request& req, httplib::Response& res) const {
     try {
         const ModelRegistry::Lease lease = lease_query_model(req);
         res.set_header("Cache-Control", "no-store");
-        std::string body = metrics_.render(model_facts(lease).capacity, load_sample(lease.service()));
+        const std::vector<ninfer::GpuReading> gpus = ninfer::read_gpu_telemetry();
+        std::string body =
+            metrics_.render(model_facts(lease).capacity, load_sample(lease.service()), gpus);
         if (port_contract_configured_) {
             body += port_contract_.metrics_text(lease.service().runtime_stats(),
                                                 !lease.service().has_failed());

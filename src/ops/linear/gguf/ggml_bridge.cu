@@ -62,9 +62,11 @@ const DeviceFacts& device_facts() {
 
 namespace {
 
-// x BF16 [columns][k] -> the vector kernel's planar q8 activation: ggml's q8_1 numbers, one warp per
-// 32 values, element i of column c read from x[c][input_columns[i]] when a gather is given.
+// x BF16 [columns][k] -> the vector kernel's planar q8 activation: ggml's q8_1 numbers, one warp
+// per 32 values, element i of column c read from x[c][input_columns[i]] when a gather is given.
+// Grid row y takes columns y, y + gridDim.y, ... (a grid has at most 65535 rows).
 constexpr int kQuantizeThreads = 256;
+constexpr int kQuantizeRows    = 65535;
 
 // Value i of column `column` into the planar q8_1 activation; every lane of the warp takes part.
 __device__ __forceinline__ void quantize_vector_value(float xi, int i, int column,
@@ -80,14 +82,16 @@ __device__ __forceinline__ void quantize_vector_value(float xi, int i, int colum
 __launch_bounds__(kQuantizeThreads) __global__
     void quantize_vector_kernel(const __nv_bfloat16* __restrict__ x,
                                 const std::int32_t* __restrict__ input_columns,
-                                std::int8_t* __restrict__ qs, half2* __restrict__ ds, int k) {
+                                std::int8_t* __restrict__ qs, half2* __restrict__ ds, int k,
+                                int columns) {
     ninfer::pdl::enter();
-    const int i      = blockDim.x * blockIdx.x + threadIdx.x;
-    const int column = blockIdx.y;
+    const int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= k) { return; }
     const int source = input_columns != nullptr ? input_columns[i] : i;
-    quantize_vector_value(__bfloat162float(x[std::int64_t(column) * k + source]), i, column, qs, ds,
-                          k);
+    for (int column = blockIdx.y; column < columns; column += gridDim.y) {
+        quantize_vector_value(__bfloat162float(x[std::int64_t(column) * k + source]), i, column,
+                              qs, ds, k);
+    }
 }
 
 // FP32 columns: output column c reads x column source[c] (zeros for a negative entry), each value
@@ -96,18 +100,19 @@ __launch_bounds__(kQuantizeThreads) __global__
     void quantize_vector_f32_kernel(const float* __restrict__ x,
                                     const std::int32_t* __restrict__ source,
                                     const float* __restrict__ scale, std::int8_t* __restrict__ qs,
-                                    half2* __restrict__ ds, int k) {
+                                    half2* __restrict__ ds, int k, int columns) {
     ninfer::pdl::enter();
-    const int i      = blockDim.x * blockIdx.x + threadIdx.x;
-    const int column = blockIdx.y;
+    const int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= k) { return; }
-    const int from = source != nullptr ? source[column] : column;
-    float xi       = 0.0f;
-    if (from >= 0) {
-        xi = x[std::int64_t(from) * k + i];
-        if (scale != nullptr) { xi = __fmul_rn(xi, scale[i]); }
+    for (int column = blockIdx.y; column < columns; column += gridDim.y) {
+        const int from = source != nullptr ? source[column] : column;
+        float xi       = 0.0f;
+        if (from >= 0) {
+            xi = x[std::int64_t(from) * k + i];
+            if (scale != nullptr) { xi = __fmul_rn(xi, scale[i]); }
+        }
+        quantize_vector_value(xi, i, column, qs, ds, k);
     }
-    quantize_vector_value(xi, i, column, qs, ds, k);
 }
 
 using VectorLaunch = void (*)(const VecArgs&, int, bool, cudaStream_t);
@@ -715,27 +720,29 @@ void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
                                 const std::int32_t* input_columns, void* out,
                                 cudaStream_t stream) {
     // Whole warps of 32 values: a warp past K leaves as one, before its reductions.
-    if (k <= 0 || k % QK8_1 != 0 || columns <= 0 || columns > 65535) {
+    if (k <= 0 || k % QK8_1 != 0 || columns <= 0) {
         throw std::invalid_argument("gguf vector activation: K must be whole 32-value blocks");
     }
     auto* base = static_cast<std::uint8_t*>(out);
-    const dim3 blocks((k + detail::kQuantizeThreads - 1) / detail::kQuantizeThreads, columns, 1);
-    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks), dim3(detail::kQuantizeThreads), std::size_t(0), stream}, detail::quantize_vector_kernel, 
+    const dim3 blocks((k + detail::kQuantizeThreads - 1) / detail::kQuantizeThreads,
+                      std::min(columns, detail::kQuantizeRows), 1);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks), dim3(detail::kQuantizeThreads), std::size_t(0), stream}, detail::quantize_vector_kernel,
         x, input_columns, reinterpret_cast<std::int8_t*>(base),
-        reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k);
+        reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k, columns);
     detail::check(cudaGetLastError(), "vector activation launch");
 }
 
 void quantize_vector_activation_f32(const float* x, int k, int columns, const std::int32_t* source,
                                     const float* scale, void* out, cudaStream_t stream) {
-    if (k <= 0 || k % QK8_1 != 0 || columns <= 0 || columns > 65535) {
+    if (k <= 0 || k % QK8_1 != 0 || columns <= 0) {
         throw std::invalid_argument("gguf vector activation: K must be whole 32-value blocks");
     }
     auto* base = static_cast<std::uint8_t*>(out);
-    const dim3 blocks((k + detail::kQuantizeThreads - 1) / detail::kQuantizeThreads, columns, 1);
-    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks), dim3(detail::kQuantizeThreads), std::size_t(0), stream}, detail::quantize_vector_f32_kernel, 
+    const dim3 blocks((k + detail::kQuantizeThreads - 1) / detail::kQuantizeThreads,
+                      std::min(columns, detail::kQuantizeRows), 1);
+    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks), dim3(detail::kQuantizeThreads), std::size_t(0), stream}, detail::quantize_vector_f32_kernel,
         x, source, scale, reinterpret_cast<std::int8_t*>(base),
-        reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k);
+        reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k, columns);
     detail::check(cudaGetLastError(), "vector activation launch");
 }
 
@@ -1988,6 +1995,29 @@ void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, 
                      std::int64_t out_row_stride, cudaStream_t stream) {
     detail::dispatch_dequantize(type, weight, row_bytes, k, row_ids, rows, out, out_row_stride,
                                 stream);
+}
+
+} // namespace ninfer::ops::gguf
+
+namespace ninfer::ops::gguf {
+
+// vector_products (the layer-input form of gguf_linear's grouped products) on this line's segment
+// launch: the same products, each row's sums vector_product's bit for bit.
+void vector_products(GgmlType type, std::int64_t row_bytes, int k,
+                     std::span<const VectorJob> products, int columns, cudaStream_t stream) {
+    if (products.empty()) { return; }
+    if (products.size() > std::size_t(kMaxVectorSegments)) {
+        throw std::invalid_argument("gguf vector_products: at most kMaxVectorJobs products");
+    }
+    VectorSegment segments[kMaxVectorSegments];
+    for (std::size_t i = 0; i < products.size(); ++i) {
+        segments[i].weight     = products[i].weight;
+        segments[i].row_bytes  = row_bytes;
+        segments[i].rows       = products[i].rows;
+        segments[i].activation = products[i].activation;
+        segments[i].out        = products[i].out;
+    }
+    vector_product_segments(type, k, columns, segments, int(products.size()), stream);
 }
 
 } // namespace ninfer::ops::gguf

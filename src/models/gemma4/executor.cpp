@@ -6,6 +6,7 @@
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/mapped_host_copy.h"
+#include "core/pdl_scope.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -1438,13 +1439,17 @@ struct Executor::Impl {
                              x.base, t, o, stream);
     }
 
-    // A block's Q, K (and V) rows from q8_1 inputs, part by part when they are not one parent.
+    // A block's Q, K (and V) rows from q8_1 inputs, part by part when they are not one parent
+    // (the parts of one block type and row size in one launch).
     void project_qkv_q8(const Q8Act& x, const LayerPlan& p, int t, Tensor& out) {
-        int row = 0;
-        for (const Weight& part : p.qkv) {
-            project_q8(x, part, t, out, row, p.qkv_rows);
-            row += part.n;
+        std::vector<ops::detail::GgufVectorProduct> parts(p.qkv.size());
+        for (std::size_t i = 0, row = 0; i < parts.size(); row += p.qkv[i].n, ++i) {
+            parts[i].weight            = &p.qkv[i];
+            parts[i].activation        = x.base;
+            parts[i].out.bf16          = static_cast<__nv_bfloat16*>(out.data) + row;
+            parts[i].out.column_stride = p.qkv_rows;
         }
+        ops::detail::gguf_vector_project(parts, t, stream);
     }
 
     static constexpr std::size_t kStagingRegions = 8;
@@ -2324,7 +2329,12 @@ struct Executor::Impl {
             return;
         }
         if (!entry.executable.ready()) {
-            entry.definition.capture(stream, [&] { body(); });
+            // Its kernels release their dependents early (pdl::arch_enter_glue), so the captured
+            // launches become programmatic dependents on an sm_90+ device.
+            entry.definition.capture(stream, [&] {
+                const pdl::ArchScope dependents;
+                body();
+            });
             entry.executable.instantiate(entry.definition);
         }
         entry.executable.launch(stream);
@@ -2930,6 +2940,19 @@ struct Executor::Impl {
         return true;
     }
 
+    std::uint32_t rewind_reach(std::uint32_t sequence, std::uint32_t position, bool held) const {
+        if (position < ring_floor.at(sequence) || position > positions.at(sequence)) { return 0; }
+        const std::int64_t slack = std::int64_t(ring) - std::int64_t(config.sliding_window) -
+                                   std::int64_t(options.draft_tokens);
+        std::uint32_t reach = slack > 0 ? std::uint32_t(slack) : 0;
+        const std::uint32_t base = held ? position : hold_base[sequence];
+        if (hold_rows != 0 && base != kNoHold && position >= base &&
+            position - base < hold_rows) {
+            reach = std::max(reach, base + hold_rows - position);
+        }
+        return reach;
+    }
+
     // The sequence may return to its current position (rewind()) for its next kHoldRows decode
     // steps; release_hold() ends that.
     void hold(std::uint32_t sequence) {
@@ -2975,6 +2998,11 @@ void Executor::load_image(std::uint32_t sequence, const SequenceImage& image,
 
 bool Executor::rewind(std::uint32_t sequence, std::uint32_t tokens) {
     return impl_->rewind(sequence, tokens);
+}
+
+std::uint32_t Executor::rewind_reach(std::uint32_t sequence, std::uint32_t position,
+                                     bool hold) const {
+    return impl_->rewind_reach(sequence, position, hold);
 }
 
 void Executor::hold(std::uint32_t sequence) { impl_->hold(sequence); }

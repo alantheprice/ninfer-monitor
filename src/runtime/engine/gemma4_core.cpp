@@ -23,6 +23,7 @@
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/contract/rope_scaling.h"
+#include "runtime/engine/bad_words_rewind.h"
 #include "runtime/engine/context_image_store.h"
 #include "runtime/engine/session_slots.h"
 #include "runtime/engine/diagnostics.h"
@@ -31,6 +32,7 @@
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/host_memory.h"
+#include "runtime/engine/pinned_block.h"
 #include "runtime/engine/model_instance.h"
 #include "text/structured_output.h"
 
@@ -302,17 +304,18 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     }
     if (options.expert_residency != ExpertResidency::Device) {
         const auto memory = instance->executor->memory().experts;
+        const std::string pinned_end = pinned_block_end_note(model->storage_stats());
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "Gemma 4: experts in %s, cache %.0f MiB (%u slots), %u layer bank(s) %.0f MiB, "
             "metadata %.1f MiB, pinned delivery %.1f MiB, pinned expert sources %.0f MiB, "
-            "expert sources in the files %.0f MiB",
+            "expert sources in the files %.0f MiB%s",
             options.expert_residency == ExpertResidency::Disk ? "artifact files"
             : model->expert_file_bytes() > 0                 ? "pinned host memory and artifact files"
                                                              : "pinned host memory",
             double(memory.cache_bytes) / 1048576, memory.cache_slots, memory.banks,
             double(memory.bank_bytes) / 1048576, double(memory.metadata_bytes) / 1048576,
             double(memory.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576,
-            double(model->expert_file_bytes()) / 1048576);
+            double(model->expert_file_bytes()) / 1048576, pinned_end.c_str());
         const auto cpu = instance->executor->expert_cpu_description();
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "Gemma 4: missing experts %s; cache seeded %s",
@@ -509,6 +512,15 @@ struct Gemma4Core::Request {
     // the sequence goes back to that many tokens after it.
     std::optional<std::size_t> hold_fed;
     bool stop_rewind = false;
+    // Banned words (bad_words) with rewinds: the tokens its sequence had read before the generated
+    // token where a banned word's hold begins, and the purpose of the draw that took that token,
+    // whose logits the slot's hold_logits keep. words_rewind: a rewind to that generated token
+    // which a speculative round completes once it commits; redrawing: the deferred draw is the
+    // rewind's.
+    std::optional<std::size_t> words_fed;
+    std::int32_t words_purpose = 0;
+    std::optional<std::uint32_t> words_rewind;
+    bool redrawing = false;
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
@@ -547,6 +559,8 @@ struct Gemma4Core::Impl {
         const std::uint32_t* mask                = nullptr; // a grammar's next-token mask
         // The typed readout's token ids, on a request's first generated token only.
         const std::vector<TokenId>* readout = nullptr;
+        // A token the row cannot take (<|channel> once an early close was applied).
+        std::optional<TokenId> ban_token;
     };
 
     Gemma4Instance& instance;
@@ -610,9 +624,12 @@ struct Gemma4Core::Impl {
     // A row's logits kept while its grammar mask is late (one per sequence), and those of the rows
     // sampled together afterwards, side by side.
     DeviceBuffer saved_logits, deferred_logits;
+    // The logits that drew the token where a banned word's hold begins, one row per sequence.
+    DeviceBuffer hold_logits;
     std::size_t vocab_rows = 0; // logits per row
     DeviceBuffer token_mask;
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
+    DeviceBuffer bf16_neg_mask; // BF16 -8192 (0xC600), the logit of a banned token (ban)
     DeviceBuffer readout_ids, readout_values;
     std::unique_ptr<PinnedHostBuffer> host_readout;
     std::unique_ptr<PinnedHostBuffer> host_mask, host_sample, host_logprobs;
@@ -686,6 +703,7 @@ struct Gemma4Core::Impl {
             vocab_rows      = static_cast<std::size_t>(instance.executor->logits(1).ne[0]);
             saved_logits    = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
             deferred_logits = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
+            hold_logits     = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
         }
         sample_config   = DeviceBuffer(rows * sizeof(ops::SamplingConfig));
         sample_position = DeviceBuffer(rows * sizeof(std::int32_t));
@@ -708,6 +726,10 @@ struct Gemma4Core::Impl {
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
         CUDA_CHECK(ninfer::copy_and_wait(logprob_flag.p, &enabled, sizeof(enabled),
+                                         cudaMemcpyHostToDevice));
+        bf16_neg_mask = DeviceBuffer(sizeof(std::uint16_t));
+        const std::uint16_t kBf16NegLarge = 0xC600U;
+        CUDA_CHECK(ninfer::copy_and_wait(bf16_neg_mask.p, &kBf16NegLarge, sizeof(kBf16NegLarge),
                                          cudaMemcpyHostToDevice));
         std::size_t workspace = std::max<std::size_t>(
             {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
@@ -827,14 +849,40 @@ struct Gemma4Core::Impl {
     // Starts the mask of a structured-output request's next token, from its grammar's state now.
     void schedule_mask(Request& r) {
         const auto grammar = r.output.grammar_state();
+        if (grammar) { allow_rewinds(r); }
         r.mask = grammar ? runtime::GrammarMaskJob::start(*grammar, mask_words()) : nullptr;
+    }
+
+    // Banned words: whether the request may take its output back to where a banned word began
+    // once its next round has read its positions (OutputSession::allow_bad_words_rewind). Before
+    // the prompt, the first token's hold is the prompt's end, which the sequence can return to.
+    void allow_rewinds(Request& r) {
+        if (r.branches || !r.decoding) {
+            r.output.allow_bad_words_rewind(!r.branches);
+            return;
+        }
+        const auto& executor = *instance.executor;
+        const std::uint32_t at    = executor.position(r.slot);
+        const std::uint32_t ahead = std::max<std::uint32_t>(
+            drafts + 1, static_cast<std::uint32_t>(r.feed.size()));
+        bool can = false;
+        if (r.words_fed) {
+            const auto from = static_cast<std::uint32_t>(*r.words_fed);
+            can = from <= at && at + ahead - from <= executor.rewind_reach(r.slot, from, false);
+        } else {
+            // A hold that begins in the round: a plain step marks it (hold()) where it begins.
+            can = ahead <= executor.rewind_reach(r.slot, at, true);
+        }
+        r.output.allow_bad_words_rewind(can);
     }
 
     // After a structured request's accepted tokens: one that decodes plainly starts its next mask
     // now, a step ahead; one that speculates fills its round's columns during the verification.
+    // A request whose token waits for a rewind's draw needs that token's mask.
     void next_mask(const std::shared_ptr<Request>& request) {
         Request& r = *request;
-        if (r.constrained && active(request) && !(drafts > 0 && r.mask_cost.speculates())) {
+        if (r.constrained && active(request) &&
+            (r.awaiting_sample || !(drafts > 0 && r.mask_cost.speculates()))) {
             schedule_mask(r);
         } else {
             r.mask.reset();
@@ -1551,6 +1599,18 @@ struct Gemma4Core::Impl {
         if (streaming) { r.cv.notify_all(); }
     }
 
+
+    // Gives `token` the logit -8192 in `count` columns from `column`: the row cannot draw it.
+    void ban(const Tensor& logits, std::size_t column, std::size_t count,
+             std::optional<TokenId> token, cudaStream_t stream) const {
+        if (!token || *token < 0 || static_cast<std::uint32_t>(*token) >= domain) { return; }
+        for (std::size_t c = column; c < column + count; ++c) {
+            auto* at = static_cast<std::uint16_t*>(logits.data) +
+                       c * static_cast<std::size_t>(logits.ne[0]) + static_cast<std::size_t>(*token);
+            CUDA_CHECK(cudaMemcpyAsync(at, bf16_neg_mask.p, sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+    }
     void sample(std::span<const SampleRow> rows, std::int32_t purpose, std::span<TokenId> out,
                 std::span<runtime::RawTokenLogprob> logprobs, const Tensor* source = nullptr) {
         const cudaStream_t stream = instance.executor->head_stream();
@@ -1599,6 +1659,7 @@ struct Gemma4Core::Impl {
         const Tensor logical(sample_position.p, DType::I32, {width});
         const Tensor logits =
             source != nullptr ? *source : instance.executor->logits(static_cast<std::uint32_t>(n));
+        for (std::size_t b = 0; b < n; ++b) { ban(logits, b, 1, rows[b].ban_token, stream); }
         const auto* device_configs = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const bool gather = std::any_of(rows.begin(), rows.end(),
                                         [](const SampleRow& row) { return row.logprobs; });
@@ -1703,7 +1764,8 @@ struct Gemma4Core::Impl {
                          .readout  = exec.logprobs && !exec.readout_tokens.empty() &&
                                              r.first_token == Clock::time_point{}
                                          ? &exec.readout_tokens
-                                         : nullptr};
+                                         : nullptr,
+                         .ban_token = r.output.banned_token()};
     }
 
     // --expert-profile-out: every route since warm-up, rewritten at each request boundary.
@@ -2018,7 +2080,7 @@ struct Gemma4Core::Impl {
         // The first token's mask began with the request; when it is not done yet, the prompt's
         // last logits wait for it instead of the engine thread.
         if (r.branches) {
-            accept(request, r.branch_token, &r.branch_record);
+            accept(request, r.branch_token, &r.branch_record, Draws{});
             return;
         }
         if (!mask_ready(r)) {
@@ -2031,7 +2093,9 @@ struct Gemma4Core::Impl {
         runtime::RawTokenLogprob logprob;
         sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1),
                std::span(&logprob, 1));
-        accept(request, token, row.logprobs ? &logprob : nullptr);
+        const Tensor logits = executor.logits(1);
+        accept(request, token, row.logprobs ? &logprob : nullptr,
+               Draws{.logits = &logits, .purpose = ops::kSamplePurposePrefill});
         next_mask(request);
     }
 
@@ -2039,16 +2103,88 @@ struct Gemma4Core::Impl {
         return slots.at(request->slot).request == request;
     }
 
+    // Where the logits that drew a round's tokens are: token i's in column `column + i` of
+    // `logits`, drawn for `purpose`. A banned word's hold keeps its token's.
+    struct Draws {
+        const Tensor* logits = nullptr;
+        std::size_t column   = 0;
+        std::int32_t purpose = ops::kSamplePurposeDecode;
+    };
+
     // Applies the output policy to a sampled token: publishes what it accepts, then either
     // finishes the request or queues what its next decode step feeds.
     void accept(const std::shared_ptr<Request>& request, TokenId token,
-                const runtime::RawTokenLogprob* logprob) {
+                const runtime::RawTokenLogprob* logprob, const Draws& draws) {
         if (token < 0) { throw_numerical_failure(*request); }
         (void)accept(request, std::span<const TokenId>(&token, 1),
                      logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
                                         : std::span<const runtime::RawTokenLogprob>{},
-                     true);
+                     true, draws);
         check_capacity(request);
+    }
+
+    // Banned words: the round's token `index` begins a hold. The request keeps the logits that
+    // drew it and how many tokens its sequence had read before it; `mark`: a plain step's rings
+    // no wider than the window keep the rows the steps from here overwrite (hold()).
+    void keep_words_hold(Request& r, std::uint32_t index, bool committed, const Draws& draws,
+                         bool mark) {
+        if (draws.logits == nullptr) {
+            throw std::logic_error("a banned word's hold began without the logits of its token");
+        }
+        const std::size_t bytes  = vocab_rows * sizeof(__nv_bfloat16);
+        const std::size_t stride = static_cast<std::size_t>(draws.logits->ne[0]) *
+                                   sizeof(__nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::uint8_t*>(hold_logits.p) + std::size_t(r.slot) * bytes,
+            static_cast<const std::uint8_t*>(draws.logits->data) + (draws.column + index) * stride,
+            bytes, cudaMemcpyDeviceToDevice, instance.executor->head_stream()));
+        r.words_fed     = slots[r.slot].fed.size() + (committed ? 0 : 1) + index;
+        r.words_purpose = draws.purpose;
+        if (committed && mark) { instance.executor->hold(r.slot); }
+    }
+
+    // Banned words: takes the request back to the state before generated token `words_rewind`,
+    // the hold's, and draws that position again from the hold's logits once the grammar's mask,
+    // which bans the dropped token there, is ready (next_mask). A speculative round calls it once
+    // it has committed the tokens before the hold.
+    void complete_words_rewind(Request& r) {
+        const std::uint32_t to = *r.words_rewind;
+        r.words_rewind.reset();
+        auto& executor = *instance.executor;
+        Slot& slot     = slots[r.slot];
+        if (!r.words_fed || to > r.generated.size() || slot.fed.size() < *r.words_fed) {
+            throw std::logic_error("banned-word rewind without the hold it returns to");
+        }
+        const std::size_t back_to = *r.words_fed;
+        const std::span<const TokenId> dropped(r.generated.data() + to, r.generated.size() - to);
+        if (r.penalties) {
+            runtime::uncount_tokens(static_cast<std::int32_t*>(token_counts.p) +
+                                        std::size_t(r.slot) * domain,
+                                    dropped, executor.head_stream());
+        }
+        r.budget->release(static_cast<std::uint32_t>(dropped.size()));
+        r.generated.resize(to);
+        if (r.hold_fed && *r.hold_fed > back_to) { r.hold_fed.reset(); }
+        if (slot.fed.size() > back_to) {
+            const auto tokens = static_cast<std::uint32_t>(slot.fed.size() - back_to);
+            if (!executor.rewind(r.slot, tokens)) {
+                throw std::logic_error("Gemma 4 could not return to a banned word's hold");
+            }
+            slot.fed.resize(back_to);
+            r.position -= tokens;
+            // The rewind ended the executor's hold; the token drawn again may begin a word.
+            executor.hold(r.slot);
+        }
+        r.feed.clear();
+        const std::size_t bytes = vocab_rows * sizeof(__nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::uint8_t*>(saved_logits.p) + std::size_t(r.slot) * bytes,
+            static_cast<const std::uint8_t*>(hold_logits.p) + std::size_t(r.slot) * bytes, bytes,
+            cudaMemcpyDeviceToDevice, executor.head_stream()));
+        r.awaiting_sample  = true;
+        r.awaiting_purpose = r.words_purpose;
+        r.redrawing        = true;
+        r.mask.reset();
     }
 
     // A turn that ended at a stop string: the sequence goes back to what it had read before the
@@ -2077,7 +2213,8 @@ struct Gemma4Core::Impl {
     // `committed`: the sequence has read what the tokens follow; a speculative round, which has
     // yet to read its anchor, commits after the policy has decided.
     std::uint32_t accept(const std::shared_ptr<Request>& request, std::span<const TokenId> tokens,
-                         std::span<const runtime::RawTokenLogprob> logprobs, bool committed) {
+                         std::span<const runtime::RawTokenLogprob> logprobs, bool committed,
+                         const Draws& draws) {
         Request& r                    = *request;
         const OutputDecision decision = r.output.preview_model(tokens, r.budget->remaining(),
                                                                r.budget->limit_reason(), logprobs);
@@ -2105,15 +2242,41 @@ struct Gemma4Core::Impl {
             std::lock_guard lock(stats_mutex);
             stats.committed_decode_tokens += accepted;
         }
+        // The holds that ended in this round, then those that begin in it. A rewind to a banned
+        // word's hold of an earlier round reports no stop hold: one that began before that hold
+        // stays (complete_words_rewind).
+        const bool replay = decision.bad_words_rewind && !decision.bad_words_hold_after;
+        if (!decision.finished() && !decision.stop_hold_alive && !replay) { r.hold_fed.reset(); }
+        if (!decision.bad_words_hold_alive) { r.words_fed.reset(); }
+        const bool held = r.hold_fed || r.words_fed;
         // The match of a stop string began at accepted token `stop_hold_after`: the sequence had
         // read, or will have once the round commits, this many tokens before it.
         if (accepted > 0 && decision.stop_hold_after && *decision.stop_hold_after < accepted) {
             r.hold_fed = slots[r.slot].fed.size() + (committed ? 0 : 1) + *decision.stop_hold_after;
-            // Rings no wider than the window keep the rows that the steps from here overwrite.
-            if (committed) { instance.executor->hold(r.slot); }
-        } else if (!decision.finished() && !decision.stop_hold_alive) {
-            r.hold_fed.reset();
+            // Rings no wider than the window keep the rows that the steps from here overwrite,
+            // from the earlier hold when one is alive.
+            if (committed && !held) { instance.executor->hold(r.slot); }
+        }
+        if (decision.bad_words_hold_after) {
+            keep_words_hold(r, *decision.bad_words_hold_after, committed, draws, !held);
+        }
+        if (!decision.finished() && !r.hold_fed && !r.words_fed) {
             instance.executor->release_hold(r.slot);
+        }
+        if (decision.bad_words_rewind) {
+            // A banned word was completed: the output stands at its hold again.
+            r.words_rewind = *decision.bad_words_rewind;
+            if (committed) {
+                // The draw counted the round's token, which the output did not take.
+                if (r.penalties) {
+                    runtime::uncount_tokens(static_cast<std::int32_t*>(token_counts.p) +
+                                                std::size_t(r.slot) * domain,
+                                            tokens.subspan(accepted),
+                                            instance.executor->head_stream());
+                }
+                complete_words_rewind(r);
+            }
+            return accepted;
         }
         if (decision.finished()) {
             if (decision.stop_cut) {
@@ -2127,6 +2290,21 @@ struct Gemma4Core::Impl {
             return accepted;
         }
         r.feed.assign(1, tokens[accepted > 0 ? accepted - 1 : 0]);
+        if (decision.continuation == ContinuationAction::ApplyTargetControl) {
+            // A reached thinking budget or the loop guard's conclusion closes the reasoning the
+            // model opened: append the control span (<guidance><channel|>) to the next step's feed.
+            const auto pending_control = r.output.pending_control_tokens();
+            const std::vector<TokenId> control(pending_control.begin(), pending_control.end());
+            const OutputDecision forced = r.output.preview_control(control, r.budget->remaining());
+            if (forced.accepted_tokens != control.size() || forced.finished()) {
+                throw RequestError(RequestErrorKind::Unavailable,
+                                   "thinking control preview returned an invalid decision");
+            }
+            r.generated.insert(r.generated.end(), control.begin(), control.end());
+            r.budget->commit(static_cast<std::uint32_t>(control.size()));
+            push_events(r, r.output.commit_preview(), std::nullopt);
+            r.feed.insert(r.feed.end(), control.begin(), control.end());
+        }
         if (r.cancelled.load(std::memory_order_acquire)) {
             finish_now(request, FinishReason::Cancelled);
         }
@@ -2159,7 +2337,7 @@ struct Gemma4Core::Impl {
     // One step of every decoding request. Those that speculate run one round together, the rest one
     // batched decode step.
     void decode_step() {
-        std::vector<std::shared_ptr<Request>> batch, speculative;
+        std::vector<std::shared_ptr<Request>> alone, batch, speculative;
         std::size_t decoding = 0;
         for (const Slot& slot : slots) {
             if (slot.request && slot.request->decoding) { ++decoding; }
@@ -2179,16 +2357,45 @@ struct Gemma4Core::Impl {
                 }
                 continue;
             }
+            if (request->feed.size() > 1) {
+                alone.push_back(request);
+                continue;
+            }
             (steps > 0 && speculates(*request) ? speculative : batch).push_back(request);
         }
-        if (batch.empty() && speculative.empty() && deferred.empty()) { return; }
+        if (alone.empty() && batch.empty() && speculative.empty() && deferred.empty()) { return; }
         const auto start = Clock::now();
         if (!deferred.empty()) { sample_deferred(deferred); }
+        for (const auto& request : alone) {
+            // The control span that closes the reasoning, after the token before it: one forward
+            // of all of them, then the token after.
+            Request& r = *request;
+            if (r.constrained && !r.mask) { schedule_mask(r); }
+            instance.executor->forward(r.slot, r.feed, 1);
+            Slot& slot = slots[r.slot];
+            slot.fed.insert(slot.fed.end(), r.feed.begin(), r.feed.end());
+            r.position += static_cast<std::uint32_t>(r.feed.size());
+            if (!mask_ready(r)) {
+                defer_sample(r, instance.executor->logits(1), 0, ops::kSamplePurposeDecode);
+                continue;
+            }
+            const SampleRow row = sample_row(r);
+            TokenId token       = 0;
+            runtime::RawTokenLogprob logprob;
+            sample(std::span(&row, 1), ops::kSamplePurposeDecode, std::span(&token, 1),
+                   std::span(&logprob, 1));
+            try {
+                if (!mask_usable(request)) { continue; }
+                const Tensor logits = instance.executor->logits(1);
+                accept(request, token, row.logprobs ? &logprob : nullptr, Draws{.logits = &logits});
+                next_mask(request);
+            } catch (...) { fail(request, std::current_exception()); }
+        }
         if (!batch.empty()) { plain_step(batch); }
         if (!speculative.empty()) { speculative_round(speculative, steps); }
         std::lock_guard lock(stats_mutex);
         stats.decode_rounds += 1;
-        stats.decode_row_rounds += batch.size() + speculative.size();
+        stats.decode_row_rounds += alone.size() + batch.size() + speculative.size();
         stats.decode_seconds_total += seconds(start, Clock::now());
     }
 
@@ -2226,11 +2433,13 @@ struct Gemma4Core::Impl {
             sample(rows, purpose, sampled, logprobs, &source);
             for (std::size_t j = 0; j < group.size(); ++j) {
                 group[j]->awaiting_sample = false;
-                if (purpose == ops::kSamplePurposeDecode && drafts > 0) {
+                if (purpose == ops::kSamplePurposeDecode && drafts > 0 && !group[j]->redrawing) {
                     ++group[j]->speculative.fallback_steps;
                 }
+                group[j]->redrawing = false;
                 try {
-                    accept(group[j], sampled[j], rows[j].logprobs ? &logprobs[j] : nullptr);
+                    accept(group[j], sampled[j], rows[j].logprobs ? &logprobs[j] : nullptr,
+                           Draws{.logits = &source, .column = j, .purpose = purpose});
                     next_mask(group[j]);
                 } catch (...) { fail(group[j], std::current_exception()); }
             }
@@ -2286,7 +2495,9 @@ struct Gemma4Core::Impl {
             if (drafts > 0) { ++now[b]->speculative.fallback_steps; }
             try {
                 if (!mask_usable(now[b])) { continue; }
-                accept(now[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
+                accept(now[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr,
+                       Draws{.logits = source ? &*source : &logits,
+                             .column = source ? b : columns[b]});
                 next_mask(now[b]);
             } catch (...) { fail(now[b], std::current_exception()); }
         }
@@ -2445,6 +2656,7 @@ struct Gemma4Core::Impl {
         for (std::size_t j = 0; j < b; ++j) {
             if (!batch[j]->constrained) { continue; }
             const std::size_t own = std::min<std::size_t>(draft_extents[j], k);
+            allow_rewinds(*batch[j]);
             column_masks[j] = runtime::GrammarMaskJob::start(
                 *batch[j]->output.grammar_state(), mask_words(),
                 std::vector<TokenId>(proposed.begin() + std::ptrdiff_t(j * k),
@@ -2520,6 +2732,9 @@ struct Gemma4Core::Impl {
                                    stream));
         const auto rows_n         = static_cast<std::int32_t>(b);
         const Tensor logits       = executor.logits(static_cast<std::uint32_t>(verified_columns));
+        for (std::size_t j = 0; j < b; ++j) {
+            ban(logits, std::size_t(starts[j]), widths[j], rows[j].ban_token, stream);
+        }
         const auto* device_config = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const Tensor drafted(spec_drafts.p, DType::I32, {static_cast<std::int32_t>(k), rows_n});
         // The tokens' logprob records, from the distributions their columns are drawn from,
@@ -2638,27 +2853,33 @@ struct Gemma4Core::Impl {
                 failed[j] = 1;
             } else {
                 try {
-                    taken = accept(request, run_tokens, records, false);
+                    taken = accept(request, run_tokens, records, false,
+                                   Draws{.logits = &logits, .column = std::size_t(starts[j])});
                 } catch (...) {
                     fail(request, std::current_exception());
                     failed[j] = 1;
                 }
             }
-            // The tokens counted as sampled: those taken, or the first when none was.
-            kept[j] = std::max<std::uint32_t>(taken, 1);
-            if (kept[j] < std::uint32_t(licensed_n) && active(request) && rows[j].counts) {
+            // The tokens counted as sampled: those taken, or the first when none was. A rewind to
+            // a banned word's hold feeds the tokens taken before it and counts only those.
+            const bool rewound = r.words_rewind.has_value();
+            kept[j] = rewound ? taken + 1 : std::max<std::uint32_t>(taken, 1);
+            const std::uint32_t counted = rewound ? taken : kept[j];
+            if (counted < std::uint32_t(licensed_n) && active(request) && rows[j].counts) {
                 // The acceptance counted the whole run; the request keeps only its prefix.
                 const std::size_t at = std::size_t(r.slot) * domain * sizeof(std::int32_t);
                 CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(token_counts.p) + at,
                                            static_cast<const std::byte*>(counts_backup.p) + at,
                                            std::size_t(domain) * sizeof(std::int32_t),
                                            cudaMemcpyDeviceToDevice, stream));
-                const Tensor ids(static_cast<std::int32_t*>(spec_licensed.p) + j * w, DType::I32,
-                                 {static_cast<std::int32_t>(kept[j])});
-                Tensor row_counts(static_cast<std::int32_t*>(token_counts.p) +
-                                      std::size_t(r.slot) * domain,
-                                  DType::I32, {static_cast<std::int32_t>(domain)});
-                ops::increment_token_counts(ids, row_counts, stream);
+                if (counted > 0) {
+                    const Tensor ids(static_cast<std::int32_t*>(spec_licensed.p) + j * w,
+                                     DType::I32, {static_cast<std::int32_t>(counted)});
+                    Tensor row_counts(static_cast<std::int32_t*>(token_counts.p) +
+                                          std::size_t(r.slot) * domain,
+                                      DType::I32, {static_cast<std::int32_t>(domain)});
+                    ops::increment_token_counts(ids, row_counts, stream);
+                }
             }
         }
         executor.commit(sequences, kept);
@@ -2682,8 +2903,12 @@ struct Gemma4Core::Impl {
             r.position += kept[j];
             if (r.stop_rewind) { rewind_to_hold(r); }
             try {
+                if (r.words_rewind) { complete_words_rewind(r); }
                 check_capacity(batch[j]);
-            } catch (...) { fail(batch[j], std::current_exception()); }
+            } catch (...) {
+                fail(batch[j], std::current_exception());
+                continue;
+            }
             if (r.constrained) { next_mask(batch[j]); }
         }
     }
@@ -2912,6 +3137,9 @@ Gemma4Core::make_request(GroupMember& member, std::optional<std::uint32_t>& budg
         throw std::invalid_argument(
             "structured output requires an Engine started with structured_output");
     }
+    if (!options.execution.bad_words.empty() && !impl_->structured_output) {
+        throw std::invalid_argument("bad_words require an Engine started with structured_output");
+    }
     if (pending_deadline == Clock::time_point{}) {
         pending_deadline = submitted + impl_->pending_timeout;
     }
@@ -3009,7 +3237,7 @@ Gemma4Core::make_request(GroupMember& member, std::optional<std::uint32_t>& budg
         impl_->instance.frontend.thinking_control_token_count());
     request->output = impl_->instance.frontend.make_output_session(
         prompt, options.stop, options.output, options.execution.thinking,
-        options.execution.structured_output);
+        options.execution.structured_output, options.execution.bad_words);
     // Strict tool arguments bring a grammar without a structured final format.
     if (request->output.grammar_state() && !impl_->structured_output) {
         throw std::invalid_argument(

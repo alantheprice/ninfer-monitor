@@ -230,6 +230,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         .requested_preserve_thinking = preserve,
         .chat_template_kwargs_json   = kwargs.dump(),
     };
+    result.structured_output_instruction = server.structured_output_instruction;
     // The server's default effort yields to everything the request decides: its own thinking
     // switch, a forced call, and an assistant prefill.
     std::optional<RequestedReasoningEffort> applied = effort;
@@ -419,7 +420,9 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
         };
         input.context_cache.markers.insert(input.context_cache.markers.begin(), automatic);
     }
-    product::apply_structured_output_instruction(input, request.structured_output);
+    if (semantics.structured_output_instruction) {
+        product::apply_structured_output_instruction(input, request.structured_output);
+    }
     return input;
 }
 
@@ -469,6 +472,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
         // path a reached thinking budget uses.
         options.execution.thinking.loop = server.reasoning_loop;
     }
+    options.execution.thinking.answer_now  = request.answer_now;
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.execution.post_thinking_sampling =
         resolve_post_thinking_overrides(request.post_thinking, server);
@@ -484,6 +488,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
             options.execution.post_thinking_sampling->presence_penalty = 0.0F;
         }
     }
+    options.execution.bad_words      = request.bad_words;
     options.execution.logprobs       = request.logprobs;
     options.execution.readout_tokens = request.readout_tokens;
     options.execution.speculative_drafting = request.speculative_drafting;

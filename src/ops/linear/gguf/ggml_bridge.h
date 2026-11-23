@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops::gguf {
 
@@ -118,6 +119,20 @@ struct VectorQ6KMmaScope {
 
 void vector_product_segments(GgmlType type, int k, int columns, const VectorSegment* segments,
                              int count, cudaStream_t stream);
+
+// One of vector_products' products: `rows` rows of `weight` times `activation` into `out`.
+struct VectorJob {
+    const void* weight     = nullptr;
+    int rows               = 0;
+    const void* activation = nullptr;
+    VectorOutput out;
+};
+inline constexpr int kMaxVectorJobs = 4;
+
+// vector_product for up to kMaxVectorJobs weights of one block type, K and row size in one launch,
+// each with its own activation and output (the products of one layer's input).
+void vector_products(GgmlType type, std::int64_t row_bytes, int k,
+                     std::span<const VectorJob> products, int columns, cudaStream_t stream);
 
 // out[r, c] = act(gate_r . x_c) * (up_r . x_c) where gate row r and up row r are rows r and
 // rows + r of one parent of this type.

@@ -1,5 +1,6 @@
 #include "models/qwen3_5/frontend/output_session.h"
 #include "text/structured_output.h"
+#include "text/bad_words.h"
 #include "models/qwen3_5/frontend/chat_template.h"
 #include "models/qwen3_5/frontend/deepseek_output.h"
 #include "models/qwen3_5/frontend/flint_output.h"
@@ -242,6 +243,9 @@ struct SemanticThinkingState {
     bool loop_detected                 = false;
     std::uint32_t loop_thinking_tokens = 0;
     float loop_coverage                = 0.0F;
+    // The caller's answer-now request closed the reasoning after this many thinking tokens.
+    bool answer_now                          = false;
+    std::uint32_t answer_now_thinking_tokens = 0;
 };
 
 void feed_semantic_thinking(SemanticThinkingState& state, std::string_view bytes) {
@@ -573,6 +577,7 @@ public:
         }
         requested_budget          = thinking.budget;
         early_close_available     = thinking.early_close_available;
+        answer_now                = thinking.answer_now;
         state.in_reasoning        = split_reasoning;
         prefix_execution.tracking = starts_in_reasoning;
         started_in_reasoning      = starts_in_reasoning;
@@ -628,6 +633,17 @@ public:
     // says when it reasons.
     [[nodiscard]] bool model_opens_reasoning() const noexcept { return gemma || flint || inkling; }
 
+    // Whether a token the model writes while its reasoning is open is part of the reasoning's body
+    // (what a thinking budget counts), not a marker that ends or frames it.
+    [[nodiscard]] bool thinking_body(TokenId token) const noexcept {
+        if (inkling) {
+            return token != inkling->end && token != inkling->header && !inkling->content(token);
+        }
+        if (flint) { return token != flint->think_close; }
+        if (gemma) { return token != gemma->channel_close; }
+        return false;
+    }
+
     // The repeated-passage coverage of the committed thinking plus the previewed round's words.
     [[nodiscard]] double loop_coverage(const std::vector<std::uint64_t>& round) const {
         const std::size_t keep =
@@ -675,6 +691,7 @@ public:
     bool started_in_reasoning  = false;
     bool early_close_available = true;
     std::optional<std::uint32_t> requested_budget;
+    std::shared_ptr<AnswerNowSignal> answer_now;
     DecoderState state;
     DecoderState preview_state;
     SemanticThinkingState semantic;
@@ -734,31 +751,183 @@ public:
     }
     bool preview_ready = false;
     std::shared_ptr<text::GrammarState> grammar;
-    std::unique_ptr<text::GrammarState> preview_grammar;
+    std::shared_ptr<text::GrammarState> preview_grammar;
+
+    // The committed session as a separate copy: its own grammar state, no preview.
+    [[nodiscard]] std::unique_ptr<Impl> clone() const {
+        auto copy = std::make_unique<Impl>(*this);
+        copy->preview_grammar.reset();
+        copy->preview_ready = false;
+        copy->preview_output.clear();
+        copy->preview_logprobs.clear();
+        copy->committed_logprobs.clear();
+        if (grammar) { copy->grammar = std::shared_ptr<text::GrammarState>(grammar->fork()); }
+        return copy;
+    }
 };
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
-    : values_(std::move(other.values_)), size_(std::exchange(other.size_, 0)) {}
+    : values_(std::exchange(other.values_, {})) {}
 
 PublishedOutput& PublishedOutput::operator=(PublishedOutput&& other) noexcept {
-    if (this != &other) {
-        values_ = std::move(other.values_);
-        size_   = std::exchange(other.size_, 0);
-    }
+    if (this != &other) { values_ = std::exchange(other.values_, {}); }
     return *this;
 }
 
-void PublishedOutput::clear() noexcept {
-    for (std::size_t index = 0; index < size_; ++index) { values_[index] = {}; }
-    size_ = 0;
+void PublishedOutput::clear() noexcept { values_.clear(); }
+
+void PublishedOutput::push_back(OutputDelta value) { values_.push_back(std::move(value)); }
+
+void PublishedOutput::append(PublishedOutput other) {
+    for (OutputDelta& delta : other.values_) {
+        if (!values_.empty() && values_.back().channel == delta.channel) {
+            values_.back().text += delta.text;
+            values_.back().logprobs.insert(values_.back().logprobs.end(),
+                                           std::make_move_iterator(delta.logprobs.begin()),
+                                           std::make_move_iterator(delta.logprobs.end()));
+        } else {
+            values_.push_back(std::move(delta));
+        }
+    }
 }
 
-void PublishedOutput::push_back(OutputDelta value) {
-    if (size_ == values_.size()) {
-        throw std::logic_error("output decoder produced more than two channel transitions");
+// Banned words (bad_words) with rewinds. A suffix of the generated text that begins a banned word
+// may still become one: from the token where the earliest such suffix begins (the hold), the
+// session publishes nothing, and the request's core keeps the sequence's state before that token
+// and the logits that drew it. A token that completes a word takes the request back there: the
+// session returns to the copy of itself made before the round in which the hold began and replays
+// that round's tokens before the hold, the core restores its state and draws the hold's position
+// again with the dropped token banned there. A suffix that dies releases the held output. Where
+// the core cannot go back (allow_bad_words_rewind), the masks keep out every completing token.
+struct OutputSession::BadWords {
+    using Filter = text::BadWordsFilter;
+    using State  = Filter::State;
+
+    // Rewinds a request may make, and tokens banned at one position, before the masks keep out
+    // every completing token instead.
+    static constexpr std::uint32_t kMaximumRewinds        = 32;
+    static constexpr std::uint32_t kMaximumBansAtPosition = 8;
+
+    // The generated text as the filter reads it: its state, the tokens generated so far (the
+    // model's and control spans), and the byte sizes of the latest tokens since the last token
+    // without text, enough of them to hold the longest word.
+    struct Text {
+        State state             = Filter::kStart;
+        std::uint32_t generated = 0;
+        std::vector<std::uint32_t> recent;
+        std::uint64_t recent_bytes = 0;
+    };
+
+    std::shared_ptr<const Filter> filter;
+    Text text;
+    // The hold: the generated token before which the core keeps the sequence's state, and the
+    // token there now.
+    std::optional<std::uint32_t> hold;
+    TokenId hold_token = -1;
+    // The session as it stood at generated token `snapshot_at` (the first token of the round in
+    // which the hold began, or the hold itself), the text there, and the tokens of that round.
+    std::unique_ptr<Impl> snapshot;
+    Text snapshot_text;
+    std::vector<TokenId> round_tokens;
+    std::vector<runtime::RawTokenLogprob> round_logprobs;
+    std::uint32_t round_budget = 0;
+    FinishReason round_limit   = FinishReason::OutputLimit;
+    // What the rounds since the hold began published, held back until it ends.
+    PublishedOutput withheld;
+    std::vector<TokenLogprob> withheld_logprobs;
+    // Whether the core can go back, the rewinds made, the first generated token from which a hold
+    // may begin (the core kept no state before it), and the tokens banned at `ban_position`.
+    bool core_allows = false;
+    std::uint32_t rewinds = 0;
+    std::uint32_t floor   = 0;
+    std::optional<std::uint32_t> ban_position;
+    std::uint32_t bans = 0;
+
+    // What commit_preview applies.
+    struct Pending {
+        Text text;
+        std::optional<std::uint32_t> hold;
+        TokenId hold_token = -1;
+        // A new snapshot (the session before this round), with this round's tokens.
+        std::unique_ptr<Impl> snapshot;
+        Text snapshot_text;
+        std::vector<TokenId> round_tokens;
+        std::vector<runtime::RawTokenLogprob> round_logprobs;
+        std::uint32_t round_budget = 0;
+        FinishReason round_limit   = FinishReason::OutputLimit;
+        bool drop_snapshot         = false;
+        // This round's output is held back; otherwise the held output is published with it.
+        // `release_withheld`: the hold moved into this round, so the output held back before it
+        // is published now and this round's is held back.
+        bool withhold         = false;
+        bool release_withheld = false;
+        // A rewind to `ban_position`, which bans `ban_token` there (and every completing token
+        // with `ban_completions`); a replay published `replay` first.
+        bool rewound = false;
+        std::uint32_t ban_position = 0;
+        TokenId ban_token          = -1;
+        bool ban_completions       = false;
+        bool replayed              = false;
+        PublishedOutput replay;
+        std::vector<TokenLogprob> replay_logprobs;
+    };
+    Pending pending;
+    bool pending_ready = false;
+
+    void advance(Text& at, std::span<const TokenId> tokens) const {
+        for (const TokenId token : tokens) {
+            const std::size_t bytes = filter->token_bytes(token);
+            const auto next         = filter->advance(at.state, token);
+            if (!next) {
+                throw std::logic_error("banned-word text advanced over a completed word");
+            }
+            ++at.generated;
+            if (bytes == 0) {
+                at.state = Filter::kStart;
+                at.recent.clear();
+                at.recent_bytes = 0;
+                continue;
+            }
+            at.state = *next;
+            at.recent.push_back(static_cast<std::uint32_t>(bytes));
+            at.recent_bytes += bytes;
+            while (at.recent.size() > 1 &&
+                   at.recent_bytes - at.recent.front() >= text::kMaximumBadWordBytes) {
+                at.recent_bytes -= at.recent.front();
+                at.recent.erase(at.recent.begin());
+            }
+        }
     }
-    values_[size_++] = std::move(value);
-}
+
+    // The generated token in which the text's longest suffix that begins a word starts.
+    [[nodiscard]] std::optional<std::uint32_t> live_start(const Text& at) const {
+        const std::uint32_t depth = filter->depth(at.state);
+        if (depth == 0) { return std::nullopt; }
+        std::uint64_t bytes = 0;
+        for (std::size_t back = 0; back < at.recent.size(); ++back) {
+            bytes += at.recent[at.recent.size() - 1 - back];
+            if (bytes >= depth) {
+                return at.generated - static_cast<std::uint32_t>(back + 1);
+            }
+        }
+        throw std::logic_error("banned-word suffix is longer than the text kept for it");
+    }
+
+    // Whether a completed word may take the output back: the core can, the request has rewinds
+    // left, and the position it holds has bans left.
+    [[nodiscard]] bool rewinds_left() const noexcept {
+        return core_allows && rewinds < kMaximumRewinds &&
+               !(hold && ban_position == hold && bans >= kMaximumBansAtPosition);
+    }
+
+    // Whether the masks keep out every completing token: no rewind is possible for the text's
+    // live suffix.
+    [[nodiscard]] bool completions_banned() const {
+        if (!rewinds_left()) { return true; }
+        const auto live = live_start(text);
+        return live && *live < floor && !hold;
+    }
+};
 
 OutputSession::OutputSession() noexcept                           = default;
 OutputSession::~OutputSession()                                   = default;
@@ -774,18 +943,28 @@ OutputSession::OutputSession(
     std::shared_ptr<const frontend::GemmaMarkers> gemma,
     std::shared_ptr<const frontend::FlintMarkers> flint,
     std::shared_ptr<const frontend::DeepSeekMarkers> deepseek,
-    std::shared_ptr<const frontend::InklingMarkers> inkling)
+    std::shared_ptr<const frontend::InklingMarkers> inkling,
+    std::shared_ptr<const text::BadWordsFilter> bad_words)
     : impl_(std::make_unique<Impl>(std::move(tokenizer), std::move(policy), output,
                                    starts_in_reasoning, thinking,
                                    std::move(thinking_control_tokens), std::move(tool_call_output),
                                    std::move(gemma), std::move(flint), std::move(deepseek),
                                    std::move(inkling))) {
-    impl_->grammar              = std::move(grammar);
-    impl_->state.exact_close    = impl_->grammar != nullptr;
-    impl_->semantic.exact_close = impl_->grammar != nullptr;
+    impl_->grammar = std::move(grammar);
+    // Banned words alone leave the output's structure as it is without them.
+    const bool grammar_constrains = impl_->grammar && impl_->grammar->has_grammar();
+    impl_->state.exact_close      = grammar_constrains;
+    impl_->semantic.exact_close   = grammar_constrains;
     // A grammar admits the stop token only after the thinking closes, so a constrained turn
     // cannot end inside it.
-    if (impl_->grammar) { impl_->collect_open_reasoning = false; }
+    if (grammar_constrains) { impl_->collect_open_reasoning = false; }
+    if (bad_words) {
+        if (!impl_->grammar) {
+            throw std::logic_error("banned words need the request's grammar state for their masks");
+        }
+        bad_words_         = std::make_unique<BadWords>();
+        bad_words_->filter = std::move(bad_words);
+    }
 }
 
 std::shared_ptr<text::GrammarState> OutputSession::grammar_state() const {
@@ -793,9 +972,9 @@ std::shared_ptr<text::GrammarState> OutputSession::grammar_state() const {
 }
 
 runtime::OutputDecision
-OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t total_budget_remaining,
-                             FinishReason limit_reason,
-                             std::span<const runtime::RawTokenLogprob> logprobs) {
+OutputSession::preview_tokens(std::span<const TokenId> tokens, std::uint32_t total_budget_remaining,
+                              FinishReason limit_reason,
+                              std::span<const runtime::RawTokenLogprob> logprobs) {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     if (!logprobs.empty() && logprobs.size() != tokens.size()) {
         throw std::invalid_argument("logprob records do not align with the generated-token round");
@@ -885,10 +1064,7 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         const bool presentation_held = holds_presentation_close(impl_->preview_state);
         if (impl_->preview_state.in_reasoning) {
             ++impl_->preview_state.reasoning_tokens;
-            if (impl_->inkling && token != impl_->inkling->end && token != impl_->inkling->header &&
-                !impl_->inkling->content(token)) {
-                ++impl_->preview_semantic.model_thinking_tokens;
-            }
+            if (impl_->thinking_body(token)) { ++impl_->preview_semantic.model_thinking_tokens; }
         }
         SemanticThinkingState& thinking = impl_->preview_semantic;
         // DeepSeek's </think> token closes its reasoning whatever follows it; a line break after
@@ -1027,10 +1203,12 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         }
         count_fed_token(impl_->preview_state);
         release_logprobs(impl_->preview_state, impl_->preview_logprobs);
-        // Enforce Inkling's thinking budget per token so a speculative span starting outside
-        // reasoning (e.g. in a header) cannot cross <|content_thinking|>, exceed the budget, or
-        // open and close an entire thinking block within one round.
-        if (impl_->inkling && impl_->early_close_available && impl_->preview_state.in_reasoning &&
+        // Enforce the thinking budget of reasoning the model opens itself (Inkling's thinking
+        // blocks, Flint's <think>, Gemma's thought channel) per token, so a speculative span
+        // starting outside reasoning cannot cross the opener, exceed the budget, or open and close
+        // a whole reasoning block within one round.
+        if (impl_->model_opens_reasoning() && impl_->early_close_available &&
+            impl_->preview_state.in_reasoning &&
             !impl_->preview_semantic.applied && impl_->preview_semantic.budget &&
             impl_->preview_semantic.model_thinking_tokens >= *impl_->preview_semantic.budget) {
             const std::uint64_t control =
@@ -1067,14 +1245,32 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
     }
     // Reasoning-loop guard: once per kLoopCheckTokens thinking tokens, at the end of a round. Gemma
-    // and Flint count the tokens of the reasoning they opened; they have no early-close control,
-    // so they stop. A held close marker defers the check to the next round, which resolves it.
+    // and Flint count the tokens of the reasoning they opened. A held close marker defers the check
+    // to the next round, which resolves it.
     SemanticThinkingState& semantic     = impl_->preview_semantic;
     const std::uint32_t thinking_tokens = impl_->inkling
                                               ? semantic.model_thinking_tokens
                                               : impl_->model_opens_reasoning()
                                                     ? impl_->preview_state.reasoning_tokens
                                                     : semantic.model_thinking_tokens;
+    // Answer now: a caller's request closes the open reasoning at the end of this round with the
+    // control span a reached budget injects. Without room for the span and one more token, or
+    // without a close control, the reply keeps reasoning. A held close marker defers it to the
+    // next round, which resolves the marker.
+    if (impl_->answer_now && impl_->answer_now->requested() && impl_->early_close_available &&
+        !semantic.applied && !semantic.answer_now &&
+        impl_->loop_reasoning(impl_->preview_state, semantic) && !holds_semantic_close(semantic)) {
+        const std::uint64_t control =
+            impl_->thinking_control_tokens ? impl_->thinking_control_tokens->size() : 0U;
+        const std::uint64_t remaining = total_budget_remaining - count;
+        if (control > 0 && remaining >= control + 1U) {
+            semantic.answer_now                 = true;
+            semantic.answer_now_thinking_tokens = thinking_tokens;
+            semantic.control_pending            = true;
+            return complete(count, FinishReason::None,
+                            runtime::ContinuationAction::ApplyTargetControl);
+        }
+    }
     if (semantic.loop != ReasoningLoopAction::Off &&
         impl_->loop_reasoning(impl_->preview_state, semantic) && !semantic.applied &&
         !semantic.loop_detected && !holds_semantic_close(semantic) &&
@@ -1109,6 +1305,239 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
     return complete(count, FinishReason::None);
 }
 
+void OutputSession::preview_nothing() {
+    impl_->preview_state            = impl_->state;
+    impl_->preview_semantic         = impl_->semantic;
+    impl_->preview_prefix_execution = impl_->prefix_execution;
+    impl_->preview_execution_split_after.reset();
+    impl_->preview_output.clear();
+    impl_->preview_logprobs.clear();
+    impl_->preview_grammar.reset();
+    impl_->preview_finish_reason = FinishReason::None;
+    impl_->preview_ready         = true;
+}
+
+runtime::OutputDecision
+OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t total_budget_remaining,
+                             FinishReason limit_reason,
+                             std::span<const runtime::RawTokenLogprob> logprobs) {
+    if (!bad_words_) {
+        return preview_tokens(tokens, total_budget_remaining, limit_reason, logprobs);
+    }
+    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
+    if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
+    if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
+    if (tokens.empty()) {
+        throw std::invalid_argument("cannot preview an empty generated-token round");
+    }
+    if (!logprobs.empty() && logprobs.size() != tokens.size()) {
+        throw std::invalid_argument("logprob records do not align with the generated-token round");
+    }
+    BadWords& words              = *bad_words_;
+    const BadWords::Filter& filter = *words.filter;
+    words.pending                = {};
+    words.pending_ready          = true;
+    BadWords::Pending& pending   = words.pending;
+    const std::uint32_t first    = words.text.generated;
+    const auto prefix_logprobs   = [&](std::size_t count) {
+        return logprobs.empty() ? logprobs : logprobs.first(count);
+    };
+
+    // The first token that completes a word, and where the live suffix began before it.
+    BadWords::Text scan = words.text;
+    std::optional<std::size_t> completion;
+    std::optional<std::uint32_t> live_before;
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        if (!filter.advance(scan.state, tokens[index])) {
+            completion  = index;
+            live_before = words.live_start(scan);
+            break;
+        }
+        words.advance(scan, tokens.subspan(index, 1));
+    }
+
+    if (completion) {
+        const std::uint32_t completes = first + static_cast<std::uint32_t>(*completion);
+        if (!words.core_allows) {
+            // The masks kept every completing token out: the core sampled outside them.
+            words.pending_ready = false;
+            throw text::GrammarViolation("generated token " + std::to_string(tokens[*completion]) +
+                                         " completes a banned word (bad_words)");
+        }
+        const bool rewinds            = words.rewinds_left();
+        // The completed word began in this round, after the hold or with none: the output goes
+        // back to where it began, within the round.
+        const bool in_round = rewinds && live_before && *live_before >= first &&
+                              *live_before >= words.floor &&
+                              (!words.hold || *live_before > *words.hold);
+        // Back to the hold of an earlier round: the session returns to its copy from before the
+        // round in which the hold began and replays that round's tokens before the hold. A replay
+        // that would end the turn or apply a control span falls back to banning the completing
+        // token where it stands.
+        if (!in_round && rewinds && words.hold && *words.hold < first && words.snapshot) {
+            const std::uint32_t hold = *words.hold;
+            const std::size_t replay = hold - words.snapshot_text.generated;
+            std::unique_ptr<Impl> scratch = words.snapshot->clone();
+            std::swap(impl_, scratch);
+            bool replayed = true;
+            PublishedOutput output;
+            std::vector<TokenLogprob> records;
+            if (replay > 0) {
+                try {
+                    const std::span<const TokenId> round(words.round_tokens);
+                    const std::span<const runtime::RawTokenLogprob> round_logprobs(
+                        words.round_logprobs);
+                    const runtime::OutputDecision decision = preview_tokens(
+                        round.first(replay), words.round_budget, words.round_limit,
+                        round_logprobs.empty() ? round_logprobs : round_logprobs.first(replay));
+                    replayed = !decision.finished() &&
+                               decision.continuation == runtime::ContinuationAction::Decode &&
+                               decision.accepted_tokens == replay;
+                    if (replayed) {
+                        output  = commit_tokens();
+                        records = std::exchange(impl_->committed_logprobs, {});
+                    }
+                } catch (const std::exception&) {
+                    replayed = false;
+                }
+            }
+            if (replayed) {
+                // The live grammar object, which the core's mask jobs hold, takes the replayed
+                // state.
+                if (scratch->grammar) {
+                    *scratch->grammar = std::move(*impl_->grammar);
+                    impl_->grammar    = scratch->grammar;
+                }
+                scratch.reset();
+                preview_nothing();
+                pending.text = words.snapshot_text;
+                words.advance(pending.text,
+                              std::span<const TokenId>(words.round_tokens).first(replay));
+                pending.hold            = hold;
+                pending.hold_token      = -1;
+                pending.rewound         = true;
+                pending.ban_position    = hold;
+                pending.ban_token       = words.hold_token;
+                pending.replayed        = true;
+                pending.replay          = std::move(output);
+                pending.replay_logprobs = std::move(records);
+                return runtime::OutputDecision{.bad_words_hold_alive = true,
+                                               .bad_words_rewind     = hold};
+            }
+            std::swap(impl_, scratch);
+        }
+        // Back within this round: to the hold when it is this round's first token, to where the
+        // completed word's suffix began, or to the completing token itself with every completing
+        // token banned there (no rewind possible, or the replay fell back).
+        std::uint32_t target    = completes;
+        bool ban_completions    = true;
+        if (in_round) {
+            target          = *live_before;
+            ban_completions = false;
+        } else if (rewinds && words.hold && *words.hold >= first) {
+            target          = *words.hold;
+            ban_completions = false;
+        }
+        const std::size_t kept = target - first;
+        runtime::OutputDecision decision;
+        if (kept > 0) {
+            decision = preview_tokens(tokens.first(kept), total_budget_remaining, limit_reason,
+                                      prefix_logprobs(kept));
+            if (decision.finished() ||
+                decision.continuation != runtime::ContinuationAction::Decode ||
+                decision.accepted_tokens != kept) {
+                // The turn ends, or a control span follows, before the word's first token.
+                pending.text = words.text;
+                words.advance(pending.text, tokens.first(decision.accepted_tokens));
+                pending.drop_snapshot = true;
+                return decision;
+            }
+        } else {
+            preview_nothing();
+        }
+        pending.text = words.text;
+        words.advance(pending.text, tokens.first(kept));
+        pending.hold            = target;
+        pending.hold_token      = -1;
+        pending.drop_snapshot   = true;
+        pending.rewound         = true;
+        pending.ban_position    = target;
+        pending.ban_token       = tokens[kept];
+        pending.ban_completions = ban_completions;
+        decision.bad_words_hold_after = static_cast<std::uint32_t>(kept);
+        decision.bad_words_hold_alive = true;
+        decision.bad_words_rewind     = target;
+        return decision;
+    }
+
+    // No word completed. A hold that the core can return to begins at the live suffix when none
+    // is kept yet, and moves to it when the suffix now begins in this round, after the kept hold
+    // (the suffix that began there died); the session before this round is then its snapshot.
+    const bool new_snapshot_possible = words.rewinds_left();
+    const auto moves_to = [&](const std::optional<std::uint32_t>& live) {
+        return words.hold && live && *live >= first && *live > *words.hold && *live >= words.floor;
+    };
+    bool may_move = false;
+    if (new_snapshot_possible && words.hold && words.snapshot) {
+        BadWords::Text probe = words.text;
+        words.advance(probe, tokens);
+        may_move = moves_to(words.live_start(probe));
+    }
+    std::unique_ptr<Impl> before;
+    if (new_snapshot_possible && (!words.hold || !words.snapshot || may_move)) {
+        before = impl_->clone();
+    }
+    runtime::OutputDecision decision =
+        preview_tokens(tokens, total_budget_remaining, limit_reason, logprobs);
+    const std::size_t accepted = decision.accepted_tokens;
+    pending.text               = words.text;
+    words.advance(pending.text, tokens.first(accepted));
+    const auto live = words.live_start(pending.text);
+    if (decision.finished() || decision.continuation != runtime::ContinuationAction::Decode ||
+        !live || !new_snapshot_possible) {
+        // The turn ends, a control span follows, nothing may begin a word, or the core cannot
+        // go back: nothing is held.
+        pending.drop_snapshot = true;
+        return decision;
+    }
+    const bool moved = moves_to(live) && before != nullptr;
+    if (words.hold && !moved) {
+        // A kept hold stays when the suffix began in an earlier round: a rewind goes back to
+        // where the core kept its state.
+        pending.hold       = words.hold;
+        pending.hold_token = words.hold_token;
+        if (*words.hold >= first) { pending.hold_token = tokens[*words.hold - first]; }
+    } else if (moved) {
+        // The output withheld since the kept hold is final: it is published with this round.
+        pending.hold                  = *live;
+        pending.hold_token            = tokens[*live - first];
+        pending.release_withheld      = true;
+        decision.bad_words_hold_after = *live - first;
+    } else if (*live >= first && *live >= words.floor) {
+        pending.hold                  = *live;
+        pending.hold_token            = tokens[*live - first];
+        decision.bad_words_hold_after = *live - first;
+    } else {
+        // The suffix began where the core kept no state (before it allowed rewinds): the masks
+        // keep its completion out (completions_banned) and nothing is held.
+        pending.drop_snapshot = true;
+        return decision;
+    }
+    if (!words.snapshot || moved) {
+        pending.snapshot       = std::move(before);
+        pending.snapshot_text  = words.text;
+        pending.round_tokens.assign(tokens.begin(), tokens.begin() + accepted);
+        if (!logprobs.empty()) {
+            pending.round_logprobs.assign(logprobs.begin(), logprobs.begin() + accepted);
+        }
+        pending.round_budget = total_budget_remaining;
+        pending.round_limit  = limit_reason;
+    }
+    pending.withhold              = true;
+    decision.bad_words_hold_alive = true;
+    return decision;
+}
+
 std::uint32_t
 OutputSession::model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept {
     // A pending control span (a reached budget's or the loop guard's) licenses no model token.
@@ -1117,7 +1546,7 @@ OutputSession::model_token_budget_remaining(std::uint32_t total_budget_remaining
         !impl_->early_close_available) {
         return total_budget_remaining;
     }
-    if (impl_->inkling) {
+    if (impl_->model_opens_reasoning()) {
         if (!impl_->state.in_reasoning) { return total_budget_remaining; }
         if (impl_->semantic.model_thinking_tokens >= *impl_->semantic.budget) { return 0; }
         return std::min(total_budget_remaining,
@@ -1145,7 +1574,7 @@ std::uint32_t OutputSession::control_suffix_tokens() const noexcept {
         return 0;
     }
     const bool active_reasoning =
-        impl_->inkling ? impl_->state.in_reasoning : impl_->semantic.in_reasoning;
+        impl_->model_opens_reasoning() ? impl_->state.in_reasoning : impl_->semantic.in_reasoning;
     return impl_->semantic.control_pending || active_reasoning
                ? static_cast<std::uint32_t>(impl_->thinking_control_tokens->size())
                : 0U;
@@ -1163,6 +1592,18 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     }
     if (tokens.size() > total_budget_remaining) {
         throw std::invalid_argument("thinking control span exceeds the remaining output budget");
+    }
+    if (bad_words_) {
+        // A control span ends the text a word may span: nothing is held across it.
+        BadWords& words              = *bad_words_;
+        words.pending                = {};
+        words.pending_ready          = true;
+        words.pending.text           = words.text;
+        words.pending.text.state     = text::BadWordsFilter::kStart;
+        words.pending.text.recent.clear();
+        words.pending.text.recent_bytes = 0;
+        words.pending.text.generated += static_cast<std::uint32_t>(tokens.size());
+        words.pending.drop_snapshot  = true;
     }
 
     impl_->preview_state            = impl_->state;
@@ -1190,6 +1631,20 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
             count_fed_token(impl_->preview_state);
             continue;
         }
+        if (impl_->flint || impl_->gemma) {
+            // The guidance is reasoning; the close marker followed by a line break closes the
+            // channel, as the model's own close does.
+            const TokenId close =
+                impl_->flint ? impl_->flint->think_close : impl_->gemma->channel_close;
+            const std::string_view presentation_bytes =
+                token == close && impl_->preview_state.in_reasoning ? std::string_view("</think>\n")
+                : !impl_->preserve_special && decoded.special       ? std::string_view{}
+                                                                    : decoded.bytes;
+            feed_token_bytes(impl_->preview_state, presentation_bytes, impl_->policy,
+                             impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
+            count_fed_token(impl_->preview_state);
+            continue;
+        }
         // DeepSeek's </think> token closes its reasoning whatever follows it, as in its own output.
         const bool deepseek_close = impl_->deepseek && token == impl_->deepseek->think_close;
         const std::string_view thinking_bytes =
@@ -1207,7 +1662,8 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     if (impl_->preview_semantic.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the thinking phase");
     }
-    if ((impl_->split_reasoning || impl_->inkling) && impl_->preview_state.in_reasoning) {
+    if ((impl_->split_reasoning || impl_->model_opens_reasoning()) &&
+        impl_->preview_state.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the reasoning channel");
     }
     impl_->preview_semantic.control_pending = false;
@@ -1234,6 +1690,12 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
         reason == FinishReason::StopToken) {
         throw std::invalid_argument("invalid between-round terminal decoder reason");
     }
+    if (bad_words_) {
+        bad_words_->pending               = {};
+        bad_words_->pending_ready         = true;
+        bad_words_->pending.text          = bad_words_->text;
+        bad_words_->pending.drop_snapshot = true;
+    }
     impl_->preview_state            = impl_->state;
     impl_->preview_semantic         = impl_->semantic;
     impl_->preview_prefix_execution = impl_->prefix_execution;
@@ -1250,6 +1712,90 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
 }
 
 PublishedOutput OutputSession::commit_preview() {
+    if (!bad_words_) { return commit_tokens(); }
+    BadWords& words = *bad_words_;
+    if (!words.pending_ready) { std::terminate(); }
+    BadWords::Pending pending = std::move(words.pending);
+    words.pending             = {};
+    words.pending_ready       = false;
+    PublishedOutput output    = commit_tokens();
+    std::vector<TokenLogprob> records = std::exchange(impl_->committed_logprobs, {});
+    if (pending.replayed) {
+        // The rounds since the hold began are gone; the replay published its round's tokens
+        // before the hold.
+        words.withheld.clear();
+        words.withheld_logprobs.clear();
+        PublishedOutput replay = std::move(pending.replay);
+        replay.append(std::move(output));
+        output = std::move(replay);
+        records.insert(records.begin(), std::make_move_iterator(pending.replay_logprobs.begin()),
+                       std::make_move_iterator(pending.replay_logprobs.end()));
+    }
+    if (pending.rewound) {
+        ++words.rewinds;
+        if (words.ban_position != pending.ban_position) {
+            words.ban_position = pending.ban_position;
+            words.bans         = 0;
+        }
+        ++words.bans;
+        impl_->grammar->ban_at(pending.ban_position,
+                               std::span<const TokenId>(&pending.ban_token, 1),
+                               pending.ban_completions);
+    }
+    words.text       = std::move(pending.text);
+    words.hold       = pending.hold;
+    words.hold_token = pending.hold_token;
+    if (pending.drop_snapshot || !words.hold) { words.snapshot.reset(); }
+    if (pending.snapshot && words.hold) {
+        words.snapshot       = std::move(pending.snapshot);
+        words.snapshot_text  = std::move(pending.snapshot_text);
+        words.round_tokens   = std::move(pending.round_tokens);
+        words.round_logprobs = std::move(pending.round_logprobs);
+        words.round_budget   = pending.round_budget;
+        words.round_limit    = pending.round_limit;
+    }
+    if (pending.withhold && words.hold && !impl_->state.terminal) {
+        PublishedOutput released;
+        if (pending.release_withheld) {
+            released                  = std::exchange(words.withheld, {});
+            impl_->committed_logprobs = std::exchange(words.withheld_logprobs, {});
+        }
+        words.withheld.append(std::move(output));
+        words.withheld_logprobs.insert(words.withheld_logprobs.end(),
+                                       std::make_move_iterator(records.begin()),
+                                       std::make_move_iterator(records.end()));
+        output = std::move(released);
+    } else {
+        PublishedOutput all = std::exchange(words.withheld, {});
+        all.append(std::move(output));
+        output = std::move(all);
+        std::vector<TokenLogprob> released = std::exchange(words.withheld_logprobs, {});
+        released.insert(released.end(), std::make_move_iterator(records.begin()),
+                        std::make_move_iterator(records.end()));
+        impl_->committed_logprobs = std::move(released);
+    }
+    impl_->grammar->ban_completions(words.completions_banned());
+    return output;
+}
+
+void OutputSession::allow_bad_words_rewind(bool allowed) {
+    if (!bad_words_) { return; }
+    BadWords& words = *bad_words_;
+    if (words.pending_ready) {
+        throw std::logic_error("banned-word rewinds change between rounds only");
+    }
+    if (allowed && !words.core_allows) { words.floor = words.text.generated; }
+    words.core_allows = allowed;
+    if (!allowed) {
+        // The core keeps no state to return to: nothing is held from here, and what was held is
+        // published with the next round.
+        words.hold.reset();
+        words.snapshot.reset();
+    }
+    impl_->grammar->ban_completions(words.completions_banned());
+}
+
+PublishedOutput OutputSession::commit_tokens() {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     if (impl_->preview_grammar) {
         *impl_->grammar = std::move(*impl_->preview_grammar);
@@ -1267,6 +1813,10 @@ PublishedOutput OutputSession::commit_preview() {
     impl_->preview_ready = false;
 
     for (OutputDelta& delta : output) {
+        // The first answer byte ends the window in which a caller may still ask to answer now.
+        if (impl_->answer_now && delta.channel == OutputChannel::Content && !delta.text.empty()) {
+            impl_->answer_now->mark_answering();
+        }
         if (delta.channel == OutputChannel::Content) {
             delta.text = impl_->gemma_tools      ? impl_->gemma_tools->feed(delta.text)
                          : impl_->flint_tools    ? impl_->flint_tools->feed(delta.text)
@@ -1353,11 +1903,14 @@ bool OutputSession::reasoning_closed() const noexcept {
 }
 
 std::optional<TokenId> OutputSession::banned_token() const noexcept {
-    if (impl_ == nullptr || !impl_->inkling || !impl_->semantic.applied) { return std::nullopt; }
-    // Keep <|content_thinking|> banned (and speculation disabled) for the remainder of an
-    // early-closed response so a multi-token speculative span cannot close a text/tool block,
-    // traverse a header, and re-open thinking unmasked.
-    return impl_->inkling->thinking;
+    if (impl_ == nullptr || !impl_->semantic.applied) { return std::nullopt; }
+    // Keep the reasoning opener (<|content_thinking|>, <think>, <|channel>) banned (and
+    // speculation disabled) for the remainder of an early-closed response so a multi-token
+    // speculative span cannot close a block, traverse a header, and re-open thinking unmasked.
+    if (impl_->inkling) { return impl_->inkling->thinking; }
+    if (impl_->flint) { return impl_->flint->think_open; }
+    if (impl_->gemma) { return impl_->gemma->channel_open; }
+    return std::nullopt;
 }
 
 ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
@@ -1372,6 +1925,8 @@ ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
         .loop_detected         = impl_->semantic.loop_detected,
         .loop_thinking_tokens  = impl_->semantic.loop_thinking_tokens,
         .loop_coverage         = impl_->semantic.loop_coverage,
+        .answer_now            = impl_->semantic.answer_now,
+        .answer_now_thinking_tokens = impl_->semantic.answer_now_thinking_tokens,
     };
 }
 

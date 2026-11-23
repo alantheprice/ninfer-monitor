@@ -1,5 +1,6 @@
 #pragma once
 
+#include "serve/answer_now.h"
 #include "serve/console_stats.h"
 #include "serve/generation_service.h"
 #include "serve/load_report.h"
@@ -22,6 +23,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <map>
 #include <memory>
@@ -85,6 +87,13 @@ public:
     // running requests then fail, so listen() returns within about one unit of Engine work.
     // Does not block; callable from any thread.
     void stop();
+
+    // Registers the graceful-stop hook for POST /shutdown, which is only reachable when
+    // --admin-token is set: the handler answers 202 and then invokes the hook. main.cpp wires
+    // the Terminate dispatch so the request takes exactly the Ctrl+Break path (listener close,
+    // requests cancelled, prefix cache saved, exit). The hook must not block; the stop outlives
+    // this HTTP response.
+    void on_shutdown(std::function<void()> handler) { shutdown_handler_ = std::move(handler); }
 
     // Serve 503 while the Engine is still loading.
     //
@@ -160,11 +169,18 @@ private:
     void handle_response_delete(const httplib::Request& req, httplib::Response& res);
     void handle_response_input_items(const httplib::Request& req, httplib::Response& res);
     void handle_response_cancel(const httplib::Request& req, httplib::Response& res);
+    void handle_answer_now(const httplib::Request& req, httplib::Response& res);
+    // A chat reply's answer-now signal, given before preparation, and its enrollment under the
+    // response's request id once the reply is submitted.
+    static void offer_answer_now(GenerationRequest& generation);
+    void enroll_answer_now(PreparedRequest& prepared, const GenerationRequest& generation,
+                           const httplib::Response& res);
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_load(const httplib::Request& req, httplib::Response& res) const;
     void handle_metrics(const httplib::Request& req, httplib::Response& res) const;
     void handle_stats(const httplib::Request& req, httplib::Response& res) const;
     void handle_health(httplib::Response& res) const;
+    void handle_shutdown(const httplib::Request& req, httplib::Response& res);
     void handle_slots(const httplib::Request& req, httplib::Response& res) const;
     void handle_usage(const httplib::Request& req, httplib::Response& res) const;
     void handle_model_card(const httplib::Request& req, httplib::Response& res) const;
@@ -240,10 +256,14 @@ private:
     // threads, so the publication has to be ordered. Handlers only ever test readiness through
     // ready_; registry_ itself is not read until ready_ has been observed true.
     ModelRegistry* registry_ = nullptr;
+    AnswerNowRegistry answer_now_;
     std::atomic<bool> ready_{false};
     std::thread startup_listener_;
     std::atomic<bool> startup_listener_result_{false};
     ServeOptions options_;
+    // The graceful-stop hook for POST /shutdown; null when --admin-token is unset, in which
+    // case the route is not registered at all.
+    std::function<void()> shutdown_handler_;
     // The one model's id in single-model mode; empty in router mode, where requests name models.
     std::string public_model_id_;
     std::chrono::steady_clock::time_point attached_at_;

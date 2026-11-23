@@ -52,16 +52,21 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   the model continues with the arguments; see [forced selection](serving.md#function-tools)),
   streaming, reasoning in its own channel when thinking is on, and causal scoring
   (`ninfer-perplexity`).
+- **Dependent launches.** On sm_90 and newer cards the decode graph launches each kernel as a
+  programmatic dependent of the one before it
+  ([programmatic dependent launch](maintainer/op-development.md#programmatic-dependent-launch)).
+  Greedy decode with MTP drafts on an RTX 5090 went from 371.1 to 382.7 tok/s with the same tokens.
 - **Prompt chunks without logits.** A chunk before the prompt's last, or before a scoring call's
   first scored position, runs its last block only up to the key/value store: that block's attention
   output, MLP and experts feed only the head. The stored rows are those of the whole block, so
   caches and logits keep their bits.
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on
   with `chat_template_kwargs: {"enable_thinking": true}`, and the reasoning arrives as
-  `reasoning_content`. Gemma has no early-close control, so thinking budgets do not apply (the
-  server refuses `--default-thinking-budget`) and the
-  [reasoning-loop guard](serving.md#openai-chat-completions) stops a looping reply under `conclude`
-  as under `stop`.
+  `reasoning_content`. A thinking budget (`--thinking-budget`, `--default-thinking-budget`, a
+  request's) counts the tokens of the thought channel the model opens; once reached, the engine
+  closes the channel with Qwen's early-close guidance and `<channel|>`, masks `<|channel>` for the
+  rest of the response, and the model answers. `--reasoning-loop conclude` closes it the same way
+  ([Serving](serving.md#openai-chat-completions)).
 - **Sampling defaults.** The release's `generation_config.json` (temperature 1.0, top-p 0.95) with
   top-k held at the sampler's 20 candidates.
 

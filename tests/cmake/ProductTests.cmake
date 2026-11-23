@@ -30,7 +30,7 @@ ninfer_add_test(ninfer_launch_config_test
 
 ninfer_add_test(ninfer_cli_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
-  LIBRARIES ninfer_runtime_support ninfer_product_logging ninfer_product_launch_config)
+  LIBRARIES ninfer_runtime_support ninfer_product_logging ninfer_product_launch_config ninfer_text)
 
 target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 
@@ -101,6 +101,10 @@ ninfer_add_test(ninfer_load_report_test
 ninfer_add_test(ninfer_console_stats_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_console_stats.cpp"
   LIBRARIES ninfer_serve ninfer_product_logging)
+
+ninfer_add_test(ninfer_answer_now_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_answer_now.cpp"
+  LIBRARIES ninfer_serve)
 
 ninfer_add_test(ninfer_stop_control_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_stop_control.cpp"

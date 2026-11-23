@@ -42,6 +42,11 @@ struct ServeOptions {
     // worker of their own (0 = off).
     int stats_port = 0;
     std::string api_key;                          // empty => no auth
+    // --admin-token: the credential of the admin routes, of which POST /shutdown -- the HTTP form
+    // of the Ctrl+Break graceful stop (listener close, requests cancelled, prefix cache saved,
+    // exit) -- is the first. A request must carry the token as a bearer or x-api-key.
+    // Empty => no admin route is registered.
+    std::string admin_token;
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
     // --model-card: a JSON model card served verbatim under model_card on /v1/models/{id} and at
@@ -223,6 +228,9 @@ struct ServeOptions {
     // --unconstrained-response-format: without structured_output, generate a JSON or JSON Schema
     // request unconstrained instead of refusing it, for clients that always send a format.
     bool unconstrained_response_format = false;
+    // --no-structured-output-instruction: a request with a response format keeps its messages as
+    // sent, without the leading format instruction; the token grammar alone enforces the format.
+    bool structured_output_instruction = true;
     // --assistant-prefill: a Chat Completions request whose last message is the assistant's
     // continues that message in place, as /v1/messages always does.
     bool assistant_prefill = false;

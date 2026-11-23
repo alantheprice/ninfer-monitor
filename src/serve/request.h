@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -251,6 +252,9 @@ struct GenerationRequest {
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
     bool stop_strings_apply_to_reasoning = false;
+    // vLLM's bad_words, normalized (ninfer::ExecutionOptions::bad_words; needs
+    // --structured-output).
+    std::vector<std::string> bad_words;
     // Benchmark/serving extension shared with vLLM, SGLang and llama.cpp: suppress the
     // checkpoint's default stop tokens so generation runs to the requested token budget.
     // Caller-supplied stop tokens and stop strings still apply.
@@ -263,6 +267,8 @@ struct GenerationRequest {
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
+    // The client's live answer-now signal (POST /v1/answer_now), or none.
+    std::shared_ptr<ninfer::AnswerNowSignal> answer_now;
     std::string chat_template_kwargs_json;
     // NInfer extension: name of a phantom-kv graft loaded with --graft. Unset => use the server's
     // --default-graft (if any); an empty name explicitly selects no graft.

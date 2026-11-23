@@ -232,6 +232,34 @@ int test_structured_output() {
                           json_prompt.messages.front().parts.back().text.find("raw JSON") !=
                               std::string::npos,
                       "JSON response contract is visible to the model");
+    {
+        // --no-structured-output-instruction keeps the caller's messages, with or without a
+        // leading system message, while the grammar still reaches the Engine.
+        ServeOptions server;
+        server.structured_output_instruction = false;
+        const auto as_sent = [&](const GenerationRequest& request) {
+            return to_prompt_input(request, resolve_prompt_semantics(request, server), {});
+        };
+        const auto user_only = as_sent(generation);
+        failures += check(user_only.messages.size() == 1 &&
+                              user_only.messages.front().role == ninfer::ChatRole::User &&
+                              user_only.messages.front().parts.size() == 1 &&
+                              user_only.messages.front().parts.front().text == "hello",
+                          "--no-structured-output-instruction added a message");
+        auto with_system        = body;
+        with_system["messages"] = Json::array({Json{{"role", "system"}, {"content", "Be brief."}},
+                                               Json{{"role", "user"}, {"content", "hello"}}});
+        const auto system_prompt = as_sent(parse(with_system).generation);
+        failures += check(system_prompt.messages.size() == 2 &&
+                              system_prompt.messages.front().parts.size() == 1 &&
+                              system_prompt.messages.front().parts.front().text == "Be brief.",
+                          "--no-structured-output-instruction changed the system message");
+        failures += check(to_request_options(generation, server,
+                                             resolve_prompt_semantics(generation, server), true)
+                                  .execution.structured_output.kind ==
+                              ninfer::StructuredOutputKind::JsonObject,
+                          "--no-structured-output-instruction dropped the constraint");
+    }
     body["response_format"] = Json{
         {"type", "json_schema"},
         {"json_schema", Json{{"name", "answer"},
@@ -1155,6 +1183,36 @@ int test_reasoning_and_extensions() {
     return failures;
 }
 
+// vLLM's bad_words: normalized into the Engine's options, malformed fields refused on the field,
+// and refused on a server without grammar masks whatever --unconstrained-response-format says.
+int test_bad_words() {
+    int failures      = 0;
+    Json body         = base_request();
+    body["bad_words"] = Json::array({"<message", "  <think", "<message"});
+    const GenerationRequest banned = parse(body).generation;
+    failures += check(banned.bad_words == std::vector<std::string>{"<message", "<think"},
+                      "bad_words lose leading whitespace and duplicates");
+    failures += check(options(banned).execution.bad_words == banned.bad_words,
+                      "bad_words reach the Engine's options");
+    for (const Json& malformed : {Json("<message"), Json::array({"<a", 3}), Json::array({" "}),
+                                  Json::array({std::string(300, 'x')})}) {
+        body["bad_words"]    = malformed;
+        const ApiError error = api_error([&] { (void)parse(body); });
+        failures += check(error.param == "bad_words" && error.code == "invalid_bad_words",
+                          "malformed bad_words refused: " + malformed.dump().substr(0, 40));
+    }
+    body["bad_words"] = nullptr;
+    failures += check(parse(body).generation.bad_words.empty(), "null bad_words ban nothing");
+    const ApiError unavailable =
+        api_error([&] { (void)drop_unavailable_constraints(banned, false, true); });
+    failures += check(unavailable.code == "bad_words_not_supported" &&
+                          unavailable.param == "bad_words",
+                      "bad_words ran unenforced on a server without grammar masks");
+    failures += check(!drop_unavailable_constraints(banned, true, false),
+                      "a server with grammar masks dropped bad_words");
+    return failures;
+}
+
 int test_stops_and_ranges() {
     int failures                            = 0;
     Json body                               = base_request();
@@ -1748,6 +1806,7 @@ int main() {
     failures += test_messages_and_media();
     failures += test_reasoning_and_extensions();
     failures += test_stops_and_ranges();
+    failures += test_bad_words();
     failures += test_aggregate_response();
     failures += test_stream_response();
     failures += test_stream_observations();
