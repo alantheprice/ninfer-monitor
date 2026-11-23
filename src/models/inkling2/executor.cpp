@@ -246,7 +246,10 @@ struct Executor::Impl {
     float eps = 1e-6f;
     KvFormat kvfmt; // the caches' storage: F16, or the quantized full-attention visits of rk8v4/rk4v4
     DeviceBuffer staging_k, staging_v;
-    bool growing = false;
+    // Growing: the full-attention caches are backed as their sequences reach them (any device with
+    // virtual memory management). Elastic: beside an elastic expert cache, which gives way to them;
+    // otherwise growth past the free memory throws KvExhausted and the scheduler preempts.
+    bool growing = false, elastic = false;
     std::vector<KvArea*> sequence_areas;
     std::atomic<std::uint64_t> kv_backed{0};
     std::uint64_t kv_fixed = 0;
@@ -340,7 +343,7 @@ struct Executor::Impl {
         std::size_t free_bytes = 0, total_bytes = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
         const std::size_t need = workspace_bytes + staging_k.bytes + staging_v.bytes + (64u << 20);
-        if (need + kGraphReserve + unbacked() > free_bytes) { return; }
+        if (need + kGraphReserve + growth_reserve() > free_bytes) { return; }
         auto c = std::make_unique<SideContext>();
         int least = 0, greatest = 0;
         CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
@@ -384,8 +387,9 @@ struct Executor::Impl {
         stream = device.stream;
         const int device_id = device.rank(0).device;
         kvfmt = kv_format(o.kv_cache);
-        growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
-                  vmm::granularity(device_id) != 0;
+        const bool vmm_ok = vmm::granularity(device_id) != 0;
+        elastic = !model.expert_banks().empty() && !options.expert_cache_bytes && vmm_ok;
+        growing = elastic || (vmm_ok && !model.expert_parallel());
         hidden      = int(config.hidden_size);
         query_heads = int(config.num_attention_heads);
         kv_heads    = int(config.num_key_value_heads);
@@ -444,10 +448,14 @@ struct Executor::Impl {
                                            plane_bytes(kvfmt.value.coding)) * std::size_t(sequences)
                 : 2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
         {
+            // Growing caches back the full-attention rows as their sequences reach them: up front
+            // only one sequence's whole context has to fit (growth_reserve).
+            const std::size_t full_owners = growing ? 1 : std::size_t(sequences);
             std::size_t needed = 0;
             for (const auto& [layer, pass] : schedule) {
                 needed += config.full_attention[layer]
-                              ? std::size_t(global_slots) * full_slot_bytes
+                              ? std::size_t(global_slots) * full_slot_bytes /
+                                    std::size_t(sequences) * full_owners
                               : (options.checkpoints ? 2 : 1) * std::size_t(ring) *
                                     2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
             }
@@ -599,7 +607,7 @@ struct Executor::Impl {
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-            if (workspace_bytes + kGraphReserve + unbacked() > free_bytes) {
+            if (workspace_bytes + kGraphReserve + growth_reserve() > free_bytes) {
                 throw InsufficientMemory(
                     "Inkling 2: the workspace of " + std::to_string(workspace_bytes >> 20) +
                     " MiB and " + std::to_string(kGraphReserve >> 20) +
@@ -1366,17 +1374,17 @@ struct Executor::Impl {
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         const auto cache = options.expert_cache_bytes.value_or(0);
-        if (bank + metadata + cache + unbacked() + kGraphReserve > free) {
+        if (bank + metadata + cache + growth_reserve() + kGraphReserve > free) {
             throw InsufficientMemory("Inkling 2: expert delivery needs " +
                 std::to_string((bank + metadata + cache) >> 20) + " MiB beside " +
-                std::to_string(unbacked() >> 20) +
+                std::to_string(growth_reserve() >> 20) +
                 " MiB for the growing caches and the CUDA Graph reserve after workspace allocation");
         }
         ExpertDeliveryOptions transport;
         transport.pair_capacity   = options.prefill_chunk * config.top_k_experts;
         transport.cache_bytes     = options.expert_cache_bytes;
-        transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
-        transport.elastic         = growing;
+        transport.keep_free_bytes = kGraphReserve + (elastic ? kKvHeadroom : 0);
+        transport.elastic         = elastic;
         transport.disk            = options.expert_disk;
         const float dma_share     = options.expert_dma_share.value_or(0.0F);
         if (!(dma_share >= 0 && dma_share <= 1) || options.expert_cpu_threads > 256) {
@@ -1443,6 +1451,32 @@ struct Executor::Impl {
             if (area->region) { bytes += area->region.bytes() - area->region.mapped_bytes(); }
         }
         return bytes;
+    }
+
+    // What later allocations leave free for the growing caches: beside an elastic expert cache all
+    // of them (the cache gives way as they grow); otherwise one sequence at the full context, so a
+    // lone sequence always runs to it (the scheduler preempts the others first).
+    [[nodiscard]] std::size_t growth_reserve() const {
+        if (elastic || sequence_areas.empty()) { return unbacked(); }
+        return unbacked() / std::max<std::size_t>(1, sequence_areas.front()->backed.size());
+    }
+
+    [[nodiscard]] std::size_t growth(std::uint32_t sequence, std::uint32_t end) const {
+        if (!growing) { return 0; }
+        const auto slots = std::uint32_t(round_up(end, 256));
+        std::size_t need = 0;
+        for (const KvArea* area : sequence_areas) { need += missing(*area, sequence, slots); }
+        return need;
+    }
+
+    [[nodiscard]] std::size_t room() const {
+        if (!growing) { return 0; }
+        std::size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        const std::size_t keep = kGraphReserve + kKvHeadroom;
+        std::size_t r = free > keep ? free - keep : 0;
+        if (elastic && delivery) { r += delivery->memory().cache_bytes; }
+        return r;
     }
 
     void count_backed() {
@@ -1513,6 +1547,16 @@ struct Executor::Impl {
         }
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        if (!elastic) {
+            if (free < need + kGraphReserve || !apply()) {
+                count_backed();
+                throw KvExhausted("Inkling 2: no device memory left to grow sequence " +
+                                  std::to_string(sequence) + "'s KV cache to " +
+                                  std::to_string(slots) + " positions");
+            }
+            count_backed();
+            return;
+        }
         if (free < need + kGraphReserve) { delivery->shrink_cache(need + kGraphReserve - free); }
         while (!apply()) {
             if (delivery->shrink_cache(std::max(need, std::size_t(64) << 20)) == 0) {
@@ -1529,7 +1573,7 @@ struct Executor::Impl {
         CUDA_CHECK(ninfer::wait_for_stream(stream));
         for (KvArea* area : sequence_areas) { trim(*area, sequence, 0); }
         count_backed();
-        delivery->grow_cache();
+        if (elastic && delivery) { delivery->grow_cache(); }
     }
 
     std::size_t start_reserve() const {
@@ -3610,6 +3654,18 @@ void Executor::reset(std::uint32_t sequence) {
 
 std::uint32_t Executor::position(std::uint32_t sequence) const {
     return impl_->positions.at(sequence);
+}
+
+std::uint64_t Executor::kv_growth(std::uint32_t sequence, std::uint32_t end) const {
+    return impl_->growth(sequence, end);
+}
+
+std::uint64_t Executor::kv_room() const { return impl_->room(); }
+
+std::uint64_t Executor::kv_sequence_bytes() const noexcept {
+    std::uint64_t bytes = 0;
+    for (const KvArea* area : impl_->sequence_areas) { bytes += area->bytes / std::max<std::size_t>(1, area->backed.size()); }
+    return bytes;
 }
 
 void Executor::warm_up() {

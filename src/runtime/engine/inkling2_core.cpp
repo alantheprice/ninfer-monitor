@@ -71,6 +71,9 @@ bool request_error(const std::exception_ptr& error) {
         std::rethrow_exception(error);
     } catch (const RequestError&) { return true; } catch (const std::invalid_argument&) {
         return true;
+    } catch (const models::inkling2::KvExhausted&) {
+        // A call outgrew the device's room for the KV cache before running anything.
+        return true;
     } catch (const text::GrammarViolation&) {
         // Raised by the output policy before anything of the round is committed.
         return true;
@@ -324,7 +327,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                        executor.sequences, executor.prefill_chunk, kv_name,
                        double(instance->executor->memory().kv_bytes) / 1048576.0,
                        instance->executor->memory().kv_grows
-                           ? " at most, growing with the sequences beside an elastic expert cache"
+                           ? " at most, backed as the sequences grow"
                            : "",
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
     if (model->expert_parallel()) {
@@ -483,6 +486,7 @@ struct Inkling2Core::Request {
     std::mutex mutex;
     std::condition_variable cv;
     std::optional<GenerationStart> stream_start;
+    bool stream_started = false; // stream_start was posted (a requeued request posts it once)
     std::optional<PromptProgress> stream_progress;
     std::vector<std::variant<OutputDelta, GenerationTimingObservation>> events;
     bool response_done = false;
@@ -627,6 +631,11 @@ struct Inkling2Core::Impl {
 
     std::vector<Slot> slots;
     std::uint64_t use_clock                 = 0;
+    // Growing KV caches (room_for): the bytes this step's calls have claimed of the device's room,
+    // and the requests whose growth found none this step.
+    std::uint64_t round_claimed = 0;
+    Clock::time_point engine_progress = Clock::now(); // the last step that ran something
+    std::vector<std::shared_ptr<Request>> stalled;
 
     // The context cache past the sequences (context_image_store.h): images of the prefixes they
     // give up (the state a turn closed at, and where a sequence ended), of shared prefixes and of
@@ -939,6 +948,10 @@ struct Inkling2Core::Impl {
         for (const Slot& slot : slots) {
             const auto request = slot.request;
             if (!request || now - request->progress < kProgressTimeout) { continue; }
+            // A prompt waiting for its turn among other prompts' chunks is not stuck while the
+            // Engine runs those: with several long prompts admitted together the last one's turn
+            // comes after all of theirs, which may take longer than the timeout.
+            if (!request->decoding && now - engine_progress < kProgressTimeout) { continue; }
             fail(request, std::make_exception_ptr(RequestError(
                               RequestErrorKind::Unavailable,
                               "inference request made no progress for " +
@@ -1027,6 +1040,7 @@ struct Inkling2Core::Impl {
                 // can take as long as the whole prompt.
                 if (admit()) { publish_stats(); }
                 worked = step();
+                if (worked) { engine_progress = Clock::now(); }
                 check_progress();
             } catch (...) { fail_engine(std::current_exception()); }
             publish_stats();
@@ -1362,6 +1376,79 @@ struct Inkling2Core::Impl {
     }
 
     // Moves queued requests into free sequences; returns whether a request left the queue.
+    // Whether sequence `s` may grow to position `end` this step: its full-attention rows' growth
+    // fits the device's room beside what the step has claimed, after the idle sequences that hold
+    // a finished request's state, least recently used first, go to the host store and free theirs.
+    bool room_for(std::uint32_t s, std::uint32_t end) {
+        auto& executor = *instance.executor;
+        const std::uint64_t need =
+            executor.kv_growth(s, std::min<std::uint32_t>(end, max_context + 1));
+        if (need == 0) { return true; }
+        for (;;) {
+            if (need + round_claimed <= executor.kv_room()) {
+                round_claimed += need;
+                return true;
+            }
+            std::optional<std::uint32_t> victim;
+            for (std::uint32_t t = 0; t < slots.size(); ++t) {
+                if (t == s || slots[t].request || (side_request && t == side_slot) ||
+                    executor.position(t) == 0) {
+                    continue;
+                }
+                if (!victim || slots[t].last_used < slots[*victim].last_used) { victim = t; }
+            }
+            if (!victim) { return false; }
+            if (*victim == side_slot) { executor.side_join(); }
+            retire(*victim);
+            clear_session(*victim);
+            std::lock_guard lock(stats_mutex);
+            stats.pressure_private_owners_demoted += 1; // device state moved to the host
+        }
+    }
+
+    // The growth the running requests still need: a prompt to its end, and each request's reply
+    // up to kReservedReply more tokens of its output budget (a growing cache backs whole granules,
+    // so a reply's growth comes in steps a running request should not stall on). Admission keeps
+    // it free for them.
+    static constexpr std::uint32_t kReservedReply = 8192;
+    [[nodiscard]] std::uint64_t prefill_reserved() const {
+        std::uint64_t bytes = 0;
+        for (std::uint32_t t = 0; t < slots.size(); ++t) {
+            const Request* r = slots[t].request.get();
+            if (r == nullptr) { continue; }
+            const auto prompt_n = static_cast<std::uint32_t>(r->prompt_tokens.size());
+            const std::uint32_t reply = std::min<std::uint32_t>(
+                kReservedReply,
+                r->budget ? static_cast<std::uint32_t>(std::min<std::uint64_t>(r->budget->remaining(), kReservedReply))
+                          : effective_output_capacity(r->options.execution.requested_output_tokens,
+                                                      max_context, prompt_n));
+            const std::uint32_t from = r->decoding ? instance.executor->position(t) : prompt_n;
+            bytes += instance.executor->kv_growth(t, from + reply);
+        }
+        return bytes;
+    }
+
+    // A request that has not produced a token gives its sequence back and waits at the front of
+    // the queue; what it prefilled goes to the host store, which its next admission resumes from.
+    void requeue(const std::shared_ptr<Request>& request) {
+        Request& r     = *request;
+        auto& executor = *instance.executor;
+        const std::uint32_t s = r.slot;
+        if (side_request == request) { side_request.reset(); }
+        if (s == side_slot) { executor.side_join(); }
+        retire(s);
+        clear_session(s);
+        slots[s].request = nullptr;
+        r.prefilled = r.reused = 0;
+        r.deadline  = Clock::time_point::max();
+        {
+            std::lock_guard lock(stats_mutex);
+            stats.pressure_private_owners_demoted += 1;
+        }
+        std::lock_guard lock(queue_mutex);
+        pending.push_front(request);
+    }
+
     bool admit() {
         bool moved = false;
         for (;;) {
@@ -1385,7 +1472,17 @@ struct Inkling2Core::Impl {
                     }
                 }
                 if (!best) { return moved; }
-                request = std::move(pending.front());
+                request = pending.front();
+            }
+            // A prompt the device cannot hold beside the running requests waits for them (a lone
+            // one is admitted whatever: the executor keeps room for one sequence's whole context).
+            round_claimed = prefill_reserved();
+            if (any_active() &&
+                !room_for(*best, static_cast<std::uint32_t>(request->prompt_tokens.size()))) {
+                return moved;
+            }
+            {
+                std::lock_guard lock(queue_mutex);
                 pending.pop_front();
                 moved = true;
             }
@@ -1514,7 +1611,7 @@ struct Inkling2Core::Impl {
             std::lock_guard lock(stats_mutex);
             stats.reused_prompt_tokens += reused;
         }
-        if (r.consumer_mode == OutputConsumerMode::Streaming) {
+        if (r.consumer_mode == OutputConsumerMode::Streaming && !std::exchange(r.stream_started, true)) {
             {
                 std::lock_guard lock(r.mutex);
                 r.stream_start =
@@ -1541,6 +1638,8 @@ struct Inkling2Core::Impl {
         auto& executor = *instance.executor;
         // A prompt chunk on the executor's second stream: done once the stream has passed it.
         if (side_request && executor.side_idle()) { side_request.reset(); }
+        round_claimed = 0;
+        stalled.clear();
         std::shared_ptr<Request> prefilling;
         bool decoding = false;
         for (const Slot& slot : slots) {
@@ -1551,6 +1650,19 @@ struct Inkling2Core::Impl {
             } else if (slot.request != side_request &&
                        (!prefilling || prefills_before(*slot.request, *prefilling))) {
                 prefilling = slot.request;
+            }
+        }
+        // A prompt chunk the device cannot back waits (its first step may restore an image of up
+        // to the whole prompt).
+        if (prefilling) {
+            const auto prompt_n = static_cast<std::uint32_t>(prefilling->prompt_tokens.size());
+            const std::uint32_t end =
+                prefilling->prefilled == 0
+                    ? prompt_n
+                    : executor.position(prefilling->slot) + prefill_step_tokens(*prefilling);
+            if (!room_for(prefilling->slot, end)) {
+                stalled.push_back(prefilling);
+                prefilling = nullptr;
             }
         }
         // Beside decoding requests, a prompt's inner chunk runs on the second stream while the
@@ -1585,9 +1697,53 @@ struct Inkling2Core::Impl {
             } catch (...) { fail(prefilling, std::current_exception()); }
             return true;
         }
-        if (!decoding) { return false; }
+        if (!decoding) { return break_stall(); }
         decode_run += decode_run != UINT32_MAX;
-        decode_step();
+        if (!decode_step()) { return break_stall(); }
+        return true;
+    }
+
+    // Every running request waits for KV room no running request will free. The latest admitted
+    // of those still prefilling goes back to the queue (requeue); with none, the latest admitted
+    // ends with Unavailable, which frees its sequence. False when none waits.
+    bool break_stall() {
+        if (stalled.empty()) { return false; }
+        if (std::getenv("NINFER_INKLING_ADMIT_LOG") != nullptr) {
+            std::fprintf(stderr, "stall | room %llu MiB claimed %llu MiB reserved %llu MiB |",
+                         static_cast<unsigned long long>(instance.executor->kv_room() >> 20),
+                         static_cast<unsigned long long>(round_claimed >> 20),
+                         static_cast<unsigned long long>(prefill_reserved() >> 20));
+            for (std::uint32_t t = 0; t < slots.size(); ++t) {
+                const Request* q = slots[t].request.get();
+                std::fprintf(stderr, " %u:%s@%u", t, q == nullptr ? "idle" : q->decoding ? "dec" : "pre",
+                             instance.executor->position(t));
+            }
+            for (const auto& q : stalled) {
+                std::fprintf(stderr, " | stalled slot %u %s need %llu MiB", q->slot,
+                             q->decoding ? "dec" : "pre",
+                             static_cast<unsigned long long>(
+                                 instance.executor->kv_growth(q->slot, instance.executor->position(q->slot) + 8) >> 20));
+            }
+            std::fprintf(stderr, "\n");
+        }
+        const auto later = [](const auto& a, const auto& b) { return a->admitted < b->admitted; };
+        std::shared_ptr<Request> prefilling;
+        for (const auto& r : stalled) {
+            if (!r->decoding && !r->constrained && (!prefilling || later(prefilling, r))) { prefilling = r; }
+        }
+        if (prefilling) {
+            requeue(prefilling);
+            return true;
+        }
+        if (side_request) { return false; }
+        const auto latest = std::max_element(stalled.begin(), stalled.end(), later);
+        {
+            std::lock_guard lock(stats_mutex);
+            stats.pressure_private_owners_degraded += 1;
+        }
+        fail(*latest, std::make_exception_ptr(RequestError(
+                          RequestErrorKind::Unavailable,
+                          "the device has no memory left for this request's KV cache")));
         return true;
     }
 
@@ -2424,7 +2580,8 @@ struct Inkling2Core::Impl {
 
     // One step of every decoding request. Those whose context or drafter proposes a continuation
     // run one speculative round together, the rest one batched decode step.
-    void decode_step() {
+    // False when no request could run (each waits for its mask or for KV room).
+    bool decode_step() {
         std::vector<std::shared_ptr<Request>> alone, batch, speculative, drafting;
         std::vector<std::vector<TokenId>> proposals;
         // Which of the round's proposals came from a context lookup.
@@ -2447,6 +2604,14 @@ struct Inkling2Core::Impl {
                     finish_now(request, FinishReason::Cancelled);
                 }
                 continue;
+            }
+            {
+                const std::uint32_t width = std::max<std::uint32_t>(
+                    {static_cast<std::uint32_t>(request->feed.size()), steps + 1, spark_block + 1});
+                if (!room_for(request->slot, instance.executor->position(request->slot) + width)) {
+                    stalled.push_back(request);
+                    continue;
+                }
             }
             if (request->feed.size() > 1) {
                 alone.push_back(request);
@@ -2472,7 +2637,7 @@ struct Inkling2Core::Impl {
         }
         if (alone.empty() && batch.empty() && speculative.empty() && drafting.empty() &&
             deferred.empty()) {
-            return;
+            return false;
         }
         const auto start = Clock::now();
         // With --adaptive-mtp the controller picks a lone drafting request's drafts from how far
@@ -2545,6 +2710,7 @@ struct Inkling2Core::Impl {
         stats.decode_rounds += 1;
         stats.decode_row_rounds += alone.size() + batch.size() + speculative.size();
         stats.decode_seconds_total += seconds(start, Clock::now());
+        return true;
     }
 
     // Keeps logits row `row` of `source` for the request until its grammar mask is ready.

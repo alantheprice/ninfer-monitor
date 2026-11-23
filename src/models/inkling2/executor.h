@@ -47,6 +47,13 @@ struct InsufficientMemory : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// A call needed a sequence's full-attention rows backed further than the device has room for (the
+// growing caches without an elastic expert cache to give way). Nothing was mapped or run: free a
+// sequence (preempt it) and retry.
+struct KvExhausted : InsufficientMemory {
+    using InsufficientMemory::InsufficientMemory;
+};
+
 struct ExecutorOptions {
     std::uint32_t max_context   = 32768;
     std::uint32_t prefill_chunk = 2048; // prompt tokens per forward()
@@ -144,6 +151,14 @@ public:
     [[nodiscard]] std::uint32_t vocab() const noexcept;
     void reset(std::uint32_t sequence);
     [[nodiscard]] std::uint32_t position(std::uint32_t sequence) const;
+    // Growing caches: the device bytes `sequence`'s full-attention rows still need backed before a
+    // call reaches position `end` (0 when they are, or the caches do not grow), and the bytes the
+    // device can still back for them. Without an elastic expert cache a call whose growth exceeds
+    // the room throws KvExhausted; the scheduler checks first and preempts a sequence instead.
+    [[nodiscard]] std::uint64_t kv_growth(std::uint32_t sequence, std::uint32_t end) const;
+    [[nodiscard]] std::uint64_t kv_room() const;
+    // A sequence's full-attention bytes at most: what one sequence at the full context backs.
+    [[nodiscard]] std::uint64_t kv_sequence_bytes() const noexcept;
     // Loads the kernels every route reaches, and captures the decode graphs.
     void warm_up();
     void check_experts() const;
