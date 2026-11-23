@@ -798,6 +798,47 @@ void test_host_write_admission() {
     index.check_invariants();
 }
 
+// A Boundary snapshot (a shared system prompt and tools) leaves the Host tier after the retained
+// conversation snapshots even when GDSF values it lower; with no share for shared prefixes it
+// competes on value again.
+void test_boundary_protected() {
+    const auto run = [](double share) {
+        RecordingBackend backend;
+        PrefixIndexConfig config = small_config(8, 4); // two tail-less images
+        config.shared_host_share = share;
+        PrefixCacheIndex index(config, backend);
+        const auto shared_tokens = make_tokens(64 * 2, 71);
+        const auto shared_path   = insert_sequence(index, backend, shared_tokens);
+        const SnapshotRef shared =
+            publish_at(index, backend, shared_path, shared_tokens, 64 * 2, SnapshotKind::Boundary);
+        backup_snapshot(index, shared);
+        const auto private_tokens = make_tokens(64 * 8, 72);
+        const auto private_path   = insert_sequence(index, backend, private_tokens);
+        const SnapshotRef conversation =
+            publish_at(index, backend, private_path, private_tokens, 64 * 8, SnapshotKind::Tap);
+        backup_snapshot(index, conversation);
+        const auto next_tokens = make_tokens(64 * 8, 73);
+        const auto next_path   = insert_sequence(index, backend, next_tokens);
+        const SnapshotRef next =
+            publish_at(index, backend, next_path, next_tokens, 64 * 8, SnapshotKind::Tap);
+        backup_snapshot(index, next);
+        const bool shared_kept = index.valid(shared) && index.snapshot(shared).host == CopyState::Resident;
+        const bool private_kept =
+            index.valid(conversation) && index.snapshot(conversation).host == CopyState::Resident;
+        index.release_path(shared_path);
+        index.release_path(private_path);
+        index.release_path(next_path);
+        index.check_invariants();
+        return std::pair{shared_kept, private_kept};
+    };
+    const auto [kept, conversation_kept] = run(0.5);
+    require(kept && !conversation_kept,
+            "a Boundary snapshot within its share must outlast a more valuable conversation snapshot");
+    const auto [unprotected, conversation_after] = run(0.0);
+    require(!unprotected && conversation_after,
+            "with no share, the Boundary snapshot competes on GDSF value and goes first");
+}
+
 // A boundary no other conversation continued from is just its lineage's snapshot: superseded
 // when the lineage moves past it, and retained again by a later hit.
 void test_unshared_boundary() {
@@ -1772,6 +1813,7 @@ int main() {
         test_unbacked_slot_values();
         test_refusals_age_owners();
         test_host_write_admission();
+        test_boundary_protected();
         test_unshared_boundary();
         test_hits_expire();
         test_lineage_hits();

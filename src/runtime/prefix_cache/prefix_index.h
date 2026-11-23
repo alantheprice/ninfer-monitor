@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -90,6 +91,12 @@ struct PrefixIndexConfig {
     // holds state images only: tails and blocks are unbacked and their loss removes dependants.
     bool host_blocks = true;
     CacheCostModel cost;
+    // Boundary snapshots (a system prompt and tools that conversations start with) are evicted
+    // from the host tier last: after every superseded and every other retained snapshot, unless
+    // unused for shared_ttl or while Boundary snapshots hold more than shared_host_share of the
+    // host slabs. The same policy as ContextImageStore's shared-prefix images.
+    double shared_host_share       = 0.25;
+    std::chrono::seconds shared_ttl = std::chrono::hours(24);
 };
 
 // Physical resources the index references but does not own.
@@ -413,6 +420,7 @@ private:
         double value                  = 0.0; // GDSF C / Z
         double priority_base          = 0.0; // GDSF inflation at the last publication or hit
         std::uint64_t last_hit_tick   = 0;
+        std::chrono::steady_clock::time_point used_at{}; // a Boundary snapshot expires from it
         bool superseded               = false;
         std::uint64_t superseded_tick = 0;
         // Superseded by a later tap of the prompt that captured it: no request has resumed from
@@ -498,6 +506,10 @@ private:
     // Next snapshot to give up its Host slabs (host_only) or its index entry: the oldest
     // superseded one, otherwise the GDSF minimum, never `protect` or `keep`. kNoId when every
     // candidate is protected.
+    // A Boundary snapshot the host tier keeps past other retained snapshots (shared_ttl,
+    // shared_host_share); shared_over: Boundary snapshots hold more than their share.
+    [[nodiscard]] bool shared_protected(const Snapshot& snapshot, bool shared_over) const;
+    [[nodiscard]] bool shared_over_share() const;
     [[nodiscard]] std::uint32_t pick_victim(bool host_resident, std::uint32_t protect,
                                             std::uint32_t keep = kNoId) const;
     void remove_subtree(std::uint32_t node);

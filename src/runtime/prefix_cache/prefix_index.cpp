@@ -235,6 +235,7 @@ void PrefixCacheIndex::note_hit(SnapshotRef snapshot) {
     entry.hit_clock = clock_;
     ++counters_.snapshot_hits;
     entry.last_hit_tick = ++tick_;
+    entry.used_at = std::chrono::steady_clock::now();
     entry.priority_base = inflation_;
     if (!entry.superseded) {
         update_priority(snapshot.index);
@@ -1015,6 +1016,7 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
     snapshot.hits                   = hits;
     snapshot.hit_clock              = clock_;
     snapshot.last_hit_tick          = ++tick_;
+    snapshot.used_at = std::chrono::steady_clock::now();
     snapshot.priority_base          = inflation_;
     snapshot.superseded             = false;
     snapshot.superseded_tick        = 0;
@@ -1206,11 +1208,30 @@ void PrefixCacheIndex::revalue_around(std::uint32_t index,
     if (ancestor != kNoId) { update_priority(ancestor); }
 }
 
+bool PrefixCacheIndex::shared_over_share() const {
+    std::uint64_t slabs = 0;
+    for (const Snapshot& snapshot : snapshots_) {
+        if (snapshot.occupied && snapshot.kind == SnapshotKind::Boundary &&
+            snapshot.host == CopyState::Resident) {
+            slabs += snapshot.host_slabs.size();
+        }
+    }
+    return double(slabs) > config_.shared_host_share * double(config_.host_slabs);
+}
+
+bool PrefixCacheIndex::shared_protected(const Snapshot& snapshot, bool shared_over) const {
+    return !shared_over && snapshot.kind == SnapshotKind::Boundary && !snapshot.superseded &&
+           std::chrono::steady_clock::now() - snapshot.used_at <= config_.shared_ttl;
+}
+
 std::uint32_t PrefixCacheIndex::pick_victim(bool host_resident, std::uint32_t protect,
                                             std::uint32_t keep) const {
     std::uint32_t superseded = kNoId;
     std::uint32_t retained   = kNoId;
     double retained_priority = 0.0;
+    // Protected Boundary snapshots go after every other candidate, least recently used first.
+    std::uint32_t shared     = kNoId;
+    const bool shared_over   = host_resident && shared_over_share();
     for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
         const Snapshot& snapshot = snapshots_[i];
         if (!snapshot.occupied || i == protect || i == keep || snapshot.pins != 0 ||
@@ -1225,6 +1246,10 @@ std::uint32_t PrefixCacheIndex::pick_victim(bool host_resident, std::uint32_t pr
             }
             continue;
         }
+        if (host_resident && shared_protected(snapshot, shared_over)) {
+            if (shared == kNoId || snapshot.used_at < snapshots_[shared].used_at) { shared = i; }
+            continue;
+        }
         const double candidate = priority(snapshot);
         if (retained == kNoId || candidate < retained_priority ||
             (candidate == retained_priority &&
@@ -1233,7 +1258,7 @@ std::uint32_t PrefixCacheIndex::pick_victim(bool host_resident, std::uint32_t pr
             retained_priority = candidate;
         }
     }
-    return superseded != kNoId ? superseded : retained;
+    return superseded != kNoId ? superseded : retained != kNoId ? retained : shared;
 }
 
 void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
@@ -1516,6 +1541,7 @@ PrefixCacheIndex::restore_host_snapshot(NodeRef anchor, std::uint32_t frontier,
     snapshot.hits                   = hits;
     snapshot.hit_clock              = clock_;
     snapshot.last_hit_tick          = ++tick_;
+    snapshot.used_at = std::chrono::steady_clock::now();
     snapshot.priority_base          = inflation_;
     snapshot.superseded             = false;
     snapshot.superseded_tick        = 0;
