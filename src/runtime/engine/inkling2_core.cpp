@@ -1196,6 +1196,12 @@ struct Inkling2Core::Impl {
 
     void fail(const std::shared_ptr<Request>& request, std::exception_ptr error) {
         if (!request_error(error)) { std::rethrow_exception(error); }
+        // The device's room for the KV cache ran out: a retryable Unavailable, not an internal error.
+        try {
+            std::rethrow_exception(error);
+        } catch (const models::inkling2::KvExhausted& exhausted) {
+            error = std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable, exhausted.what()));
+        } catch (...) {}
         Slot& slot = slots.at(request->slot);
         if (slot.request == request) {
             slot.request = nullptr;
@@ -1609,7 +1615,7 @@ struct Inkling2Core::Impl {
         const std::uint32_t s = *free_slot;
         const auto at = static_cast<std::uint32_t>(r.park_fed.size());
         round_claimed = prefill_reserved();
-        if (any_active() && !room_for(s, at + kReservedReply)) { return false; }
+        if (!room_for(s, at + kReservedReply) && any_active()) { return false; }
         parked.pop_front();
         if (s == side_slot) { executor.side_join(); }
         Slot& slot = slots[s];
@@ -1687,9 +1693,11 @@ struct Inkling2Core::Impl {
             }
             // A prompt the device cannot hold beside the running requests waits for them (a lone
             // one is admitted whatever: the executor keeps room for one sequence's whole context).
+            // room_for gives the idle sequences' state to the host store until the prompt fits, so
+            // it runs for a lone request too (admitted whatever after that).
             round_claimed = prefill_reserved();
-            if (any_active() &&
-                !room_for(*best, static_cast<std::uint32_t>(request->prompt_tokens.size()))) {
+            if (!room_for(*best, static_cast<std::uint32_t>(request->prompt_tokens.size())) &&
+                any_active()) {
                 return moved;
             }
             {
