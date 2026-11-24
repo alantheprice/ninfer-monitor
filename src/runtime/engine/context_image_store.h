@@ -268,6 +268,7 @@ public:
         std::uint64_t last_used = 0;
         std::chrono::steady_clock::time_point used_at{}; // shared prefixes expire from it
         bool writing            = false; // its pages are being written to the shared tier
+        bool pinned             = false; // a parked request's state: never evicted (pin)
     };
 
     ContextImageStore() = default;
@@ -557,6 +558,20 @@ public:
         // Within the budget again, the image just read in being the most recently used.
         (void)make_room(0);
         return bytes;
+    }
+
+    // Pins (or unpins) the image of exactly `tokens` and `media`: a pinned image is never chosen
+    // for eviction, so the request parked on it resumes from it. False when the store has none.
+    bool pin(std::span<const TokenId> tokens, std::span<const ContextMediaMark> media, bool on) {
+        for (Image& image : images_) {
+            if (image.tokens.size() == tokens.size() && image.media.size() == media.size() &&
+                std::equal(image.tokens.begin(), image.tokens.end(), tokens.begin()) &&
+                std::equal(image.media.begin(), image.media.end(), media.begin())) {
+                image.pinned = on;
+                return true;
+            }
+        }
+        return false;
     }
 
     // Drops the images `drop(image)` names, their files too.
@@ -849,7 +864,9 @@ private:
         for (const Image& image : images_) {
             if (is_shared_prefix(image) && !image.pages.empty()) { shared_bytes += page_rounded(image.bytes); }
         }
-        return victim([](const Image& image) { return !image.pages.empty() && !image.writing; },
+        return victim([](const Image& image) {
+                          return !image.pages.empty() && !image.writing && !image.pinned;
+                      },
                       shared_bytes > shared_host_);
     }
 
@@ -862,7 +879,9 @@ private:
         }
         const auto share = std::uint64_t(double(disk_budget_) *
                                          (host_budget_ ? double(shared_host_) / double(host_budget_) : 0.0));
-        return victim([keep](const Image& image) { return !image.file.empty() && &image != keep; },
+        return victim([keep](const Image& image) {
+                          return !image.file.empty() && &image != keep && !image.pinned;
+                      },
                       shared_bytes > share);
     }
 

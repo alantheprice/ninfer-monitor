@@ -485,6 +485,38 @@ void check_shared_prefix_kept() {
     check(!over_kept && a_over, "a shared prefix past its share is evicted by use order");
 }
 
+void check_pinned_kept() {
+    // A pinned image (a parked request's state) outlives newer images that need its pages; once
+    // unpinned it is evicted by use order again.
+    const auto run = [](bool pinned) {
+        Store store;
+        ContextImageStoreOptions options;
+        options.host_budget  = 12 * kPage;
+        options.host_reserve = 4 * kPage;
+        store.configure(options, "test-image2-profile", image_bytes, {});
+        store.pin_reserve();
+        const auto parked = prompt(100, 500), a = prompt(200, 1000), b = prompt(300, 2000),
+                   c = prompt(400, 3000);
+        check(store.put(parked, {}, PrefixReusePath::PrivateEndpoint, 100, save(100, 1)).has_value(),
+              "parked image stored");
+        if (pinned) { check(store.pin(parked, {}, true), "pin finds the stored image"); }
+        check(store.put(a, {}, PrefixReusePath::PrivateEndpoint, 200, save(200, 2)).has_value(),
+              "first newer image stored");
+        check(store.put(b, {}, PrefixReusePath::PrivateEndpoint, 300, save(300, 3)).has_value(),
+              "second newer image stored");
+        check(store.put(c, {}, PrefixReusePath::PrivateEndpoint, 400, save(400, 4)).has_value(),
+              "third newer image stored");
+        return store.index(parked, {}).has_value();
+    };
+    check(run(true), "a pinned image is never the eviction victim");
+    check(!run(false), "the same image unpinned is evicted first by use order");
+    Store store;
+    ContextImageStoreOptions options;
+    options.host_budget = 8 * kPage;
+    store.configure(options, "test-image2-profile", image_bytes, {});
+    check(!store.pin(prompt(10), {}, true), "pin reports an image the store does not hold");
+}
+
 void check_stale_temporaries(const std::filesystem::path& root) {
     // A partial write a dead process left goes at startup once it is old; a fresh one stays.
     const auto dir = root / "stale";
@@ -512,6 +544,7 @@ int main() {
         check_steps();
         check_host_budget();
         check_shared_prefix_kept();
+        check_pinned_kept();
         check_pin_ahead();
         check_disk_tier(root);
         check_stale_temporaries(root);

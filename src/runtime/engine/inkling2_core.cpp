@@ -1565,7 +1565,8 @@ struct Inkling2Core::Impl {
         }
         if (s == side_slot) { executor.side_join(); }
         store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
-        if (!stored(slot.fed, slot.media)) { return false; }
+        // Pinned until it resumes, so the store cannot drop the state it resumes from.
+        if (!stored(slot.fed, slot.media) || !store.pin(slot.fed, slot.media, true)) { return false; }
         const bool anchored = !slot.anchor.empty() && slot.anchor.size() <= slot.fed.size() &&
                               std::equal(slot.anchor.begin(), slot.anchor.end(), slot.fed.begin());
         if (anchored) {
@@ -1616,7 +1617,9 @@ struct Inkling2Core::Impl {
         if (test_park_drop) {
             store.drop_if([&](const auto& image) { return image.tokens == r.park_fed; });
         }
-        if (!restore_stored(s, r.park_fed, r.park_media)) {
+        const bool restored = restore_stored(s, r.park_fed, r.park_media);
+        (void)store.pin(r.park_fed, r.park_media, false);
+        if (!restored) {
             if (!r.park_media.empty()) {
                 r.slot = s;
                 complete(request, std::make_exception_ptr(RequestError(
