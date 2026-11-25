@@ -1614,9 +1614,10 @@ struct Executor::Impl {
 
     static constexpr int kHeadRows = 64; // LM-head columns per FP32 plane pass
 
-    // Rows of one decode call: every active lane's next token. The vector products take 8
-    // columns a group, so a call of 9..32 lanes runs them in up to four column groups.
-    static constexpr int kMaxDecodeRows = 64;
+    // Rows of one decode or verify call: every active lane's next token, or a round's drafts and
+    // bonus rows. Up to NINFER_INKLING_Q8_ROWS (64) take the vector products, 8 columns a group;
+    // wider calls the matrix kernels (decode_body).
+    static constexpr int kMaxDecodeRows = 128;
 
     [[nodiscard]] int decode_rows() const {
         return std::min<int>(kMaxDecodeRows,
@@ -3118,7 +3119,13 @@ struct Executor::Impl {
         c.runs           = runs > 0 && span_full > 0 ? static_cast<const std::int32_t*>(d_starts.p) : nullptr;
         c.run_count      = runs;
         c.key_bound      = key_bound;
-        c.q8             = !bf16_rows;
+        // Wide rounds (more rows than NINFER_INKLING_Q8_ROWS, default 64) take the matrix kernels:
+        // their cost is nearly flat in rows where the vector kernels' grows with each column.
+        static const int q8_rows = [] {
+            const char* v = std::getenv("NINFER_INKLING_Q8_ROWS");
+            return v != nullptr ? std::atoi(v) : 64;
+        }();
+        c.q8             = !bf16_rows && b <= q8_rows;
         c.keep           = true;
         c.rows.positions = static_cast<const std::int32_t*>(d_positions.p);
         c.rows.sequences = static_cast<const std::int32_t*>(d_sequences.p);

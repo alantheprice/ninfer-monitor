@@ -537,6 +537,7 @@
         "gguf_moe_matrix/q5_0": [[1024, "async"]],
         "gguf_moe_matrix/q5_k": [[1024, "async"]],
         "gguf_moe_matrix/q8_0": [[64, "async"], [1024, ""]],
+        "gguf_moe_matrix/nvfp4": [[1024, "async"]],
         "gguf_moe_up/q4_k": [[4, ""]],
         "gguf_moe_up/q6_k": [[4, "cooperative"]],
         "gguf_moe_vector/q4_k": [[1, "cooperative"], [8, ""]],

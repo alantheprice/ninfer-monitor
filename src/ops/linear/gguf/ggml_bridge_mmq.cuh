@@ -263,9 +263,18 @@ void matrix_product_impl(const void* weight, std::int64_t row_bytes, int rows, i
 // or mapped host memory) instead of a fixed stride. Column c of the activation is the routing's
 // c-th pair, and pair p's result row lands at out[p * rows]. The grid's column dimension bounds
 // the list; the CTAs past its length leave at once.
+// Two CTAs an SM for NVFP4's asynchronous tile loop (its staged copies hide the weight loads that
+// one CTA leaves exposed: Inkling 2's [gate; up] at 128 pairs 413 -> 321 us on an RTX PRO 6000;
+// the synchronous loop loses at two).
+template <ggml_type type, int J, int async>
+__host__ __device__ constexpr int moe_matrix_occupancy() {
+    return async != 0 && type == GGML_TYPE_NVFP4 && J <= 32 ? 2
+                                                            : ggml_cuda_mmq_get_occupancy(type, J, false);
+}
+
 template <ggml_type type, int J, int async = 0>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false),
-                  ggml_cuda_mmq_get_occupancy(type, J, false)) static __global__
+                  moe_matrix_occupancy<type, J, async>()) static __global__
     void moe_mul_mat_q(const void* const* __restrict__ experts, const int* __restrict__ y,
                        const std::int32_t* __restrict__ sorted,
                        const std::int32_t* __restrict__ bounds,

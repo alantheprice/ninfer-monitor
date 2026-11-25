@@ -1,3 +1,6 @@
+#include <cstdlib>
+#include <string>
+#include <vector>
 #include "ops/common/device_route.h"
 
 #include <cuda_runtime.h>
@@ -78,9 +81,34 @@ std::shared_ptr<const DeviceRouteProfile> installed_device_route_profile() {
     return current_storage()[static_cast<std::size_t>(device)];
 }
 
+// NINFER_ROUTE_OVERRIDE="key=schedule,key=schedule": those keys' schedules at every width, ahead of
+// the installed profile (for measuring a route the profile does not hold).
+const std::vector<std::pair<std::string, std::string>>& route_overrides() {
+    static const std::vector<std::pair<std::string, std::string>> overrides = [] {
+        std::vector<std::pair<std::string, std::string>> out;
+        const char* v = std::getenv("NINFER_ROUTE_OVERRIDE");
+        if (v == nullptr) { return out; }
+        std::string all(v);
+        std::size_t at = 0;
+        while (at <= all.size()) {
+            const std::size_t end = std::min(all.find(',', at), all.size());
+            const std::string item = all.substr(at, end - at);
+            if (const std::size_t eq = item.find('='); eq != std::string::npos) {
+                out.emplace_back(item.substr(0, eq), item.substr(eq + 1));
+            }
+            at = end + 1;
+        }
+        return out;
+    }();
+    return overrides;
+}
+
 std::string_view device_route_schedule(std::string_view key, std::int32_t width) {
     if (const Forced* forced = forced_route(); forced != nullptr && forced->key == key) {
         return forced->schedule;
+    }
+    for (const auto& [k, schedule] : route_overrides()) {
+        if (k == key) { return schedule; }
     }
     const int device = current_device();
     if (device < 0 || device >= kMaxDevices) { return {}; }

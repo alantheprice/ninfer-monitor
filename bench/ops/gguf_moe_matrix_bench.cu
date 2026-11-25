@@ -158,7 +158,7 @@ void run(const Format& format, const Shape& shape_of, int experts, int tokens, s
         DeviceBuffer d_table(table.size() * sizeof(void*));
         d_table.copy_from_host(table.data(), table.size() * sizeof(void*));
         const gguf::MoeTable moe{static_cast<const void* const*>(d_table.p), row_bytes, proj.rows,
-                                 proj.k};
+                                 proj.k, row_bytes % 16 == 0};
         const int columns = pairs / proj.column_group;
         DeviceBuffer x     = bench::make_bf16(std::size_t(columns) * proj.k, 0x1234567u);
         DeviceBuffer matrix_act(gguf::moe_matrix_activation_bytes(proj.k, pairs)),

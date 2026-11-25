@@ -684,18 +684,19 @@ struct Inkling2Core::Impl {
     static constexpr double kImageCopyBytesPerSecond = 12e9;
     static constexpr double kPrefillSecondsPerToken  = 2e-4;
     // NINFER_INKLING_BATCH_DRAFT=0: DSpark drafts only for a lone decoding request.
-    // NINFER_INKLING_BATCH_ROWS (2..64): a multi-request round's rows; by default 32, or three a
-    // request past ten (at most 64), so a round of up to 21 requests still drafts two each
-    // (38K-token coding contexts, 16 requests: 37.0 -> 42.2 tok/s each, 566 -> 606 together; 8
-    // requests keep 32: 48 gave 535 -> 528 together).
+    // NINFER_INKLING_BATCH_ROWS (2..128): a multi-request round's rows; by default eight a request,
+    // 32 to 128, so 16 requests still draft up to five each. Rounds past 64 rows take the matrix
+    // kernels (executor: NINFER_INKLING_Q8_ROWS), whose cost is nearly flat in rows (38K-token
+    // coding contexts on an RTX PRO 6000, 16 requests: 41.5 -> 55 tok/s each, 609 -> 725-745
+    // together; 4 and 8 requests unchanged; outputs identical alone and together).
     const std::size_t kBatchRoundRowsFixed = [] {
         const char* v = std::getenv("NINFER_INKLING_BATCH_ROWS");
         const int n   = v != nullptr ? std::atoi(v) : 0;
-        return std::size_t(n >= 2 && n <= 64 ? n : 0);
+        return std::size_t(n >= 2 && n <= 128 ? n : 0);
     }();
     [[nodiscard]] std::size_t batch_round_rows(std::size_t decoding) const noexcept {
         if (kBatchRoundRowsFixed != 0) { return kBatchRoundRowsFixed; }
-        return std::clamp<std::size_t>(3 * decoding, 32, 64);
+        return std::clamp<std::size_t>(8 * decoding, 32, 128);
     }
     const bool batch_drafting = [] {
         const char* v = std::getenv("NINFER_INKLING_BATCH_DRAFT");
