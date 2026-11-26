@@ -3038,6 +3038,17 @@ void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, c
         check_launch("gemv parts");
         return;
     }
+    if (vector_call && n > 2 * kGemvRows) {
+        // A decode or verify call of more than 16 columns: the batch form's parts, whose columns'
+        // sums are those of a narrower call (not SGEMM's).
+        GemvBatch one{};
+        one.count  = 1;
+        one.w[0]   = w;
+        one.x[0]   = x;
+        one.out[0] = out;
+        gemm_f32_batch(m, n, k, one, stream, x_stride, out_stride, true);
+        return;
+    }
     if (n <= kGemvRows || (vector_call && n <= 2 * kGemvRows)) {
         // Up to 16 columns (a decode call of 16 lanes) in one launch; each column's sums are those
         // of a narrower call.

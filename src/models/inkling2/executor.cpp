@@ -2184,6 +2184,12 @@ struct Executor::Impl {
         float* split = nullptr;
     };
 
+    // A decode or verify call (not a prompt chunk) of up to kMaxDecodeRows rows: its FP32 products
+    // take the GEMV kernels' column parts at any width, as the q8 calls do, not SGEMM.
+    [[nodiscard]] static bool row_call(const Call& c) {
+        return c.q8 || (!c.chunk && c.t <= kMaxDecodeRows);
+    }
+
     [[nodiscard]] const void* input_q(const Call& c, int i) const {
         if (!c.q8) { return nullptr; }
         return static_cast<const std::byte*>(c.in_q.base) + std::size_t(i) * c.in_q_stride;
@@ -2320,8 +2326,8 @@ struct Executor::Impl {
         }
         down.count = count;
         up.count   = 2 * count;
-        kernels::gemm_f32_batch(r, t, 2 * hidden, down, stream, 0, 0, c.q8);
-        kernels::gemm_f32_batch(hidden, t, r, up, stream, 0, 0, c.q8);
+        kernels::gemm_f32_batch(r, t, 2 * hidden, down, stream, 0, 0, row_call(c));
+        kernels::gemm_f32_batch(hidden, t, r, up, stream, 0, 0, row_call(c));
         ca.eps          = eps;
         ca.query_stride = c.plane;
         set_outputs(c, ca.out, ca.out_q, ca.f32, ca.q8_stride, out_bf16, out_q, q_stride, out_f32);
@@ -2490,7 +2496,7 @@ struct Executor::Impl {
             product(lp.key, input_q(c, ki), bf16_in(ki), t, kv, 2 * kvd, 0);
             product(lp.value, input_q(c, vi), bf16_in(vi), t, kv, 2 * kvd, kvd);
         }
-        kernels::gemm_f32(query_heads, t, hidden, lp.sinks, f32_in(0), sinks, stream, 0, 0, c.q8);
+        kernels::gemm_f32(query_heads, t, hidden, lp.sinks, f32_in(0), sinks, stream, 0, 0, row_call(c));
         float* taps = nullptr;
         const int tap_columns = 2 * kv_heads * kTaps;
         if (lp.full) {
@@ -2767,7 +2773,7 @@ struct Executor::Impl {
         auto* weights    = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * 4).data);
         auto* pair_scale = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * 4).data);
         auto* logits     = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * e * 4).data);
-        kernels::gemm_f32(e, t, hidden, p.router, c.ffn_f32, logits, stream, 0, 0, c.q8);
+        kernels::gemm_f32(e, t, hidden, p.router, c.ffn_f32, logits, stream, 0, 0, row_call(c));
         kernels::RouteArgs route;
         route.hidden        = hidden;
         route.tokens        = t;
@@ -3153,11 +3159,12 @@ struct Executor::Impl {
         c.runs           = runs > 0 && span_full > 0 ? static_cast<const std::int32_t*>(d_starts.p) : nullptr;
         c.run_count      = runs;
         c.key_bound      = key_bound;
-        // Wide rounds (more rows than NINFER_INKLING_Q8_ROWS, default 64) take the matrix kernels:
-        // their cost is nearly flat in rows where the vector kernels' grows with each column.
+        // Wide rounds (more rows than NINFER_INKLING_Q8_ROWS, default 40) take the matrix kernels:
+        // their cost is nearly flat in rows where the vector kernels' grows with each column
+        // (RTX PRO 6000, 16 requests at 38K: 40 rows 793 tok/s together, 64 rows 666-728).
         static const int q8_rows = [] {
             const char* v = std::getenv("NINFER_INKLING_Q8_ROWS");
-            return v != nullptr ? std::atoi(v) : 64;
+            return v != nullptr ? std::atoi(v) : 40;
         }();
         c.q8             = !bf16_rows && b <= q8_rows;
         c.keep           = true;

@@ -89,7 +89,7 @@ struct MixArgs {
     // order, so the values equal the one-block row's. Null: one block per row.
     float* split = nullptr;
 };
-inline constexpr int kSplitRows = 16;
+inline constexpr int kSplitRows = 128;
 [[nodiscard]] std::size_t mix_split_floats(int tokens, int hidden);
 void mix(const MixArgs& args, cudaStream_t stream);
 
