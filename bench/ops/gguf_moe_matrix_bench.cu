@@ -7,10 +7,16 @@
 // activation's quantization included, over random routes of each --tokens count to distinct
 // experts (the routes' sort is outside the timing).
 // The bytes are the active experts' weights, each read once. The products themselves are checked by
-// test_gguf_moe_iq1m (IQ1_M) and the models' tests.
+// test_gguf_moe_iq1m (IQ1_M), test_gguf_moe_fp4 (the FP4 route) and the models' tests.
+//
+// --fp4 adds, for NVFP4 on sm_120a code, the W4A4 route (quantize_moe_fp4_activation,
+// moe_fp4_product) in both schedules at its own column tile, and with --fp4-tiles every tile
+// (16, 32, 64 staged and synchronous, 128 synchronous). Inkling 2 Mini's prompt steps:
+//   --formats NVFP4 --hidden 2304 --width 1152 --top-k 8 --experts 128 --tokens 2048,4096 --fp4
 //
 // usage: ninfer_benches ninfer_gguf_moe_matrix_bench [--formats IQ1_M,IQ1_S,IQ2_XXS,IQ2_S|all]
 //        [--tokens 64,512,2048] [--experts 384] [--hidden 5120] [--width 2304] [--top-k 6]
+//        [--fp4] [--fp4-tiles] [--no-vector]
 
 #include "core/device_buffer.h"
 #include "ninfer_bench_common.h"
@@ -36,6 +42,9 @@ namespace {
 using namespace ninfer;
 namespace gguf = ops::gguf;
 int vector_chunk = 0; // --chunk: the vector route's columns a pass (0: by tokens; Inkling 2 decodes at 2)
+bool fp4_route    = false; // --fp4: also the W4A4 route for NVFP4
+bool fp4_tiles    = false; // --fp4-tiles: every column tile of it
+bool vector_route = true;  // --no-vector: skip the vector route (slow at prompt widths)
 
 struct Shape {
     int hidden = 5120, width = 2304, top_k = 6;
@@ -97,7 +106,12 @@ DeviceBuffer random_bank(gguf::GgmlType type, int experts, int rows, int k, std:
         }
         for (std::size_t at = 0; at < host.size(); at += std::size_t(shape.bytes)) {
             const std::uint16_t d = half_bits(scale(rng));
-            if (type == gguf::GgmlType::NVFP4) { continue; } // its scales: random E4M3 bytes
+            if (type == gguf::GgmlType::NVFP4) {
+                // Finite positive UE4M3 scales (0x20 .. 0x3F): the FP4 tensor cores read 0x7F
+                // as NaN, and a sign bit has no meaning in UE4M3.
+                for (int j = 0; j < 4; ++j) { host[at + j] = std::uint8_t(0x20 | (host[at + j] & 0x1F)); }
+                continue;
+            }
             if (type != gguf::GgmlType::IQ1_M) {
                 std::memcpy(&host[at], &d, 2);
                 continue;
@@ -174,23 +188,67 @@ void run(const Format& format, const Shape& shape_of, int experts, int tokens, s
                                          matrix_act.p, static_cast<float*>(out.p), stream);
             },
             bytes, 3, 20, 300);
-        gguf::MoeOutput rows;
-        rows.f32           = static_cast<float*>(out.p);
-        // The models' chunk: as many columns a pass as the call has tokens, up to eight.
-        const int chunk   = tokens <= 1 ? 1 : tokens <= 2 ? 2 : tokens <= 4 ? 4 : 8;
-        const auto vector = bench::bench_loop(
-            [&](cudaStream_t stream) {
-                gguf::quantize_vector_activation(xb, proj.k, columns, nullptr, vector_act.p, stream);
-                gguf::moe_vector_product(format.type, moe, routing, max_active, proj.column_group,
-                                         top_k, vector_act.p, columns, rows,
-                                         vector_chunk > 0 ? vector_chunk : chunk, stream);
-            },
-            bytes, 3, 20, 300);
-        check(cudaDeviceSynchronize(), "products");
-        std::printf("%-8s %-7s T=%-5d experts %3d: matrix %9.1f us (%6.1f GB/s), vector %9.1f us "
-                    "(%6.1f GB/s), vector/matrix %.2fx\n",
+        std::printf("%-8s %-7s T=%-5d experts %3d: matrix %9.1f us (%6.1f GB/s, %6.1f TOPS)",
                     format.name, proj.name, tokens, active_experts, matrix.median_us, matrix.gbs,
-                    vector.median_us, vector.gbs, vector.median_us / matrix.median_us);
+                    2.0 * pairs * double(proj.rows) * proj.k / (matrix.median_us * 1e6));
+        if (vector_route) {
+            gguf::MoeOutput rows;
+            rows.f32 = static_cast<float*>(out.p);
+            // The models' chunk: as many columns a pass as the call has tokens, up to eight.
+            const int chunk   = tokens <= 1 ? 1 : tokens <= 2 ? 2 : tokens <= 4 ? 4 : 8;
+            const auto vector = bench::bench_loop(
+                [&](cudaStream_t stream) {
+                    gguf::quantize_vector_activation(xb, proj.k, columns, nullptr, vector_act.p,
+                                                     stream);
+                    gguf::moe_vector_product(format.type, moe, routing, max_active,
+                                             proj.column_group, top_k, vector_act.p, columns, rows,
+                                             vector_chunk > 0 ? vector_chunk : chunk, stream);
+                },
+                bytes, 3, 20, 300);
+            std::printf(", vector %9.1f us (%6.1f GB/s), vector/matrix %.2fx", vector.median_us,
+                        vector.gbs, vector.median_us / matrix.median_us);
+        }
+        std::printf("\n");
+        check(cudaDeviceSynchronize(), "products");
+        if (!fp4_route || format.type != gguf::GgmlType::NVFP4) { continue; }
+        if (!gguf::moe_fp4_supported(format.type, proj.rows, proj.k)) {
+            std::printf("%-8s %-7s T=%-5d no FP4 route on this device or build\n", format.name,
+                        proj.name, tokens);
+            continue;
+        }
+        DeviceBuffer fp4_act(gguf::moe_fp4_activation_bytes(proj.k, pairs));
+        struct Variant {
+            int staged, tile;
+        };
+        std::vector<Variant> variants{{1, 0}, {0, 0}};
+        if (fp4_tiles) {
+            variants = {{1, 16}, {1, 32}, {1, 64}, {0, 16}, {0, 32}, {0, 64}, {0, 128}};
+        }
+        // The activation's quantization alone, then each schedule with it.
+        const auto quant = bench::bench_loop(
+            [&](cudaStream_t stream) {
+                gguf::quantize_moe_fp4_activation(xb, proj.k, routing, pairs, proj.column_group,
+                                                  fp4_act.p, stream);
+            },
+            double(pairs) * proj.k * 2.0, 3, 20, 300);
+        for (const Variant v : variants) {
+            const int J  = gguf::moe_fp4_column_tile(pairs, max_active, v.staged, v.tile);
+            const auto r = bench::bench_loop(
+                [&](cudaStream_t stream) {
+                    gguf::quantize_moe_fp4_activation(xb, proj.k, routing, pairs,
+                                                      proj.column_group, fp4_act.p, stream);
+                    gguf::moe_fp4_product(moe, routing, max_active, pairs, fp4_act.p,
+                                          static_cast<float*>(out.p), stream, v.staged, v.tile);
+                },
+                bytes, 3, 20, 300);
+            std::printf("%-8s %-7s T=%-5d experts %3d: fp4 %-6s J=%-3d %9.1f us (%6.1f GB/s, "
+                        "%6.1f TOPS; quantize %6.1f us), matrix/fp4 %.2fx\n",
+                        format.name, proj.name, tokens, active_experts,
+                        v.staged ? "staged" : "sync", J, r.median_us, r.gbs,
+                        2.0 * pairs * double(proj.rows) * proj.k / (r.median_us * 1e6),
+                        quant.median_us, matrix.median_us / r.median_us);
+        }
+        check(cudaDeviceSynchronize(), "fp4 products");
     }
 }
 
@@ -227,6 +285,12 @@ int main(int argc, char** argv) {
                 shape.top_k = std::stoi(value());
             } else if (arg == "--chunk") {
                 vector_chunk = std::stoi(value());
+            } else if (arg == "--fp4") {
+                fp4_route = true;
+            } else if (arg == "--fp4-tiles") {
+                fp4_route = fp4_tiles = true;
+            } else if (arg == "--no-vector") {
+                vector_route = false;
             } else {
                 throw std::invalid_argument("unknown argument " + arg);
             }

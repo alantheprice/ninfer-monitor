@@ -238,6 +238,16 @@ struct States {
 
 } // namespace
 
+// NINFER_INKLING_FP4_PREFILL: unset or 0 off; 1 or "all" both MoE products; "gate_up" or "down"
+// one of them (bit 0 the [gate; up] product, bit 1 the down product).
+static int fp4_prefill_mode() {
+    const char* v = std::getenv("NINFER_INKLING_FP4_PREFILL");
+    if (v == nullptr || v[0] == '\0' || std::strcmp(v, "0") == 0) { return 0; }
+    if (std::strcmp(v, "gate_up") == 0 || std::strcmp(v, "gate") == 0) { return 1; }
+    if (std::strcmp(v, "down") == 0) { return 2; }
+    return 3;
+}
+
 struct Executor::Impl {
     const Model& model;
     DeviceContext& device;
@@ -254,6 +264,16 @@ struct Executor::Impl {
     // virtual memory management). Elastic: beside an elastic expert cache, which gives way to them;
     // otherwise growth past the free memory throws KvExhausted and the scheduler preempts.
     bool growing = false, elastic = false;
+    // W4A4 prompt experts (NINFER_INKLING_FP4_PREFILL): a prompt chunk of at least fp4_min_tokens
+    // rows runs its NVFP4 routed experts' [gate; up] (bit 0) and down (bit 1) products on the FP4
+    // tensor cores with an NVFP4 activation (gguf::moe_fp4_product) instead of the q8_1 one.
+    // Decode and verification calls never do, so their kernels and sums are unchanged.
+    int fp4_prefill = 0, fp4_min_tokens = 256;
+    // NINFER_INKLING_FP4_DECODE=1: decode and verification calls on the matrix route (more rows
+    // than NINFER_INKLING_Q8_ROWS) take both products on the FP4 tensor cores as well. Their sums
+    // then differ from the q8_1 route's, so a request's output depends on the rows its rounds
+    // share (vLLM's behaviour); off by default.
+    bool fp4_decode = false;
     std::vector<KvArea*> sequence_areas;
     std::atomic<std::uint64_t> kv_backed{0};
     std::uint64_t kv_fixed = 0;
@@ -390,6 +410,28 @@ struct Executor::Impl {
         }
         stream = device.stream;
         const int device_id = device.rank(0).device;
+        fp4_prefill = fp4_prefill_mode();
+        if (const char* v = std::getenv("NINFER_INKLING_FP4_DECODE"); v != nullptr && std::strcmp(v, "1") == 0) {
+            fp4_decode = !model.expert_parallel() &&
+                         gguf::moe_fp4_supported(gguf::GgmlType::NVFP4, 128, 64);
+            std::fprintf(stderr, "inkling2: FP4 decode experts %s\n", fp4_decode ? "on" : "unsupported, off");
+        }
+        if (fp4_prefill != 0) {
+            if (const char* v = std::getenv("NINFER_INKLING_FP4_MIN_TOKENS")) {
+                fp4_min_tokens = std::max(gguf::kMaxVectorColumns + 1, std::atoi(v));
+            }
+            // The support check probes the device once; here, before any call is captured.
+            if (model.expert_parallel() ||
+                !gguf::moe_fp4_supported(gguf::GgmlType::NVFP4, 128, 64)) {
+                std::fprintf(stderr, "inkling2: NINFER_INKLING_FP4_PREFILL ignored (needs one "
+                                     "device running sm_120a code)\n");
+                fp4_prefill = 0;
+            } else {
+                std::fprintf(stderr, "inkling2: FP4 prompt experts (%s%s) from %d rows\n",
+                             fp4_prefill & 1 ? "gate_up" : "", fp4_prefill == 3 ? ", down" :
+                             fp4_prefill & 2 ? "down" : "", fp4_min_tokens);
+            }
+        }
         kvfmt = kv_format(o.kv_cache);
         const bool vmm_ok = vmm::granularity(device_id) != 0;
         elastic = !model.expert_banks().empty() && !options.expert_cache_bytes && vmm_ok;
@@ -2937,18 +2979,44 @@ struct Executor::Impl {
             ra.top_k       = k;
             return;
         }
-        void* rows_act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
-        gguf::quantize_moe_matrix_activation(p.gate_up_type, c.ffn_bf16, hidden, routing, pairs, k,
-                                             rows_act, stream);
-        gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, true,
-                                 rows_act, gu, stream);
+        // A long prompt chunk's NVFP4 products may take the FP4 tensor cores (fp4_prefill).
+        const bool fp4_chunk = fp4_prefill != 0 && c.chunk && t >= fp4_min_tokens;
+        const bool fp4       = fp4_chunk || (fp4_decode && !c.chunk);
+        const int fp4_mode   = fp4_chunk ? fp4_prefill : 3;
+        const bool fp4_up    = fp4 && (fp4_mode & 1) != 0 &&
+                            gguf::moe_fp4_supported(p.gate_up_type, 2 * width, hidden);
+        const bool fp4_down  = fp4 && (fp4_mode & 2) != 0 &&
+                              gguf::moe_fp4_supported(p.down_type, hidden, width);
+        if (fp4_up) {
+            void* rows_act =
+                workspace->alloc_bytes(gguf::moe_fp4_activation_bytes(hidden, pairs)).data;
+            gguf::quantize_moe_fp4_activation(c.ffn_bf16, hidden, routing, pairs, k, rows_act,
+                                              stream);
+            gguf::moe_fp4_product(gate_up, routing, max_active, pairs, rows_act, gu, stream);
+        } else {
+            void* rows_act =
+                workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
+            gguf::quantize_moe_matrix_activation(p.gate_up_type, c.ffn_bf16, hidden, routing,
+                                                 pairs, k, rows_act, stream);
+            gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, true,
+                                     rows_act, gu, stream);
+        }
         situ(gu, pairs, pair_scale, middle, stream);
-        void* act2 = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(width, pairs)).data;
-        gguf::quantize_moe_matrix_activation(p.down_type, middle, width, routing, pairs, 1, act2,
-                                             stream);
-        auto* rows = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * hidden * 4).data);
-        gguf::moe_matrix_product(p.down_type, down_matrix, routing, max_active, pairs, true, act2, rows,
-                                 stream);
+        float* rows = nullptr;
+        if (fp4_down) {
+            void* act2 = workspace->alloc_bytes(gguf::moe_fp4_activation_bytes(width, pairs)).data;
+            gguf::quantize_moe_fp4_activation(middle, width, routing, pairs, 1, act2, stream);
+            rows = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * hidden * 4).data);
+            gguf::moe_fp4_product(down, routing, max_active, pairs, act2, rows, stream);
+        } else {
+            void* act2 =
+                workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(width, pairs)).data;
+            gguf::quantize_moe_matrix_activation(p.down_type, middle, width, routing, pairs, 1,
+                                                 act2, stream);
+            rows = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * hidden * 4).data);
+            gguf::moe_matrix_product(p.down_type, down_matrix, routing, max_active, pairs, true,
+                                     act2, rows, stream);
+        }
         ra.moe_rows    = rows;
         ra.moe_weights = weights;
         ra.top_k       = k;

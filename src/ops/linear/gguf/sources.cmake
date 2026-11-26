@@ -27,6 +27,7 @@ add_library(ninfer_ggml_quants ${_ninfer_ggml_library_type}
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_q5_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_q2_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_nvfp4.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_nvfp4_fp4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_q8_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_q4_0.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_vec_q5_0.cu"

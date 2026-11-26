@@ -119,3 +119,9 @@ target_include_directories(ninfer_linear_gguf_cooperative_test PRIVATE
 ninfer_add_op_test(ninfer_linear_stq_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_stq.cpp"
   LIBRARIES ninfer_ops)
+
+# The W4A4 routed experts on the FP4 tensor cores (sm_120a): the activation byte for byte against
+# the host's, every schedule's product against an FP64 oracle.
+ninfer_add_op_test(ninfer_linear_gguf_moe_fp4_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_moe_fp4.cpp"
+  LIBRARIES ninfer_ops)

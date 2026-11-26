@@ -348,6 +348,30 @@ void quantize_moe_matrix_activation_f32(GgmlType type, const float* x, int k,
                                         const std::int32_t* source, const float* scale, void* out,
                                         cudaStream_t stream);
 
+// --- W4A4 routed experts on Blackwell's block-scaled FP4 tensor cores (sm_120a) ----------------
+// The same product as moe_matrix_product for NVFP4 experts with the activation itself in NVFP4
+// (E2M1 codes, a UE4M3 scale per 16 values and an FP32 factor per column, nvfp4_activation.h)
+// instead of q8_1: the tensor cores multiply both operands' codes and scales, so the weights go
+// to shared memory as stored. Coarser than the q8_1 activation (4-bit values), so callers use it
+// for prompt steps only, behind a switch. Rows a whole number of 128, k of 64; any k of whole
+// blocks runs without reading past a row (no `tail`). Not supported off sm_120a / sm_121a code.
+[[nodiscard]] bool moe_fp4_supported(GgmlType type, int rows, int k);
+// The activation: column c (routing order) is x column routing.sorted[c] / column_group, as
+// quantize_moe_matrix_activation's. x is BF16 [columns][k], k a multiple of 64.
+[[nodiscard]] std::size_t moe_fp4_activation_bytes(int k, int pairs);
+void quantize_moe_fp4_activation(const __nv_bfloat16* x, int k, const MoeRouting& routing,
+                                 int pairs, int column_group, void* out, cudaStream_t stream);
+// pair p's FP32 row lands at out[p * table.rows]. The schedule: `staged` 1 copies the next K
+// step's weights with cp.async while the tensor cores work (column tiles up to 64), 0 loads each
+// step when it starts (tiles up to 128), -1 takes NINFER_FP4_MOE_STAGED (default 1). `tile` 16, 32,
+// 64 or 128 forces the column tile, 0 takes NINFER_FP4_MOE_TILE or the narrowest tile holding an
+// active expert's pairs on average.
+void moe_fp4_product(const MoeTable& table, const MoeRouting& routing, int max_active, int pairs,
+                     const void* activation, float* out, cudaStream_t stream, int staged = -1,
+                     int tile = 0);
+// The column tile moe_fp4_product takes for `pairs` over `max_active` experts (same arguments).
+[[nodiscard]] int moe_fp4_column_tile(int pairs, int max_active, int staged = -1, int tile = 0);
+
 // out[i, :] = dequantize(W[row_ids ? row_ids[i] : i, :]) as BF16, rows `out_row_stride` apart.
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, __nv_bfloat16* out,
