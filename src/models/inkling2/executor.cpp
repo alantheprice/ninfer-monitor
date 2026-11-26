@@ -146,6 +146,10 @@ struct LayerPlan {
     gguf::GgmlType gate_up_type{}, down_type{};
     bool bf16 = false; // BF16 experts (both banks), multiplied by kernels::bf16_expert_rows
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
+    // NINFER_INKLING_PAD_DOWN=1: the down bank's rows copied out to a whole number of the matrix
+    // kernel's 256-value steps (zeros past the expert width), and the k the matrix calls take.
+    DeviceBuffer padded_down;
+    int down_matrix_k = 0;
     DeviceBuffer tables; // pointers: [E] gate, [E] up, [E] gate_up, [E] down
     bool gate_up_aligned16 = true, down_aligned16 = true;
     std::vector<DeviceBuffer> peer_tables; // expert parallelism: rank r's (r > 0)
@@ -708,6 +712,33 @@ struct Executor::Impl {
                     table[2 * e + x] = gu;
                     table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
                                        std::int64_t(x - first) * hidden * p.down_row_bytes;
+                }
+                static const bool pad_down = [] {
+                    const char* v = std::getenv("NINFER_INKLING_PAD_DOWN");
+                    return v != nullptr && std::string(v) == "1";
+                }();
+                const int padded_k = (width + 255) / 256 * 256;
+                if (pad_down && !bf16 && padded_k != width && first == 0 &&
+                    last == std::uint32_t(e) &&
+                    (p.down_row_bytes * padded_k) % width == 0) {
+                    // The matrix kernel reads a row in 256-value steps; a row of 1,152 values
+                    // takes its tail form, reading past the row into the next one (against a
+                    // zero activation). Rows padded with zero blocks keep the same sums and take
+                    // the whole-step form with 16-byte copies.
+                    const std::int64_t padded_row = p.down_row_bytes * padded_k / width;
+                    const std::size_t rows = std::size_t(e) * std::size_t(hidden);
+                    p.padded_down = DeviceBuffer(rows * std::size_t(padded_row));
+                    CUDA_CHECK(cudaMemset(p.padded_down.p, 0, rows * std::size_t(padded_row)));
+                    CUDA_CHECK(cudaMemcpy2D(p.padded_down.p, std::size_t(padded_row), down.qdata,
+                                            std::size_t(p.down_row_bytes),
+                                            std::size_t(p.down_row_bytes), rows,
+                                            cudaMemcpyDeviceToDevice));
+                    for (std::uint32_t x = 0; x < std::uint32_t(e); ++x) {
+                        table[3 * e + x] = static_cast<const std::byte*>(p.padded_down.p) +
+                                           std::int64_t(x) * hidden * padded_row;
+                    }
+                    p.down_row_bytes = padded_row;
+                    p.down_matrix_k  = padded_k;
                 }
                 bool gate_up_aligned = true, down_aligned = true;
                 for (std::size_t j = 0; j < table.size(); ++j) {
@@ -2791,6 +2822,9 @@ struct Executor::Impl {
                                      p.gate_up_aligned16};
         const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width,
                                   p.down_aligned16};
+        const gguf::MoeTable down_matrix{tables + 3 * e, p.down_row_bytes, hidden,
+                                         p.down_matrix_k != 0 && !delivery ? p.down_matrix_k : width,
+                                         p.down_aligned16};
         const int max_active = std::min(pairs, e);
         auto* middle = static_cast<__nv_bfloat16*>(
             workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
@@ -2885,7 +2919,7 @@ struct Executor::Impl {
         gguf::quantize_moe_matrix_activation(p.down_type, middle, width, routing, pairs, 1, act2,
                                              stream);
         auto* rows = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * hidden * 4).data);
-        gguf::moe_matrix_product(p.down_type, down, routing, max_active, pairs, true, act2, rows,
+        gguf::moe_matrix_product(p.down_type, down_matrix, routing, max_active, pairs, true, act2, rows,
                                  stream);
         ra.moe_rows    = rows;
         ra.moe_weights = weights;
