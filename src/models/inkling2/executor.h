@@ -194,6 +194,9 @@ public:
     // one block per sequence.
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
                std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence);
+    // DSpark: the sequence's drafts from the drafter's distribution at 1 / temperature with the
+    // target's Gumbel key (its seed); temperature 0 (the default) drafts the argmax.
+    void set_draft_sampling(std::uint32_t sequence, std::uint64_t seed, float temperature);
     // DSpark: the drafts its block proposes a round, its block less one (0 without the drafter);
     // and the drafter's greedy drafts of the drafts.size() positions after the sequence's anchor
     // (at most that many) with their probabilities. A block needs a committed token before it.

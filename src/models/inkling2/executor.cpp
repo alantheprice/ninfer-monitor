@@ -207,7 +207,7 @@ struct Spark {
     // final hidden.
     std::vector<int> tap_after;
     int taps = 0, block = 0, window = 0;
-    DeviceBuffer contexts, contexts_kept, table_m, table_c, state, prev, drafts, confidence;
+    DeviceBuffer contexts, contexts_kept, table_m, table_c, state, prev, drafts, confidence, gumbel;
     std::unique_ptr<PinnedHostBuffer> host;
     std::unique_ptr<CudaCompletionEvent> copied;
     bool prepared = false;
@@ -1051,6 +1051,7 @@ struct Executor::Impl {
         d->prev    = DeviceBuffer(4 * lanes);
         d->drafts  = DeviceBuffer(std::size_t(d->block) * 4 * lanes);
         d->confidence = DeviceBuffer(std::size_t(d->block) * 4 * lanes);
+        d->gumbel     = DeviceBuffer(12 * lanes); // seeds [lanes] u64, then 1 / temperature [lanes]
         d->bytes += d->table_m.bytes + d->table_c.bytes;
         d->host   = std::make_unique<PinnedHostBuffer>(std::size_t(d->block) * 8 * lanes);
         d->copied = std::make_unique<CudaCompletionEvent>(device);
@@ -1315,6 +1316,9 @@ struct Executor::Impl {
         sa.partials     = sa.logits + vocab;
         sa.lanes        = n;
         sa.block        = bl;
+        sa.seeds        = static_cast<const unsigned long long*>(d.gumbel.p);
+        sa.inv_temperature = reinterpret_cast<const float*>(
+            static_cast<const std::byte*>(d.gumbel.p) + 8 * kernels::kSparkMaxLanes);
         for (int i = 1; i <= k; ++i) {
             sa.row = i;
             kernels::spark_step(sa, stream);
@@ -1365,6 +1369,19 @@ struct Executor::Impl {
             }
         }
         prepare_spark();
+        {
+            // The lanes' draft sampling (set_draft_sampling), read by the pick kernels.
+            std::array<std::uint64_t, kernels::kSparkMaxLanes> seeds{};
+            std::array<float, kernels::kSparkMaxLanes> inv{};
+            for (int j = 0; j < n; ++j) {
+                seeds[j] = draft_seed.empty() ? 0 : draft_seed[sequences[j]];
+                inv[j]   = draft_inv_t.empty() ? 0.0F : draft_inv_t[sequences[j]];
+            }
+            CUDA_CHECK(cudaMemcpyAsync(d.gumbel.p, seeds.data(), sizeof(seeds),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(d.gumbel.p) + sizeof(seeds), inv.data(),
+                                       sizeof(inv), cudaMemcpyHostToDevice, stream));
+        }
         for (int j = 0; j < n; ++j) { back(sequences[j], positions[sequences[j]] + std::uint32_t(b)); }
         stage(tokens, pos, seq);
         run_graph(n == 1 ? 48 + std::uint32_t(k) : 1024 + std::uint32_t(n) * 16 + std::uint32_t(k),
@@ -3309,6 +3326,19 @@ struct Executor::Impl {
         verify_widths.clear();
     }
 
+    // set_draft_sampling's values, a sequence each (empty until set).
+    std::vector<std::uint64_t> draft_seed;
+    std::vector<float> draft_inv_t;
+    void set_draft_sampling(std::uint32_t sequence, std::uint64_t seed, float temperature) {
+        if (sequence >= options.sequences) { throw std::invalid_argument("inkling2: no such sequence"); }
+        if (draft_seed.empty()) {
+            draft_seed.assign(options.sequences, 0);
+            draft_inv_t.assign(options.sequences, 0.0F);
+        }
+        draft_seed[sequence]  = seed;
+        draft_inv_t[sequence] = temperature > 0.0F ? 1.0F / temperature : 0.0F;
+    }
+
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
                std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence) {
         if (spark) {
@@ -3850,6 +3880,10 @@ void Executor::verify(std::span<const std::uint32_t> sequences,
 void Executor::commit(std::span<const std::uint32_t> sequences,
                       std::span<const std::uint32_t> kept) {
     impl_->commit(sequences, kept);
+}
+
+void Executor::set_draft_sampling(std::uint32_t sequence, std::uint64_t seed, float temperature) {
+    impl_->set_draft_sampling(sequence, seed, temperature);
 }
 
 void Executor::draft(std::span<const std::uint32_t> sequences,

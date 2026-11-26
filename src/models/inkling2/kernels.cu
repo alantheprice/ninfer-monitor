@@ -5,6 +5,7 @@
 #include "models/inkling2/kv_codec.cuh"
 #include "models/inkling2/situ.h"
 #include "ops/common/mma.cuh"
+#include "ops/kernel/sampling_device.cuh"
 
 #include "core/pdl.cuh"
 #include <cublas_v2.h>
@@ -2738,7 +2739,7 @@ constexpr int kSparkRank     = 256;
 constexpr int kSparkPartials = 256;
 // A lane's step scratch (spark_step_floats): joint, logits, partials.
 __host__ __device__ constexpr std::int64_t spark_scratch(int vocab) {
-    return std::int64_t(3 * kSparkRank) + vocab + 3 * kSparkPartials;
+    return std::int64_t(3 * kSparkRank) + vocab + 5 * kSparkPartials;
 }
 
 __global__ void spark_table_kernel(const float* p, std::int64_t n, __nv_bfloat16* m, float* c) {
@@ -2764,6 +2765,10 @@ __global__ void spark_head_inputs_kernel(const float* hidden_out, const float* b
 
 // Block of eight warps, warp w output 8 blockIdx.x + w of the joint projection; the block's input
 // vector in shared memory.
+// The joint product takes its lanes' inputs in shared memory (20 KiB a lane at Inkling 2's
+// width), so spark_step runs it over groups of at most this many lanes.
+constexpr int kSparkJointLanes = 4;
+
 __global__ void __launch_bounds__(256) spark_joint_kernel(SparkStepArgs a) {
     ninfer::pdl::enter();
     extern __shared__ float x[];
@@ -2797,16 +2802,16 @@ __global__ void __launch_bounds__(256) spark_joint_kernel(SparkStepArgs a) {
     const int o    = blockIdx.x * 8 + warp;
     if (o >= 3 * kSparkRank) { return; }
     const float4* w  = reinterpret_cast<const float4*>(a.weight + std::int64_t(o) * k);
-    float sum[kSparkMaxLanes] = {};
+    float sum[kSparkJointLanes] = {};
     for (int i = lane; i < k / 4; i += 32) {
         const float4 wi = w[i];
 #pragma unroll
-        for (int j = 0; j < kSparkMaxLanes; ++j) {
+        for (int j = 0; j < kSparkJointLanes; ++j) {
             if (j < a.lanes) { sum[j] += dot4(wi, reinterpret_cast<const float4*>(x + j * k)[i]); }
         }
     }
 #pragma unroll
-    for (int j = 0; j < kSparkMaxLanes; ++j) {
+    for (int j = 0; j < kSparkJointLanes; ++j) {
         if (j >= a.lanes) { break; }
         const float total = warp_sum(sum[j]);
         if (lane == 0) { a.joint[j * scratch + o] = total + a.bias[o]; }
@@ -2892,6 +2897,88 @@ __device__ Pick block_pick(Pick p) {
     return all;
 }
 
+// The Gumbel draw's running best: its score, token and scaled logit.
+struct GumbelPick {
+    float score = -INFINITY;
+    int index   = INT_MAX;
+    float x     = -INFINITY;
+};
+
+__device__ __forceinline__ GumbelPick merge_gumbel(GumbelPick a, GumbelPick b) {
+    return b.score > a.score || (b.score == a.score && b.index < a.index) ? b : a;
+}
+
+__device__ GumbelPick block_gumbel(GumbelPick p) {
+    __shared__ float scores[32], xs[32];
+    __shared__ int indices[32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        GumbelPick other;
+        other.score = __shfl_xor_sync(0xFFFFFFFFu, p.score, o);
+        other.index = __shfl_xor_sync(0xFFFFFFFFu, p.index, o);
+        other.x     = __shfl_xor_sync(0xFFFFFFFFu, p.x, o);
+        p           = merge_gumbel(p, other);
+    }
+    if (lane == 0) {
+        scores[warp]  = p.score;
+        indices[warp] = p.index;
+        xs[warp]      = p.x;
+    }
+    __syncthreads();
+    GumbelPick all;
+    for (int w = 0; w < int(blockDim.x >> 5); ++w) {
+        GumbelPick other;
+        other.score = scores[w];
+        other.index = indices[w];
+        other.x     = xs[w];
+        all         = merge_gumbel(all, other);
+    }
+    return all;
+}
+
+__device__ __forceinline__ float spark_inv_temperature(const SparkStepArgs& a, int j) {
+    return a.inv_temperature != nullptr ? a.inv_temperature[j] : 0.0f;
+}
+
+// Lane j's sampled pass: the softmax at 1 / temperature (top and sum, for the confidence) and the
+// Gumbel draw at the target's key, partials [5 * blocks] after the argmax form's [3 * blocks].
+__device__ void spark_pick_partials_gumbel(const SparkStepArgs& a, int j, const float* logits,
+                                           float* partials, int lo, int hi, float inv_t) {
+    const unsigned long long seed = a.seeds[j];
+    const int position            = a.positions[j * a.block + a.row];
+    Pick p;
+    GumbelPick g;
+    for (int v = lo + threadIdx.x; v < hi; v += blockDim.x) {
+        const float x = logits[v] * inv_t;
+        if (x > p.top) {
+            p.sum   = p.sum * expf(p.top - x) + 1.0f;
+            p.top   = x;
+            p.index = v;
+        } else {
+            p.sum += expf(x - p.top);
+        }
+        const float u = ninfer::ops::sampling_uniform_open(
+            seed, position, ninfer::ops::kSamplePurposeDecode, static_cast<unsigned int>(v) + 1u);
+        const float score = x - logf(-logf(u));
+        if (score > g.score) {
+            g.score = score;
+            g.index = v;
+            g.x     = x;
+        }
+    }
+    p = block_pick(p);
+    __syncthreads();
+    g = block_gumbel(g);
+    if (threadIdx.x == 0) {
+        partials[5 * blockIdx.x]     = p.top;
+        partials[5 * blockIdx.x + 1] = p.sum;
+        partials[5 * blockIdx.x + 2] = g.score;
+        partials[5 * blockIdx.x + 3] = __int_as_float(g.index);
+        partials[5 * blockIdx.x + 4] = g.x;
+    }
+}
+
 __global__ void __launch_bounds__(256) spark_pick_partials_kernel(SparkStepArgs a) {
     ninfer::pdl::enter();
     const int j = blockIdx.y;
@@ -2900,6 +2987,10 @@ __global__ void __launch_bounds__(256) spark_pick_partials_kernel(SparkStepArgs 
     float* partials     = a.joint + j * scratch + 3 * kSparkRank + a.vocab;
     const int per = (a.vocab + kSparkPartials - 1) / kSparkPartials;
     const int lo = blockIdx.x * per, hi = min(a.vocab, lo + per);
+    if (const float inv_t = spark_inv_temperature(a, j); inv_t > 0.0f) {
+        spark_pick_partials_gumbel(a, j, logits, partials, lo, hi, inv_t);
+        return;
+    }
     Pick p;
     for (int v = lo + threadIdx.x; v < hi; v += blockDim.x) {
         const float x = logits[v];
@@ -2928,14 +3019,33 @@ __global__ void __launch_bounds__(kSparkPartials) spark_pick_final_kernel(SparkS
     float* state          = a.state + j * kSparkRank;
     Pick p;
     const int b = threadIdx.x;
-    p.top   = partials[3 * b];
-    p.index = __float_as_int(partials[3 * b + 1]);
-    p.sum   = partials[3 * b + 2];
-    p       = block_pick(p);
-    if (threadIdx.x == 0) {
-        a.prev[j]                               = p.index;
-        a.drafts[j * a.block + a.row - 1]       = p.index;
-        a.confidence[j * a.block + a.row - 1]   = 1.0f / p.sum;
+    if (spark_inv_temperature(a, j) > 0.0f) {
+        // The sampled pass: the Gumbel winner, its probability at the temperature its confidence.
+        p.top   = partials[5 * b];
+        p.index = b;
+        p.sum   = partials[5 * b + 1];
+        GumbelPick g;
+        g.score = partials[5 * b + 2];
+        g.index = __float_as_int(partials[5 * b + 3]);
+        g.x     = partials[5 * b + 4];
+        p       = block_pick(p);
+        __syncthreads();
+        g = block_gumbel(g);
+        if (threadIdx.x == 0) {
+            a.prev[j]                             = g.index;
+            a.drafts[j * a.block + a.row - 1]     = g.index;
+            a.confidence[j * a.block + a.row - 1] = expf(g.x - p.top) / p.sum;
+        }
+    } else {
+        p.top   = partials[3 * b];
+        p.index = __float_as_int(partials[3 * b + 1]);
+        p.sum   = partials[3 * b + 2];
+        p       = block_pick(p);
+        if (threadIdx.x == 0) {
+            a.prev[j]                               = p.index;
+            a.drafts[j * a.block + a.row - 1]       = p.index;
+            a.confidence[j * a.block + a.row - 1]   = 1.0f / p.sum;
+        }
     }
     for (int r = threadIdx.x; r < kSparkRank; r += blockDim.x) {
         const float gate      = sigmoidf(joint[r]);
@@ -3486,15 +3596,29 @@ void spark_step(const SparkStepArgs& args, cudaStream_t stream) {
         throw std::invalid_argument("inkling2 spark_step: scratch out of layout");
     }
     const int k = 2 * kSparkRank + 2 * a.hidden_size;
-    const std::size_t smem = std::size_t(k) * 4 * a.lanes;
     static const bool configured = [k] {
         CUDA_CHECK(cudaFuncSetAttribute(spark_joint_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        int(std::size_t(k) * 4 * kSparkMaxLanes)));
+                                        int(std::size_t(k) * 4 * kSparkJointLanes)));
         return true;
     }();
     (void)configured;
-    (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(3 * kSparkRank / 8), dim3(256), smem, stream}, spark_joint_kernel, a);
-    check_launch("spark_joint");
+    // The joint product a group of lanes at a time (each lane's rows, state, previous draft and
+    // scratch shifted to the group's first); the head and the picks take every lane at once.
+    const std::int64_t scratch = spark_scratch(a.vocab);
+    const int rows_per_lane    = a.lanes == 1 ? 1 : a.block;
+    for (int g0 = 0; g0 < a.lanes; g0 += kSparkJointLanes) {
+        SparkStepArgs g = a;
+        g.lanes         = std::min(kSparkJointLanes, a.lanes - g0);
+        g.prev          = a.prev + g0;
+        g.state         = a.state + std::int64_t(g0) * kSparkRank;
+        g.sequences     = a.sequences + std::int64_t(g0) * rows_per_lane;
+        g.positions     = a.positions + std::int64_t(g0) * rows_per_lane;
+        g.hidden        = a.hidden + std::int64_t(g0) * rows_per_lane * a.hidden_size;
+        g.joint         = a.joint + std::int64_t(g0) * scratch;
+        const std::size_t smem = std::size_t(k) * 4 * g.lanes;
+        (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(3 * kSparkRank / 8), dim3(256), smem, stream}, spark_joint_kernel, g);
+        check_launch("spark_joint");
+    }
     (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(blocks_for(a.vocab, 8)), dim3(256), std::size_t(0), stream}, spark_logits_kernel, a);
     check_launch("spark_logits");
     (void)ninfer::pdl::launch_consumer(ninfer::pdl::LaunchConfig{dim3(kSparkPartials, a.lanes), dim3(256), std::size_t(0), stream}, spark_pick_partials_kernel, a);

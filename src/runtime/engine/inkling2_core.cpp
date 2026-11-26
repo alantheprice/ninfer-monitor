@@ -21,6 +21,7 @@
 #include "ninfer/ops/target_logprobs.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/grammar_masks.h"
+#include "runtime/contract/draft_sampling.h"
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/contract/rope_scaling.h"
@@ -2890,6 +2891,21 @@ struct Inkling2Core::Impl {
         for (const auto& request : rows) {
             sequences.push_back(request->slot);
             anchors.push_back(request->feed.front());
+        }
+        if (spark_drafts != 0) {
+            // With --gumbel-sampling a sampled request drafts from the drafter's distribution at
+            // its temperature with its own Gumbel key, so a draft is the target's draw wherever
+            // the two distributions agree (draft_sampling.h); otherwise the argmax.
+            // NINFER_INKLING_DRAFT_GREEDY=1 keeps the argmax.
+            static const bool greedy = std::getenv("NINFER_INKLING_DRAFT_GREEDY") != nullptr;
+            for (const auto& request : rows) {
+                const auto& exec = request->options.execution;
+                const auto& params =
+                    request->post_thinking ? *exec.post_thinking_sampling : exec.sampling;
+                const ops::SamplingConfig dc = runtime::draft_sampling(params);
+                instance.executor->set_draft_sampling(request->slot, dc.seed,
+                                                      greedy ? 0.0F : dc.temperature);
+            }
         }
         std::vector<std::int32_t> drafted(rows.size() * steps);
         std::vector<float> confidence(rows.size() * steps);

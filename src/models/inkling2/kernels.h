@@ -497,9 +497,15 @@ struct SparkStepArgs {
     // j * block ..), lane j's state, prev, drafts and confidence at j * 256, j, j * block and
     // j * block, its scratch at j * spark_step_floats(vocab), hidden and base rows j * block + row.
     int lanes = 1, block = 0;
+    // Drafting from the drafter's own distribution with the target's Gumbel key: lane j's seed and
+    // 1 / temperature (0 drafts the argmax). Draft row r of lane j draws the token the target's
+    // column r - 1 would at its key, (seed, positions[j * block + r], decode, token + 1), so the two
+    // draws agree wherever the two distributions do (runtime/contract/draft_sampling.h).
+    const unsigned long long* seeds = nullptr;
+    const float* inv_temperature    = nullptr;
 };
 [[nodiscard]] std::size_t spark_step_floats(int vocab);
-constexpr int kSparkMaxLanes = 4;
+constexpr int kSparkMaxLanes = 8;
 void spark_step(const SparkStepArgs& args, cudaStream_t stream);
 
 // sums[i] += products[i] for i < n when *flag is nonzero: the 2^-32 fixed-point sums of the
