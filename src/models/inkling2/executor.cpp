@@ -570,7 +570,12 @@ struct Executor::Impl {
             const auto up16 = [](std::int64_t x) { return int((x + 31) / 32 * 32); }; // 32-key tiles
             span_full        = std::max(256, up16((std::int64_t(options.max_context) + 239) / 240));
             span_splits_full = int((std::int64_t(options.max_context) + span_full - 1) / span_full) + 1;
-            span_sliding        = 64;
+            // NINFER_INKLING_SPAN_SLIDING: keys a sliding visit's span covers (a multiple of 32).
+            span_sliding = [] {
+                const char* v = std::getenv("NINFER_INKLING_SPAN_SLIDING");
+                const int n   = v != nullptr ? std::atoi(v) : 64;
+                return n >= 32 && n % 32 == 0 ? n : 64;
+            }();
             span_splits_sliding = (window + kMaxDecodeRows + 16 + span_sliding - 1) / span_sliding + 1;
         }
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, sequences);
